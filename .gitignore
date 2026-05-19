@@ -1,0 +1,48 @@
+# IDE
+.idea/
+*.iml
+.DS_Store
+Thumbs.db
+
+# Local machine config
+local.properties
+
+# Gradle and build outputs
+.gradle/
+build/
+app/build/
+coordinator/build/
+
+# Android native/build intermediates
+captures/
+.externalNativeBuild/
+.cxx/
+app/.cxx/
+
+# Android packaging outputs
+*.apk
+*.aab
+
+# Coordinator runtime state
+coordinator/data/
+*.db
+*.db-shm
+*.db-wal
+
+# Model artifacts and generated exports
+model/*.pte
+exported_pte/
+
+# Python caches and virtual environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+env/
+*.egg-info/
+
+# Logs and memory dumps
+*.log
+*.hprof

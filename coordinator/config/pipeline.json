@@ -1,0 +1,29 @@
+{
+  "bindPort": 50051,
+  "adminBindPort": 18080,
+  "heartbeatLeaseSeconds": 15,
+  "cleanupIntervalSeconds": 5,
+  "requestStallTimeoutSeconds": 30,
+  "resolvedRequestRetentionSeconds": 86400,
+  "artifactBaseUrl": "http://192.168.214.35:18080",
+  "pipelineName": "demo-pipeline",
+  "stateDbPath": "coordinator/data/coordinator.db",
+  "stages": [
+    {
+      "stageId": 0,
+      "deviceId": "Lenovo_Lenovo_L71091",
+      "modelShardId": "chunk_0",
+      "modelArtifactPath": "../../model/phi2_sid_full_ft_chunk_0.pte",
+      "expectedHost": "192.168.214.35",
+      "expectedPort": 50052
+    },
+    {
+      "stageId": 1,
+      "deviceId": "nubia_NX809J",
+      "modelShardId": "chunk_1",
+      "modelArtifactPath": "../../model/phi2_sid_full_ft_chunk_1.pte",
+      "expectedHost": "192.168.214.35",
+      "expectedPort": 50052
+    }
+  ]
+}
