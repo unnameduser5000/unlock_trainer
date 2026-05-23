@@ -9,6 +9,7 @@ local.properties
 
 # Gradle and build outputs
 .gradle/
+.gradle-user/
 build/
 app/build/
 coordinator/build/

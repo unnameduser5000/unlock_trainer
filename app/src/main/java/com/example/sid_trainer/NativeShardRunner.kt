@@ -61,17 +61,29 @@ object NativeShardRunner {
     }
 
     private fun loadRuntime(modelPath: String): LoadedRuntime {
-        val trainingFailure = runCatching {
-            val module = TrainingModule.load(modelPath)
-            Log.i(LOG_TAG, "Loaded ExecuTorch training module from $modelPath")
-            return TrainingLoadedRuntime(modelPath, module)
-        }.exceptionOrNull()
-
-        trainingFailure?.let {
-            Log.w(LOG_TAG, "TrainingModule.load() failed for $modelPath, falling back to Module: ${it.message}")
+        try {
+            return loadInferenceRuntime(modelPath)
+        } catch (inferenceFailure: Throwable) {
+            Log.w(
+                LOG_TAG,
+                "Module.load() failed for $modelPath, trying TrainingModule: ${inferenceFailure.message}"
+            )
         }
 
-        return loadInferenceRuntime(modelPath)
+        try {
+            val module = TrainingModule.load(modelPath)
+            Log.w(
+                LOG_TAG,
+                "Loaded ExecuTorch training module from $modelPath. " +
+                    "Prefer forward-only Module artifacts for mobile pipeline tests."
+            )
+            return TrainingLoadedRuntime(modelPath, module)
+        } catch (trainingFailure: Throwable) {
+            throw IllegalStateException(
+                "Could not load ExecuTorch artifact as Module or TrainingModule: $modelPath",
+                trainingFailure
+            )
+        }
     }
 
     private fun loadInferenceRuntime(modelPath: String): LoadedRuntime {
@@ -111,13 +123,6 @@ object NativeShardRunner {
         val allInputs = listOf(hiddenStates, attentionMask, positionIds, labels, shiftLogPPrev)
         val candidates = mutableListOf<List<EValue>>()
 
-        candidates += allInputs
-
-        val lastConcreteIndex = allInputs.indexOfLast { !it.isNone() }
-        if (lastConcreteIndex >= 0) {
-            candidates += allInputs.take(lastConcreteIndex + 1)
-        }
-
         val compactInputs = buildList {
             add(hiddenStates)
             if (!request.attentionMask.isEmptyTensor()) add(attentionMask)
@@ -126,8 +131,6 @@ object NativeShardRunner {
             if (!request.shiftLogPPrev.isEmptyTensor()) add(shiftLogPPrev)
         }
         candidates += compactInputs
-
-        candidates.add(listOf(hiddenStates))
 
         if (!request.labels.isEmptyTensor()) {
             candidates.add(listOf(hiddenStates, labels))
@@ -141,8 +144,22 @@ object NativeShardRunner {
             })
         }
 
+        candidates.add(listOf(hiddenStates))
+
+        if (allInputs.none { it.isNone() }) {
+            candidates += allInputs
+        }
+
+        val lastConcreteIndex = allInputs.indexOfLast { !it.isNone() }
+        if (lastConcreteIndex >= 0) {
+            val trimmedInputs = allInputs.take(lastConcreteIndex + 1)
+            if (trimmedInputs.none { it.isNone() }) {
+                candidates += trimmedInputs
+            }
+        }
+
         val seen = LinkedHashSet<String>()
-        return candidates
+        val deduplicated = candidates
             .filter { it.isNotEmpty() }
             .map { it.toTypedArray() }
             .filter { candidate ->
@@ -159,6 +176,26 @@ object NativeShardRunner {
                 }
                 seen.add("${candidate.size}:$signature")
             }
+
+        Log.i(
+            LOG_TAG,
+            "Prepared ${deduplicated.size} ExecuTorch candidate signatures: ${
+                deduplicated.joinToString { candidate ->
+                    candidate.joinToString(prefix = "[", postfix = "]") { eValue ->
+                        when {
+                            eValue.isTensor() -> "tensor"
+                            eValue.isNone() -> "none"
+                            eValue.isInt() -> "int"
+                            eValue.isDouble() -> "double"
+                            eValue.isBool() -> "bool"
+                            eValue.isString() -> "string"
+                            else -> "unknown"
+                        }
+                    }
+                }
+            }"
+        )
+        return deduplicated
     }
 
     private fun InvocationResult.toExecutionResult(request: Sid.ForwardChunkRequest): ShardExecutionResult {

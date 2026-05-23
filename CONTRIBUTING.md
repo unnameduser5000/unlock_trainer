@@ -62,10 +62,13 @@ On Windows:
 
 ### Export server
 
-The export environment is described by [requirement.txt](requirement.txt):
+The minimal export environment is described by:
+
+- [environment.yml](environment.yml)
+- [requirements-export.txt](requirements-export.txt)
 
 ```bash
-conda create --name mobile-bpfree-export --file requirement.txt
+conda env create -f environment.yml
 conda activate mobile-bpfree-export
 ```
 
@@ -106,12 +109,13 @@ Minimum command:
 
 ## If You Change Export Logic
 
-If you modify [tools/export/sid_export_mobile.py](tools/export/sid_export_mobile.py):
+If you modify [tools/export/sid_export_forward_mobile.py](tools/export/sid_export_forward_mobile.py) or [tools/export/sid_export_mobile.py](tools/export/sid_export_mobile.py):
 
 1. keep a reproducible command example
 2. note which model preset you tested
 3. note `num_chunks`, `seq_len`, and `transport_dtype`
-4. mention whether XNNPACK lowering was enabled
+4. mention whether the artifact is forward-only or joint forward/backward
+5. mention whether XNNPACK lowering was enabled
 
 ## If You Replace Model Artifacts
 

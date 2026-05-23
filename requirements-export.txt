@@ -1,0 +1,13 @@
+# Minimal export environment for tools/export/*.py
+#
+# This file is intentionally much smaller than requirement.txt.
+# Use this first for server-side shard export.
+
+torch==2.9.0
+executorch==1.2.0
+transformers==5.0.0rc1
+sentencepiece==0.2.1
+safetensors==0.7.0
+numpy==2.4.2
+pyyaml==6.0.3
+tqdm==4.67.3

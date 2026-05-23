@@ -75,7 +75,9 @@ Today the request path is still pipeline-shaped, but the intended research direc
 |- model/               Local shard artifacts (ignored by git)
 |- tools/export/        Server-side model export scripts
 |- CONTRIBUTING.md      Collaboration and handoff guide
-|- requirement.txt      Explicit conda environment export for the export server
+|- environment.yml      Minimal conda environment for export
+|- requirements-export.txt  Minimal pip dependencies for export
+|- requirement.txt      Raw environment snapshot from a working machine
 `- README.md
 ```
 
@@ -88,6 +90,7 @@ Key files:
 - [coordinator/src/main/kotlin/com/example/sid_coordinator/CoordinatorMain.kt](coordinator/src/main/kotlin/com/example/sid_coordinator/CoordinatorMain.kt)
 - [coordinator/config/pipeline.json](coordinator/config/pipeline.json)
 - [coordinator/config/pipeline.example.json](coordinator/config/pipeline.example.json)
+- [tools/export/sid_export_forward_mobile.py](tools/export/sid_export_forward_mobile.py)
 - [tools/export/sid_export_mobile.py](tools/export/sid_export_mobile.py)
 - [CONTRIBUTING.md](CONTRIBUTING.md)
 
@@ -144,16 +147,23 @@ APK output:
 
 ### 2. Export server environment
 
-The file [requirement.txt](requirement.txt) is an **explicit conda environment export**, not a minimal pip requirements file.
+Use the minimal export environment first:
+
+- [environment.yml](environment.yml)
+- [requirements-export.txt](requirements-export.txt)
 
 Create the export environment:
 
 ```bash
-conda create --name mobile-bpfree-export --file requirement.txt
+conda env create -f environment.yml
 conda activate mobile-bpfree-export
 ```
 
 This environment is intended for the **server-side export machine**, not for Android.
+
+The file [requirement.txt](requirement.txt) is kept only as a **raw environment snapshot** from a working machine. It is not meant to be installed with `pip install -r requirement.txt`, and it is not a clean collaboration entrypoint.
+
+Keep the Python `executorch` package version aligned with the Android `executorch-android` dependency when possible.
 
 ## Exporting Shards
 
@@ -161,16 +171,24 @@ The original export script snapshot is preserved at:
 
 - [tools/export/sid_export_original_backup.py](tools/export/sid_export_original_backup.py)
 
-The mobile-oriented export script is:
+The recommended first mobile system-test export script is:
+
+- [tools/export/sid_export_forward_mobile.py](tools/export/sid_export_forward_mobile.py)
+
+This script exports **forward-only** `.pte` shards for Android `Module.execute()`. Use this first when validating coordinator routing, worker-to-worker transfer, request tracking, and mobile memory behavior.
+
+The joint forward/backward export script is:
 
 - [tools/export/sid_export_mobile.py](tools/export/sid_export_mobile.py)
 
-Why the new script exists:
+The joint script keeps the local training graph and targets Android `TrainingModule.executeForwardBackward()`. That path is useful for later training-runtime work, but it is more fragile on phones. If the goal is to validate the system pipeline first, use the forward-only script.
+
+Why these mobile scripts exist:
 
 - `chunk 0` can omit `prev_log_probs`
 - stage-to-stage transport defaults to `float16`
 - default `seq_len` is shorter
-- joint graph export defaults to **no XNNPACK lowering** for safer first runs
+- XNNPACK lowering is opt-in for safer first runs
 - it is tuned for the current worker/coordinator contract
 
 ### Recommended starting point
@@ -178,27 +196,60 @@ Why the new script exists:
 For the current phones, start with:
 
 - `TinyLlama/TinyLlama-1.1B-Chat-v1.0`
-- `num_chunks=8`
+- `num_chunks=4`
 - `seq_len=64`
 - `transport_dtype=float16`
 
-Example:
+Two-phone forward-only compatibility export:
 
 ```bash
-python tools/export/sid_export_mobile.py \
+python tools/export/sid_export_forward_mobile.py \
   --model_name tinyllama \
-  --num_chunks 8 \
+  --num_chunks 4 \
+  --chunk_idx 0,1 \
+  --seq_len 64 \
+  --transport_dtype float16 \
+  --artifact_prefix tinyllama \
+  --output_dir model
+```
+
+This writes:
+
+- `model/tinyllama_chunk_0.pte`
+- `model/tinyllama_chunk_1.pte`
+
+For all four chunks:
+
+```bash
+python tools/export/sid_export_forward_mobile.py \
+  --model_name tinyllama \
+  --num_chunks 4 \
   --chunk_idx -1 \
-  --seq_len 64
+  --seq_len 64 \
+  --transport_dtype float16 \
+  --artifact_prefix tinyllama \
+  --output_dir model
 ```
 
 Smaller sanity-check model:
 
 ```bash
-python tools/export/sid_export_mobile.py \
+python tools/export/sid_export_forward_mobile.py \
   --model_name smollm2_360m \
   --num_chunks 4 \
   --chunk_idx -1 \
+  --seq_len 64 \
+  --artifact_prefix smollm2_360m \
+  --output_dir model
+```
+
+Joint training-runtime export, for later compatibility testing:
+
+```bash
+python tools/export/sid_export_mobile.py \
+  --model_name tinyllama \
+  --num_chunks 4 \
+  --chunk_idx 0 \
   --seq_len 64
 ```
 
@@ -206,6 +257,7 @@ Notes:
 
 - exported `.pte` files are **not committed** to git
 - place the generated files under `model/` or another local artifact path referenced by the coordinator config
+- after replacing coordinator-served artifacts, call `POST /api/v1/routing/reload` and restart the Android workers
 
 ## Coordinator Setup
 

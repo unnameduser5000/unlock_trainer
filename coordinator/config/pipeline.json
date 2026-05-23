@@ -9,21 +9,22 @@
   "pipelineName": "demo-pipeline",
   "stateDbPath": "coordinator/data/coordinator.db",
   "stages": [
-    {
-      "stageId": 0,
-      "deviceId": "Lenovo_Lenovo_L71091",
-      "modelShardId": "chunk_0",
-      "modelArtifactPath": "../../model/phi2_sid_full_ft_chunk_0.pte",
-      "expectedHost": "192.168.214.35",
-      "expectedPort": 50052
-    },
-    {
-      "stageId": 1,
-      "deviceId": "nubia_NX809J",
-      "modelShardId": "chunk_1",
-      "modelArtifactPath": "../../model/phi2_sid_full_ft_chunk_1.pte",
-      "expectedHost": "192.168.214.35",
-      "expectedPort": 50052
-    }
+  {
+    "stageId": 0,
+    "deviceId": "android_stage_0",
+    "modelShardId": "tinyllama_chunk_0",
+    "modelArtifactPath": "../../model/tinyllama_chunk_0.pte",
+    "expectedHost": "192.168.1.101",
+    "expectedPort": 26052
+  },
+
+  {
+    "stageId": 1,
+    "deviceId": "android_stage_1",
+    "modelShardId": "tinyllama_chunk_1",
+    "modelArtifactPath": "../../model/tinyllama_chunk_1.pte",
+    "expectedHost": "192.168.1.102",
+    "expectedPort": 26052
+  }
   ]
 }
