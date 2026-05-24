@@ -85,8 +85,8 @@ object ModelArtifactManager {
     ) {
         val connection = (URL(url).openConnection() as HttpURLConnection).apply {
             requestMethod = "GET"
-            connectTimeout = 15_000
-            readTimeout = 60_000
+            connectTimeout = 30_000
+            readTimeout = 600_000
             doInput = true
         }
         try {

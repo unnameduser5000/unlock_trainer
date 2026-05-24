@@ -111,7 +111,7 @@ class CoordinatorAdminServer(
                 )
             }
         }
-        server.executor = Executors.newSingleThreadExecutor { runnable ->
+        server.executor = Executors.newFixedThreadPool(4) { runnable ->
             Thread(runnable, "sid-coordinator-admin").apply { isDaemon = true }
         }
     }

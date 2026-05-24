@@ -209,6 +209,7 @@ python tools/export/sid_export_forward_mobile.py \
   --chunk_idx 0,1 \
   --seq_len 64 \
   --transport_dtype float16 \
+  --relay_only \
   --artifact_prefix tinyllama \
   --output_dir model
 ```
@@ -227,6 +228,7 @@ python tools/export/sid_export_forward_mobile.py \
   --chunk_idx -1 \
   --seq_len 64 \
   --transport_dtype float16 \
+  --relay_only \
   --artifact_prefix tinyllama \
   --output_dir model
 ```
@@ -258,6 +260,7 @@ Notes:
 - exported `.pte` files are **not committed** to git
 - place the generated files under `model/` or another local artifact path referenced by the coordinator config
 - after replacing coordinator-served artifacts, call `POST /api/v1/routing/reload` and restart the Android workers
+- `--relay_only` is recommended for the first end-to-end mobile system test. It preserves the stage-to-stage tensor relay while skipping local CE/KD loss inside the `.pte`, which avoids conflating coordinator/data-plane validation with model-loss runtime compatibility.
 
 ## Coordinator Setup
 

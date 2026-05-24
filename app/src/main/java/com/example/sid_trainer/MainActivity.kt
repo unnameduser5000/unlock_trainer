@@ -26,6 +26,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.ui.Modifier
@@ -54,10 +55,10 @@ class MainActivity : ComponentActivity() {
     private val isWorkerRunning = mutableStateOf(false)
     private val modelFilePath = mutableStateOf<String?>(null)
     private val modelCacheSummary = mutableStateOf("No shard prepared")
-    private val coordinatorHost = mutableStateOf("192.168.5.29")
+    private val coordinatorHost = mutableStateOf("192.168.214.35")
     private val coordinatorPort = mutableStateOf("50051")
     private val deviceId = mutableStateOf(defaultDeviceId())
-    private val localServerPort = mutableStateOf("50052")
+    private val localServerPort = mutableStateOf("26052")
     private val routingSummary = mutableStateOf("Not registered")
     @Volatile
     private var acceptsNewChunks = true
@@ -66,6 +67,7 @@ class MainActivity : ComponentActivity() {
 
     private var workerJob: Job? = null
     private var activeGrpcManager: GrpcManager? = null
+    private var autoStartRequested = false
 
     private val pickModelLauncher =
         registerForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
@@ -84,6 +86,16 @@ class MainActivity : ComponentActivity() {
 
     @Composable
     private fun MainConsoleScreen() {
+        LaunchedEffect(Unit) {
+            if (!autoStartRequested) {
+                autoStartRequested = true
+                appendLog(
+                    "Auto-starting worker with coordinator=${coordinatorHost.value}:${coordinatorPort.value}, deviceId=${deviceId.value}, localPort=${localServerPort.value}"
+                )
+                startWorker()
+            }
+        }
+
         Column(
             modifier = Modifier
                 .fillMaxSize()
@@ -684,11 +696,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun defaultDeviceId(): String {
-        val manufacturer = Build.MANUFACTURER.orEmpty().replace(' ', '_')
         val model = Build.MODEL.orEmpty().replace(' ', '_')
-        return listOf(manufacturer, model)
-            .filter { it.isNotBlank() }
-            .joinToString("_")
-            .ifBlank { "android_worker" }
+        return model.ifBlank { "android_worker" }
     }
 }

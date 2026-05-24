@@ -21,5 +21,6 @@ python tools/export/sid_export_forward_mobile.py \
   --seq_len "${SEQ_LEN}" \
   --batch_size "${BATCH_SIZE}" \
   --transport_dtype "${TRANSPORT_DTYPE}" \
+  --relay_only \
   --artifact_prefix "${ARTIFACT_PREFIX}" \
   --output_dir "${OUTPUT_DIR}"

@@ -45,6 +45,7 @@ class ForwardOnlySIDChunk(nn.Module):
         alpha: float = 0.5,
         label_smoothing: float = 0.1,
         transport_dtype: torch.dtype = torch.float16,
+        relay_only: bool = False,
     ) -> None:
         super().__init__()
         self.chunk_idx = chunk_idx
@@ -56,6 +57,7 @@ class ForwardOnlySIDChunk(nn.Module):
         self.alpha = alpha
         self.label_smoothing = label_smoothing
         self.transport_dtype = transport_dtype
+        self.relay_only = relay_only
 
     def forward(
         self,
@@ -68,7 +70,6 @@ class ForwardOnlySIDChunk(nn.Module):
         hidden_states = hidden_states.float()
         attention_mask = attention_mask.float()
         position_ids = position_ids.long()
-        labels = labels.long()
 
         position_embeddings = None
         if self.rotary_emb is not None:
@@ -85,35 +86,39 @@ class ForwardOnlySIDChunk(nn.Module):
             curr_hidden = layer_out[0] if isinstance(layer_out, tuple) else layer_out
 
         logits = self.lm_head(self.final_norm(curr_hidden))
-        shift_logits = logits[..., :-1, :]
-        shift_labels = labels[..., 1:]
-        valid_mask = (shift_labels != -100).float()
-        valid_tokens_count = valid_mask.sum().clamp_min(1.0)
-        safe_labels = torch.where(shift_labels != -100, shift_labels, torch.zeros_like(shift_labels))
-
-        loss_ce_unmasked = F.cross_entropy(
-            shift_logits.reshape(-1, self.vocab_size),
-            safe_labels.reshape(-1),
-            reduction="none",
-            label_smoothing=self.label_smoothing,
-        ).reshape_as(shift_labels)
-        loss_ce = (loss_ce_unmasked * valid_mask).sum() / valid_tokens_count
-
-        if self.chunk_idx == 0:
-            total_loss = loss_ce
+        if self.relay_only:
+            total_loss = curr_hidden.sum() * 0.0
         else:
-            if prev_log_probs is None:
-                raise RuntimeError("prev_log_probs is required for non-zero chunks.")
-            teacher_log_probs = prev_log_probs[..., :-1, :].float()
-            student_log_probs = F.log_softmax(shift_logits.float(), dim=-1)
-            loss_kl_unmasked = F.kl_div(
-                student_log_probs,
-                teacher_log_probs,
+            labels = labels.long()
+            shift_logits = logits[..., :-1, :]
+            shift_labels = labels[..., 1:]
+            valid_mask = (shift_labels != -100).float()
+            valid_tokens_count = valid_mask.sum().clamp_min(1.0)
+            safe_labels = torch.where(shift_labels != -100, shift_labels, torch.zeros_like(shift_labels))
+
+            loss_ce_unmasked = F.cross_entropy(
+                shift_logits.reshape(-1, self.vocab_size),
+                safe_labels.reshape(-1),
                 reduction="none",
-                log_target=True,
-            ).sum(dim=-1)
-            loss_kl = (loss_kl_unmasked * valid_mask).sum() / valid_tokens_count
-            total_loss = self.alpha * loss_ce + (1.0 - self.alpha) * loss_kl
+                label_smoothing=self.label_smoothing,
+            ).reshape_as(shift_labels)
+            loss_ce = (loss_ce_unmasked * valid_mask).sum() / valid_tokens_count
+
+            if self.chunk_idx == 0:
+                total_loss = loss_ce
+            else:
+                if prev_log_probs is None:
+                    raise RuntimeError("prev_log_probs is required for non-zero chunks.")
+                teacher_log_probs = prev_log_probs[..., :-1, :].float()
+                student_log_probs = F.log_softmax(shift_logits.float(), dim=-1)
+                loss_kl_unmasked = F.kl_div(
+                    student_log_probs,
+                    teacher_log_probs,
+                    reduction="none",
+                    log_target=True,
+                ).sum(dim=-1)
+                loss_kl = (loss_kl_unmasked * valid_mask).sum() / valid_tokens_count
+                total_loss = self.alpha * loss_ce + (1.0 - self.alpha) * loss_kl
 
         next_hidden = transport_cast(curr_hidden.detach(), self.transport_dtype)
         next_log_probs = transport_cast(
@@ -150,6 +155,7 @@ def build_chunk_module(
     alpha: float,
     label_smoothing: float,
     transport_dtype: torch.dtype,
+    relay_only: bool,
 ) -> tuple[ForwardOnlySIDChunk, int, int]:
     layers, final_norm, lm_head, vocab_size, rotary_emb = get_model_parts(backbone)
     total_layers = len(layers)
@@ -167,6 +173,7 @@ def build_chunk_module(
         alpha=alpha,
         label_smoothing=label_smoothing,
         transport_dtype=transport_dtype,
+        relay_only=relay_only,
     )
     return chunk_module, start, end
 
@@ -204,6 +211,7 @@ def export_chunk(
     label_smoothing: float,
     transport_dtype: torch.dtype,
     use_xnnpack: bool,
+    relay_only: bool,
 ) -> Path:
     resolved_model_name = resolve_model_name(model_name)
     print(f"[1/5] Loading model: {resolved_model_name}")
@@ -220,6 +228,7 @@ def export_chunk(
         alpha=alpha,
         label_smoothing=label_smoothing,
         transport_dtype=transport_dtype,
+        relay_only=relay_only,
     )
     print(f"      layers=[{start}, {end - 1}]")
 
@@ -320,6 +329,11 @@ def main() -> None:
     parser.add_argument("--alpha", type=float, default=0.5)
     parser.add_argument("--label_smoothing", type=float, default=0.1)
     parser.add_argument("--transport_dtype", type=str, default="float16")
+    parser.add_argument(
+        "--relay_only",
+        action="store_true",
+        help="Export a simple forward-relay graph without local CE/KD loss. Use this for system validation.",
+    )
     parser.add_argument("--output_dir", type=Path, default=Path("./exported_pte"))
     parser.add_argument(
         "--artifact_prefix",
@@ -358,6 +372,7 @@ def main() -> None:
             label_smoothing=args.label_smoothing,
             transport_dtype=transport_dtype,
             use_xnnpack=args.enable_xnnpack,
+            relay_only=args.relay_only,
         )
 
     print(
