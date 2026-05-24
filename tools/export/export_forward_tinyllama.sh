@@ -12,6 +12,7 @@ SEQ_LEN="${SEQ_LEN:-64}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
 TRANSPORT_DTYPE="${TRANSPORT_DTYPE:-float16}"
 ARTIFACT_PREFIX="${ARTIFACT_PREFIX:-tinyllama}"
+ARTIFACT_SUFFIX="${ARTIFACT_SUFFIX:-_inf}"
 OUTPUT_DIR="${OUTPUT_DIR:-model}"
 
 python tools/export/sid_export_forward_mobile.py \
@@ -23,4 +24,5 @@ python tools/export/sid_export_forward_mobile.py \
   --transport_dtype "${TRANSPORT_DTYPE}" \
   --relay_only \
   --artifact_prefix "${ARTIFACT_PREFIX}" \
+  --artifact_suffix "${ARTIFACT_SUFFIX}" \
   --output_dir "${OUTPUT_DIR}"

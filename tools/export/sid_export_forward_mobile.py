@@ -207,6 +207,7 @@ def export_chunk(
     batch_size: int,
     output_dir: Path,
     artifact_prefix: str,
+    artifact_suffix: str,
     alpha: float,
     label_smoothing: float,
     transport_dtype: torch.dtype,
@@ -270,7 +271,7 @@ def export_chunk(
     executorch_program = edge_program.to_executorch()
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    save_path = output_dir / f"{artifact_prefix}_chunk_{target_chunk}.pte"
+    save_path = output_dir / f"{artifact_prefix}_chunk_{target_chunk}{artifact_suffix}.pte"
 
     print("[5/5] Writing .pte")
     with save_path.open("wb") as f:
@@ -342,6 +343,12 @@ def main() -> None:
         help="Output files are named {artifact_prefix}_chunk_{idx}.pte.",
     )
     parser.add_argument(
+        "--artifact_suffix",
+        type=str,
+        default="",
+        help="Optional suffix before .pte, for example _inf.",
+    )
+    parser.add_argument(
         "--enable_xnnpack",
         action="store_true",
         help="Enable XNNPACK lowering. Leave off for the first mobile compatibility run.",
@@ -368,6 +375,7 @@ def main() -> None:
             batch_size=args.batch_size,
             output_dir=args.output_dir,
             artifact_prefix=args.artifact_prefix,
+            artifact_suffix=args.artifact_suffix,
             alpha=args.alpha,
             label_smoothing=args.label_smoothing,
             transport_dtype=transport_dtype,

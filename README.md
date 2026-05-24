@@ -211,6 +211,7 @@ python tools/export/sid_export_forward_mobile.py \
   --transport_dtype float16 \
   --relay_only \
   --artifact_prefix tinyllama \
+  --artifact_suffix _inf \
   --output_dir model
 ```
 
@@ -230,6 +231,7 @@ python tools/export/sid_export_forward_mobile.py \
   --transport_dtype float16 \
   --relay_only \
   --artifact_prefix tinyllama \
+  --artifact_suffix _inf \
   --output_dir model
 ```
 
