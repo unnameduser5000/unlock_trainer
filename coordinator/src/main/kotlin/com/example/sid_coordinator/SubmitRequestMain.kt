@@ -30,9 +30,11 @@ fun main(args: Array<String>) {
     val chunkIdx = max(0, args.getOrNull(6)?.toIntOrNull() ?: 0)
     val shapes = MODEL_SHAPES[modelPreset]
         ?: error("Unknown model preset '$modelPreset'. Supported: ${MODEL_SHAPES.keys.joinToString()}")
+    val maxMessageSizeBytes = 50 * 1024 * 1024
 
     val channel = ManagedChannelBuilder.forAddress(host, port)
         .usePlaintext()
+        .maxInboundMessageSize(maxMessageSizeBytes)
         .build()
 
     try {

@@ -277,7 +277,7 @@ object NativeShardRunner {
         val rawBytes = data.toByteArray()
         return when (dataType.normalizedDataType()) {
             "float32", "float" -> Tensor.fromBlob(rawBytes.toFloatArray(), shape)
-            "float16", "half" -> Tensor.fromBlob(rawBytes.toShortArray(), shape)
+            "float16", "half" -> Tensor.fromBlob(rawBytes.toFloatArrayFromHalf(), shape)
             "int32", "int" -> Tensor.fromBlob(rawBytes.toIntArray(), shape)
             "int64", "long" -> Tensor.fromBlob(rawBytes.toLongArray(), shape)
             "float64", "double" -> Tensor.fromBlob(rawBytes.toDoubleArray(), shape)
@@ -360,6 +360,10 @@ object NativeShardRunner {
         return ShortArray(buffer.remaining()).also(buffer::get)
     }
 
+    private fun ByteArray.toFloatArrayFromHalf(): FloatArray {
+        return toShortArray().map { halfBits -> halfToFloat(halfBits) }.toFloatArray()
+    }
+
     private fun ByteArray.toIntArray(): IntArray {
         if (isEmpty()) {
             return IntArray(0)
@@ -397,6 +401,39 @@ object NativeShardRunner {
         val bytes = ByteArray(size * Float.SIZE_BYTES)
         ByteBuffer.wrap(bytes).order(ByteOrder.nativeOrder()).asFloatBuffer().put(this)
         return bytes
+    }
+
+    private fun halfToFloat(rawHalf: Short): Float {
+        val half = rawHalf.toInt() and 0xffff
+        val sign = (half ushr 15) and 0x1
+        val exponent = (half ushr 10) and 0x1f
+        val fraction = half and 0x03ff
+
+        val floatBits = when (exponent) {
+            0 -> {
+                if (fraction == 0) {
+                    sign shl 31
+                } else {
+                    var normalizedFraction = fraction
+                    var normalizedExponent = -14
+                    while ((normalizedFraction and 0x0400) == 0) {
+                        normalizedFraction = normalizedFraction shl 1
+                        normalizedExponent--
+                    }
+                    normalizedFraction = normalizedFraction and 0x03ff
+                    (sign shl 31) or ((normalizedExponent + 127) shl 23) or (normalizedFraction shl 13)
+                }
+            }
+
+            0x1f -> {
+                (sign shl 31) or (0xff shl 23) or (fraction shl 13)
+            }
+
+            else -> {
+                (sign shl 31) or ((exponent - 15 + 127) shl 23) or (fraction shl 13)
+            }
+        }
+        return Float.fromBits(floatBits)
     }
 
     private fun ShortArray.toByteArray(): ByteArray {
