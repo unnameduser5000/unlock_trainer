@@ -62,24 +62,10 @@ object NativeShardRunner {
         try {
             return loadInferenceRuntime(modelPath)
         } catch (inferenceFailure: Throwable) {
-            Log.w(
-                LOG_TAG,
-                "Module.load() failed for $modelPath, trying TrainingModule: ${inferenceFailure.message}"
-            )
-        }
-
-        try {
-            val module = TrainingModule.load(modelPath)
-            Log.w(
-                LOG_TAG,
-                "Loaded ExecuTorch training module from $modelPath. " +
-                    "This path executes the exported training graph; it does not create cross-stage backprop RPC."
-            )
-            return TrainingLoadedRuntime(modelPath, module)
-        } catch (trainingFailure: Throwable) {
             throw IllegalStateException(
-                "Could not load ExecuTorch artifact as Module or TrainingModule: $modelPath",
-                trainingFailure
+                "ExecuTorch artifact has no __et_training marker, so it must load via Module. " +
+                    "Refusing unsafe TrainingModule fallback for forward-only artifact: $modelPath",
+                inferenceFailure
             )
         }
     }
