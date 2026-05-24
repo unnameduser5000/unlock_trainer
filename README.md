@@ -92,6 +92,7 @@ Key files:
 - [coordinator/config/pipeline.example.json](coordinator/config/pipeline.example.json)
 - [tools/export/sid_export_forward_mobile.py](tools/export/sid_export_forward_mobile.py)
 - [tools/export/sid_export_mobile.py](tools/export/sid_export_mobile.py)
+- [tools/export/export_bpfree_tinyllama.sh](tools/export/export_bpfree_tinyllama.sh)
 - [CONTRIBUTING.md](CONTRIBUTING.md)
 
 ## Data Contract Between Shards
@@ -175,13 +176,16 @@ The recommended first mobile system-test export script is:
 
 - [tools/export/sid_export_forward_mobile.py](tools/export/sid_export_forward_mobile.py)
 
-This script exports **forward-only** `.pte` shards for Android `Module.execute()`. Use this first when validating coordinator routing, worker-to-worker transfer, request tracking, and mobile memory behavior.
+This script exports **forward-only** `.pte` shards for Android `Module.execute()`. It can export either:
+
+- relay-only `_inf` shards for pure system validation
+- BP-free shards with local CE/KD loss outputs for the current algorithm path
 
 The joint forward/backward export script is:
 
 - [tools/export/sid_export_mobile.py](tools/export/sid_export_mobile.py)
 
-The joint script keeps the local training graph and targets Android `TrainingModule.executeForwardBackward()`. That path is useful for later training-runtime work, but it is more fragile on phones. If the goal is to validate the system pipeline first, use the forward-only script.
+The joint script uses PyTorch/ExecuTorch forward-backward export and targets Android `TrainingModule.executeForwardBackward()`. This is a local-shard runtime path: it can execute a training graph inside one shard, but it still does **not** add any cross-stage backward-gradient RPC. Use it only when the exported `.pte` really requires `TrainingModule`; use `sid_export_forward_mobile.py` when validating forward-only system routing or forward-only BP-free shard behavior.
 
 Why these mobile scripts exist:
 
@@ -217,8 +221,27 @@ python tools/export/sid_export_forward_mobile.py \
 
 This writes:
 
-- `model/tinyllama_chunk_0.pte`
-- `model/tinyllama_chunk_1.pte`
+- `model/tinyllama_chunk_0_inf.pte`
+- `model/tinyllama_chunk_1_inf.pte`
+
+Two-phone BP-free export with local CE/KD loss, still forward-only:
+
+```bash
+bash tools/export/export_bpfree_tinyllama.sh
+```
+
+Equivalent explicit command:
+
+```bash
+python tools/export/sid_export_forward_mobile.py \
+  --model_name tinyllama \
+  --num_chunks 4 \
+  --chunk_idx 0,1 \
+  --seq_len 64 \
+  --transport_dtype float16 \
+  --artifact_prefix tinyllama \
+  --output_dir model
+```
 
 For all four chunks:
 

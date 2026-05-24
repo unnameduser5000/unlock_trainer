@@ -9,6 +9,7 @@ import org.pytorch.executorch.Tensor
 import org.pytorch.executorch.training.TrainingModule
 import sid.Sid
 import java.io.Closeable
+import java.io.File
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.concurrent.locks.ReentrantLock
@@ -23,28 +24,15 @@ data class ShardExecutionResult(
 object NativeShardRunner {
     private const val LOG_TAG = "ExecuTorchShardRunner"
     private const val DEFAULT_METHOD = "forward"
+    private const val TRAINING_METADATA_SCAN_BYTES = 1024 * 1024
 
     private val cacheLock = ReentrantLock()
     private var cachedModelPath: String? = null
     private var cachedRuntime: LoadedRuntime? = null
 
     fun execute(modelPath: String, request: Sid.ForwardChunkRequest): ShardExecutionResult {
-        val candidateInputs = buildCandidateInputs(request)
         val runtime = acquireRuntime(modelPath)
-        val invocation = try {
-            runtime.execute(candidateInputs)
-        } catch (failure: Throwable) {
-            if (runtime is TrainingLoadedRuntime) {
-                Log.w(
-                    LOG_TAG,
-                    "Training runtime failed for $modelPath, retrying with inference Module: ${failure.message}"
-                )
-                val fallbackRuntime = replaceWithInferenceRuntime(modelPath, runtime)
-                fallbackRuntime.execute(candidateInputs)
-            } else {
-                throw failure
-            }
-        }
+        val invocation = runtime.execute(request)
         return invocation.toExecutionResult(request)
     }
 
@@ -61,6 +49,16 @@ object NativeShardRunner {
     }
 
     private fun loadRuntime(modelPath: String): LoadedRuntime {
+        if (modelPath.hasTrainingMetadata()) {
+            val module = TrainingModule.load(modelPath)
+            Log.w(
+                LOG_TAG,
+                "Loaded ExecuTorch training module from $modelPath. " +
+                    "This path executes the exported joint graph; it does not create cross-stage backprop RPC."
+            )
+            return TrainingLoadedRuntime(modelPath, module)
+        }
+
         try {
             return loadInferenceRuntime(modelPath)
         } catch (inferenceFailure: Throwable) {
@@ -75,7 +73,7 @@ object NativeShardRunner {
             Log.w(
                 LOG_TAG,
                 "Loaded ExecuTorch training module from $modelPath. " +
-                    "Prefer forward-only Module artifacts for mobile pipeline tests."
+                    "This path executes the exported training graph; it does not create cross-stage backprop RPC."
             )
             return TrainingLoadedRuntime(modelPath, module)
         } catch (trainingFailure: Throwable) {
@@ -101,19 +99,7 @@ object NativeShardRunner {
         return InferenceLoadedRuntime(modelPath, module, selectedMethod)
     }
 
-    private fun replaceWithInferenceRuntime(
-        modelPath: String,
-        expectedCurrentRuntime: LoadedRuntime
-    ): LoadedRuntime = cacheLock.withLock {
-        if (cachedRuntime === expectedCurrentRuntime) {
-            cachedRuntime?.closeQuietly()
-            cachedRuntime = loadInferenceRuntime(modelPath)
-            cachedModelPath = modelPath
-        }
-        return requireNotNull(cachedRuntime)
-    }
-
-    private fun buildCandidateInputs(request: Sid.ForwardChunkRequest): List<Array<EValue>> {
+    private fun buildInferenceInputCandidates(request: Sid.ForwardChunkRequest): List<Array<EValue>> {
         val hiddenStates = request.hiddenStates.toRequiredEValue("hidden_states")
         val attentionMask = request.attentionMask.toOptionalEValue()
         val positionIds = request.positionIds.toOptionalEValue()
@@ -198,6 +184,26 @@ object NativeShardRunner {
         return deduplicated
     }
 
+    private fun buildTrainingInputs(request: Sid.ForwardChunkRequest): Array<EValue> {
+        val inputs = buildList {
+            add(request.hiddenStates.toRequiredEValue("hidden_states"))
+            add(request.attentionMask.toRequiredEValue("attention_mask"))
+            add(request.positionIds.toRequiredEValue("position_ids"))
+            add(request.labels.toRequiredEValue("labels"))
+            if (!request.shiftLogPPrev.isEmptyTensor()) {
+                add(request.shiftLogPPrev.toRequiredEValue("prev_log_probs"))
+            }
+        }.toTypedArray()
+
+        Log.i(
+            LOG_TAG,
+            "Prepared ExecuTorch training signature: ${
+                inputs.joinToString(prefix = "[", postfix = "]") { it.describeForLog() }
+            }"
+        )
+        return inputs
+    }
+
     private fun InvocationResult.toExecutionResult(request: Sid.ForwardChunkRequest): ShardExecutionResult {
         var localLoss = 0f
         val tensors = mutableListOf<Tensor>()
@@ -275,7 +281,7 @@ object NativeShardRunner {
     private fun Sid.TensorData.toExecuTorchTensor(): Tensor {
         val shape = shapeList.map { it.toLong() }.toLongArray()
         val rawBytes = data.toByteArray()
-        return when (dataType.normalizedDataType()) {
+        val tensor = when (dataType.normalizedDataType()) {
             "float32", "float" -> Tensor.fromBlob(rawBytes.toFloatArray(), shape)
             "float16", "half" -> Tensor.fromBlob(rawBytes.toFloatArrayFromHalf(), shape)
             "int32", "int" -> Tensor.fromBlob(rawBytes.toIntArray(), shape)
@@ -285,6 +291,13 @@ object NativeShardRunner {
             "uint8" -> Tensor.fromBlobUnsigned(rawBytes, shape)
             else -> error("Unsupported TensorData dtype '$dataType' for ExecuTorch input.")
         }
+        Log.i(
+            LOG_TAG,
+            "Input tensor dtype=${tensor.dtype()} protoDtype=$dataType shape=${
+                shape.joinToString(prefix = "[", postfix = "]")
+            } bytes=${data.size()}"
+        )
+        return tensor
     }
 
     private fun Tensor.toSidTensor(): Sid.TensorData {
@@ -475,6 +488,48 @@ object NativeShardRunner {
             }
     }
 
+    private fun String.hasTrainingMetadata(): Boolean {
+        val marker = "__et_training".encodeToByteArray()
+        File(this).inputStream().buffered().use { input ->
+            val buffer = ByteArray(TRAINING_METADATA_SCAN_BYTES)
+            val read = input.read(buffer)
+            return read > 0 && buffer.indexOf(marker, read) >= 0
+        }
+    }
+
+    private fun ByteArray.indexOf(pattern: ByteArray, validLength: Int): Int {
+        if (pattern.isEmpty() || validLength < pattern.size) return -1
+        for (start in 0..(validLength - pattern.size)) {
+            var matched = true
+            for (offset in pattern.indices) {
+                if (this[start + offset] != pattern[offset]) {
+                    matched = false
+                    break
+                }
+            }
+            if (matched) return start
+        }
+        return -1
+    }
+
+    private fun EValue.describeForLog(): String {
+        return when {
+            isTensor() -> {
+                val tensor = toTensor()
+                "tensor(dtype=${tensor.dtype()},shape=${
+                    tensor.shape().joinToString(prefix = "[", postfix = "]")
+                })"
+            }
+
+            isNone() -> "none"
+            isInt() -> "int"
+            isDouble() -> "double"
+            isBool() -> "bool"
+            isString() -> "string"
+            else -> "unknown"
+        }
+    }
+
     private data class InvocationResult(
         val runtimeName: String,
         val methodName: String,
@@ -483,44 +538,30 @@ object NativeShardRunner {
     )
 
     private sealed interface LoadedRuntime : Closeable {
-        fun execute(candidateInputs: List<Array<EValue>>): InvocationResult
+        fun execute(request: Sid.ForwardChunkRequest): InvocationResult
     }
 
     private class TrainingLoadedRuntime(
         private val modelPath: String,
         private val module: TrainingModule
     ) : LoadedRuntime {
-        override fun execute(candidateInputs: List<Array<EValue>>): InvocationResult {
-            var lastFailure: Throwable? = null
-            for (inputs in candidateInputs) {
-                try {
-                    val outputs = module.executeForwardBackward(DEFAULT_METHOD, *inputs)
-                    Log.i(
-                        LOG_TAG,
-                        "TrainingModule.executeForwardBackward() succeeded for $modelPath with ${inputs.size} inputs"
-                    )
-                    return InvocationResult(
-                        runtimeName = "TrainingModule",
-                        methodName = DEFAULT_METHOD,
-                        inputCount = inputs.size,
-                        outputs = outputs
-                    )
-                } catch (t: Throwable) {
-                    lastFailure = t
-                    Log.w(
-                        LOG_TAG,
-                        "TrainingModule execution failed for $modelPath with ${inputs.size} inputs: ${t.message}"
-                    )
-                }
-            }
-            throw IllegalStateException(
-                "TrainingModule could not execute any supported input signature for $modelPath.",
-                lastFailure
+        override fun execute(request: Sid.ForwardChunkRequest): InvocationResult {
+            val inputs = buildTrainingInputs(request)
+            val outputs = module.executeForwardBackward(DEFAULT_METHOD, *inputs)
+            Log.i(
+                LOG_TAG,
+                "TrainingModule.executeForwardBackward() succeeded for $modelPath with ${inputs.size} inputs"
+            )
+            return InvocationResult(
+                runtimeName = "TrainingModule",
+                methodName = DEFAULT_METHOD,
+                inputCount = inputs.size,
+                outputs = outputs
             )
         }
 
         override fun close() {
-            // executorch-android 1.2.0 does not expose a public destroy/close API for TrainingModule.
+            // executorch-android 1.2.0 does not expose a public close API for TrainingModule.
         }
     }
 
@@ -529,7 +570,8 @@ object NativeShardRunner {
         private val module: Module,
         private val methodName: String
     ) : LoadedRuntime {
-        override fun execute(candidateInputs: List<Array<EValue>>): InvocationResult {
+        override fun execute(request: Sid.ForwardChunkRequest): InvocationResult {
+            val candidateInputs = buildInferenceInputCandidates(request)
             var lastFailure: Throwable? = null
             for (inputs in candidateInputs) {
                 try {

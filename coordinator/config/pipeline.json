@@ -12,8 +12,8 @@
   {
     "stageId": 0,
     "deviceId": "NX809J",
-    "modelShardId": "tinyllama_chunk_0_inf",
-    "modelArtifactPath": "../../model/tinyllama_chunk_0_inf.pte",
+    "modelShardId": "tinyllama_chunk_0",
+    "modelArtifactPath": "../../model/tinyllama_chunk_0.pte",
     "expectedHost": "192.168.214.103",
     "expectedPort": 26052
   },
@@ -21,8 +21,8 @@
   {
     "stageId": 1,
     "deviceId": "Lenovo_L71091",
-    "modelShardId": "tinyllama_chunk_1_inf",
-    "modelArtifactPath": "../../model/tinyllama_chunk_1_inf.pte",
+    "modelShardId": "tinyllama_chunk_1",
+    "modelArtifactPath": "../../model/tinyllama_chunk_1.pte",
     "expectedHost": "192.168.214.59",
     "expectedPort": 26052
   }

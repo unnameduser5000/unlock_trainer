@@ -192,6 +192,49 @@ def build_example_args(
     return (dummy_hidden, dummy_mask, dummy_pos, dummy_labels, dummy_prev_log_probs)
 
 
+def rewrite_empty_permuted(joint_graph) -> int:
+    """Rewrite aten.empty_permuted, which ExecuTorch edge/mobile does not implement."""
+    rewritten = 0
+    graph = joint_graph.graph
+    for node in list(graph.nodes):
+        if node.op != "call_function":
+            continue
+        if node.target not in (
+            torch.ops.aten.empty_permuted.out,
+            torch.ops.aten.empty_permuted.default,
+        ):
+            continue
+
+        with graph.inserting_before(node):
+            empty_node = graph.create_node(
+                "call_function",
+                torch.ops.aten.empty.memory_format,
+                (node.args[0],),
+                node.kwargs,
+            )
+            permute_target = (
+                torch.ops.aten.permute
+                if node.target == torch.ops.aten.empty_permuted.out
+                else torch.ops.aten.permute.default
+            )
+            permute_node = graph.create_node(
+                "call_function",
+                permute_target,
+                (empty_node, node.args[1]),
+            )
+            permute_node.meta.update(node.meta)
+
+        node.replace_all_uses_with(permute_node)
+        graph.erase_node(node)
+        rewritten += 1
+
+    if rewritten:
+        graph.lint()
+        joint_graph.graph_module.recompile()
+
+    return rewritten
+
+
 def export_chunk(
     *,
     model_name: str,
@@ -244,6 +287,13 @@ def export_chunk(
     with sdpa_kernel([SDPBackend.MATH]):
         ep = export(chunk_module, example_args, strict=False)
         joint_ep = _export_forward_backward(ep)
+        rewritten_empty_permuted = rewrite_empty_permuted(joint_ep)
+        if rewritten_empty_permuted:
+            print(
+                "      rewrote "
+                f"{rewritten_empty_permuted} aten.empty_permuted node(s) "
+                "to aten.empty + aten.permute"
+            )
 
     print("[4/5] Lowering to ExecuTorch edge program")
     edge_config = EdgeCompileConfig(_check_ir_validity=False)
@@ -264,6 +314,13 @@ def export_chunk(
     output_dir.mkdir(parents=True, exist_ok=True)
     stem = resolved_model_name.split("/")[-1].replace("-", "_").lower()
     save_path = output_dir / f"{stem}_sid_chunk_{target_chunk}.pte"
+
+    if b"aten::empty_permuted" in executorch_program.buffer:
+        raise RuntimeError(
+            "Exported PTE still contains aten::empty_permuted. "
+            "Do not deploy this artifact to Android; the current ExecuTorch "
+            "mobile runtime does not implement that op."
+        )
 
     print("[5/5] Writing .pte")
     with save_path.open("wb") as f:
