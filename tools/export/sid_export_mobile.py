@@ -243,6 +243,8 @@ def export_chunk(
     seq_len: int,
     batch_size: int,
     output_dir: Path,
+    artifact_prefix: str,
+    artifact_suffix: str,
     alpha: float,
     label_smoothing: float,
     transport_dtype: torch.dtype,
@@ -312,8 +314,7 @@ def export_chunk(
     executorch_program = edge_program.to_executorch()
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    stem = resolved_model_name.split("/")[-1].replace("-", "_").lower()
-    save_path = output_dir / f"{stem}_sid_chunk_{target_chunk}.pte"
+    save_path = output_dir / f"{artifact_prefix}_chunk_{target_chunk}{artifact_suffix}.pte"
 
     if b"aten::empty_permuted" in executorch_program.buffer:
         raise RuntimeError(
@@ -343,13 +344,41 @@ def parse_transport_dtype(raw: str) -> torch.dtype:
     raise ValueError(f"Unsupported transport dtype: {raw}")
 
 
+def parse_chunk_indices(raw: str, num_chunks: int) -> list[int]:
+    normalized = raw.strip()
+    if normalized == "-1":
+        return list(range(num_chunks))
+
+    chunk_indices = []
+    for item in normalized.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        chunk_idx = int(item)
+        if chunk_idx < 0 or chunk_idx >= num_chunks:
+            raise ValueError(f"chunk_idx {chunk_idx} is outside [0, {num_chunks - 1}]")
+        chunk_indices.append(chunk_idx)
+
+    if not chunk_indices:
+        raise ValueError("No chunk indices were provided.")
+    return sorted(dict.fromkeys(chunk_indices))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Export SID chunks for the current Android coordinator/worker pipeline."
+        description=(
+            "Export joint forward/backward SID chunks for Android TrainingModule.executeForwardBackward(). "
+            "This is the chunk-local backward path; it does not add cross-stage gradient RPC."
+        )
     )
     parser.add_argument("--model_name", type=str, default="tinyllama")
-    parser.add_argument("--num_chunks", type=int, default=8)
-    parser.add_argument("--chunk_idx", type=int, default=-1)
+    parser.add_argument("--num_chunks", type=int, default=4)
+    parser.add_argument(
+        "--chunk_idx",
+        type=str,
+        default="-1",
+        help="Use -1 for all chunks, a single index, or a comma list such as 0,1.",
+    )
     parser.add_argument("--seq_len", type=int, default=64)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--alpha", type=float, default=0.5)
@@ -357,15 +386,34 @@ def main() -> None:
     parser.add_argument("--transport_dtype", type=str, default="float16")
     parser.add_argument("--output_dir", type=Path, default=Path("./exported_pte"))
     parser.add_argument(
+        "--artifact_prefix",
+        type=str,
+        default="tinyllama",
+        help="Output files are named {artifact_prefix}_chunk_{idx}.pte.",
+    )
+    parser.add_argument(
+        "--artifact_suffix",
+        type=str,
+        default="",
+        help="Optional suffix before .pte.",
+    )
+    parser.add_argument(
         "--enable_xnnpack",
         action="store_true",
         help="Enable XNNPACK lowering. Leave off for the first joint-graph training export.",
     )
     args = parser.parse_args()
 
-    transport_dtype = parse_transport_dtype(args.transport_dtype)
+    if args.num_chunks <= 0:
+        raise ValueError("num_chunks must be positive.")
+    if args.seq_len < 2:
+        raise ValueError("seq_len must be at least 2.")
+    if args.batch_size <= 0:
+        raise ValueError("batch_size must be positive.")
 
-    chunk_indices = range(args.num_chunks) if args.chunk_idx == -1 else [args.chunk_idx]
+    transport_dtype = parse_transport_dtype(args.transport_dtype)
+    chunk_indices = parse_chunk_indices(args.chunk_idx, args.num_chunks)
+
     for chunk_idx in chunk_indices:
         print("=" * 72)
         export_chunk(
@@ -375,6 +423,8 @@ def main() -> None:
             seq_len=args.seq_len,
             batch_size=args.batch_size,
             output_dir=args.output_dir,
+            artifact_prefix=args.artifact_prefix,
+            artifact_suffix=args.artifact_suffix,
             alpha=args.alpha,
             label_smoothing=args.label_smoothing,
             transport_dtype=transport_dtype,

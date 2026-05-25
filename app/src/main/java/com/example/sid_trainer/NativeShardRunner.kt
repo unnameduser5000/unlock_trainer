@@ -6,6 +6,7 @@ import org.pytorch.executorch.DType
 import org.pytorch.executorch.EValue
 import org.pytorch.executorch.Module
 import org.pytorch.executorch.Tensor
+import org.pytorch.executorch.training.SGD
 import org.pytorch.executorch.training.TrainingModule
 import sid.Sid
 import java.io.Closeable
@@ -25,6 +26,7 @@ object NativeShardRunner {
     private const val LOG_TAG = "ExecuTorchShardRunner"
     private const val DEFAULT_METHOD = "forward"
     private const val TRAINING_METADATA_SCAN_BYTES = 1024 * 1024
+    private const val DEFAULT_TRAINING_LEARNING_RATE = 1e-5
 
     private val cacheLock = ReentrantLock()
     private var cachedModelPath: String? = null
@@ -531,12 +533,21 @@ object NativeShardRunner {
         private val modelPath: String,
         private val module: TrainingModule
     ) : LoadedRuntime {
+        private var optimizer: SGD? = null
+
         override fun execute(request: Sid.ForwardChunkRequest): InvocationResult {
             val inputs = buildTrainingInputs(request)
             val outputs = module.executeForwardBackward(DEFAULT_METHOD, *inputs)
+            val gradients = module.namedGradients(DEFAULT_METHOD)
+            require(gradients.isNotEmpty()) {
+                "TrainingModule.executeForwardBackward() produced no gradients for $modelPath."
+            }
+            val sgd = optimizer ?: createOptimizer().also { optimizer = it }
+            sgd.step(gradients)
             Log.i(
                 LOG_TAG,
-                "TrainingModule.executeForwardBackward() succeeded for $modelPath with ${inputs.size} inputs"
+                "TrainingModule.executeForwardBackward() and SGD.step() succeeded for $modelPath " +
+                    "with ${inputs.size} inputs gradients=${gradients.size}"
             )
             return InvocationResult(
                 runtimeName = "TrainingModule",
@@ -546,8 +557,21 @@ object NativeShardRunner {
             )
         }
 
+        private fun createOptimizer(): SGD {
+            val parameters = module.namedParameters(DEFAULT_METHOD)
+            require(parameters.isNotEmpty()) {
+                "TrainingModule has no trainable parameters for $modelPath."
+            }
+            Log.i(
+                LOG_TAG,
+                "Creating ExecuTorch SGD optimizer for $modelPath " +
+                    "parameters=${parameters.size} lr=$DEFAULT_TRAINING_LEARNING_RATE"
+            )
+            return SGD.create(parameters, DEFAULT_TRAINING_LEARNING_RATE)
+        }
+
         override fun close() {
-            // executorch-android 1.2.0 does not expose a public close API for TrainingModule.
+            // executorch-android 1.2.0 Maven AAR does not expose TrainingModule.close().
         }
     }
 

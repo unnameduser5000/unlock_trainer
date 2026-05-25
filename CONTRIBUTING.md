@@ -11,6 +11,7 @@ This repository is still a research prototype. The main goal of collaboration is
 
 Read these files first:
 
+- [docs/CURRENT_DEBUG_STATE.md](docs/CURRENT_DEBUG_STATE.md)
 - [README.md](README.md)
 - [coordinator/README.md](coordinator/README.md)
 - [app/src/main/proto/sid.proto](app/src/main/proto/sid.proto)

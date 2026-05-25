@@ -33,6 +33,7 @@ coordinator/data/
 # Model artifacts and generated exports
 model/*.pte
 exported_pte/
+executorch/
 
 # Python caches and virtual environments
 __pycache__/
@@ -47,3 +48,4 @@ env/
 # Logs and memory dumps
 *.log
 *.hprof
+debug_runs/

@@ -276,10 +276,13 @@ class MainActivity : ComponentActivity() {
                             appendLog("Coordinator command: $command")
                         }
                         when {
-                            command.equals("DRAIN", ignoreCase = true) ||
-                                command.equals("PAUSED", ignoreCase = true) -> {
+                            command.equals("DRAIN", ignoreCase = true) -> {
                                 acceptsNewChunks = false
                                 activeGrpcManager?.setWorkerActive(false)
+                            }
+
+                            command.equals("PAUSED", ignoreCase = true) -> {
+                                // PAUSED is the coordinator echo for a worker-reported inactive heartbeat.
                             }
 
                             command.equals("RESUME", ignoreCase = true) ||

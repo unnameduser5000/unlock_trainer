@@ -93,6 +93,7 @@ Key files:
 - [tools/export/sid_export_forward_mobile.py](tools/export/sid_export_forward_mobile.py)
 - [tools/export/sid_export_mobile.py](tools/export/sid_export_mobile.py)
 - [tools/export/export_bpfree_tinyllama.sh](tools/export/export_bpfree_tinyllama.sh)
+- [tools/export/export_forward_belief_tinyllama.sh](tools/export/export_forward_belief_tinyllama.sh)
 - [CONTRIBUTING.md](CONTRIBUTING.md)
 
 ## Data Contract Between Shards
@@ -179,13 +180,13 @@ The recommended first mobile system-test export script is:
 This script exports **forward-only** `.pte` shards for Android `Module.execute()`. It can export either:
 
 - relay-only `_inf` shards for pure system validation
-- BP-free shards with local CE/KD loss outputs for the current algorithm path
+- forward belief/local-loss shards with local CE/KD loss outputs, but without local backward/optimizer
 
 The joint forward/backward export script is:
 
 - [tools/export/sid_export_mobile.py](tools/export/sid_export_mobile.py)
 
-The joint script uses PyTorch/ExecuTorch forward-backward export and targets Android `TrainingModule.executeForwardBackward()`. This is a local-shard runtime path: it can execute a training graph inside one shard, but it still does **not** add any cross-stage backward-gradient RPC. Use it only when the exported `.pte` really requires `TrainingModule`; use `sid_export_forward_mobile.py` when validating forward-only system routing or forward-only BP-free shard behavior.
+The joint script uses PyTorch/ExecuTorch forward-backward export and targets Android `TrainingModule.executeForwardBackward()`. This is the full BP-free training artifact path for the current prototype: each shard can run local loss, local backward, and a local optimizer step, while the system still does **not** add any cross-stage backward-gradient RPC. Use `sid_export_forward_mobile.py` only when validating the system routing or the forward belief signal path.
 
 Why these mobile scripts exist:
 
@@ -224,7 +225,7 @@ This writes:
 - `model/tinyllama_chunk_0_inf.pte`
 - `model/tinyllama_chunk_1_inf.pte`
 
-Two-phone BP-free export with local CE/KD loss, still forward-only:
+Two-phone BP-free training export with local CE/KD loss/backward:
 
 ```bash
 bash tools/export/export_bpfree_tinyllama.sh
@@ -233,7 +234,7 @@ bash tools/export/export_bpfree_tinyllama.sh
 Equivalent explicit command:
 
 ```bash
-python tools/export/sid_export_forward_mobile.py \
+python tools/export/sid_export_mobile.py \
   --model_name tinyllama \
   --num_chunks 4 \
   --chunk_idx 0,1 \
@@ -241,6 +242,12 @@ python tools/export/sid_export_forward_mobile.py \
   --transport_dtype float16 \
   --artifact_prefix tinyllama \
   --output_dir model
+```
+
+Forward belief/local-loss export, for isolating the forward data plane without local backward:
+
+```bash
+bash tools/export/export_forward_belief_tinyllama.sh
 ```
 
 For all four chunks:
@@ -270,14 +277,16 @@ python tools/export/sid_export_forward_mobile.py \
   --output_dir model
 ```
 
-Joint training-runtime export, for later compatibility testing:
+Single-chunk joint training-runtime export:
 
 ```bash
 python tools/export/sid_export_mobile.py \
   --model_name tinyllama \
   --num_chunks 4 \
   --chunk_idx 0 \
-  --seq_len 64
+  --seq_len 64 \
+  --artifact_prefix tinyllama \
+  --output_dir model
 ```
 
 Notes:
@@ -285,7 +294,8 @@ Notes:
 - exported `.pte` files are **not committed** to git
 - place the generated files under `model/` or another local artifact path referenced by the coordinator config
 - after replacing coordinator-served artifacts, call `POST /api/v1/routing/reload` and restart the Android workers
-- `--relay_only` is recommended for the first end-to-end mobile system test. It preserves the stage-to-stage tensor relay while skipping local CE/KD loss inside the `.pte`, which avoids conflating coordinator/data-plane validation with model-loss runtime compatibility.
+- `--relay_only` is recommended only for the first end-to-end mobile system test. It preserves the stage-to-stage tensor relay while skipping local CE/KD loss inside the `.pte`, which avoids conflating coordinator/data-plane validation with model-loss runtime compatibility.
+- Full BP-free training uses `sid_export_mobile.py` / `export_bpfree_tinyllama.sh`, not the markerless forward-only script.
 
 ## Coordinator Setup
 
