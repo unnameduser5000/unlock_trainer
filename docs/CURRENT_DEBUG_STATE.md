@@ -2,7 +2,7 @@
 
 This file is the first file to read after any context reset.
 
-Last updated: 2026-05-25 16:29 Asia/Shanghai
+Last updated: 2026-05-25 17:41 Asia/Shanghai
 
 ## Mainline
 
@@ -10,7 +10,7 @@ The intended mainline experiment is BP-free / forward-only inter-stage training 
 
 Immediate target: restore the algorithm distinction before running more claims. BP-free means no cross-chunk backward-gradient traffic; it does not mean "no backward anywhere". A real BP-free training step still needs local backward/optimizer inside each chunk, while chunks exchange forward belief/log-prob signals.
 
-Current deployed `tinyllama_chunk_0/1.pte` artifacts are training PTEs with `__et_training=3`. They are served under the non-`_inf` filenames and should run through Android `TrainingModule.executeForwardBackward()` plus local `SGD.step()`.
+The previously verified non-LoRA `tinyllama_chunk_0/1.pte` artifacts are training PTEs with `__et_training=3` and run through Android `TrainingModule.executeForwardBackward()` plus local `SGD.step()`. The current local runtime config was switched on 2026-05-25 17:19 to the LoRA artifacts `tinyllama_lora_chunk_0/1.pte` for the LoRA smoke test.
 
 Do not confuse these three paths:
 
@@ -40,7 +40,12 @@ Coordinator:
 - admin HTTP: `http://127.0.0.1:18080`
 - config: `coordinator/config/pipeline.json`
 
-Current config should point to:
+For the current LoRA smoke path, local config points to:
+
+- stage 0: `model/tinyllama_lora_chunk_0.pte`
+- stage 1: `model/tinyllama_lora_chunk_1.pte`
+
+The non-LoRA baseline config points to:
 
 - stage 0: `model/tinyllama_chunk_0.pte`
 - stage 1: `model/tinyllama_chunk_1.pte`
@@ -255,6 +260,28 @@ Validation performed locally:
 - Export dependency fix: `requirements-export.txt` now pins `torch==2.11.*` because `executorch==1.2.0` declares `torch>=2.11.0`; old `torch==2.9.0` caused pip resolver conflicts and `torchao` compatibility warnings.
 
 Do not claim LoRA mobile training has completed yet. The completed phone run at request `tinyllama-training-20260525-1542` was the non-LoRA training-PTE path.
+
+Verified 2026-05-25 17:41 after copying newly generated LoRA PTEs into `model/`:
+
+- Local PTE inspection:
+  - `model/tinyllama_lora_chunk_0.pte`: size `1143652096`, SHA256 `640cf3f4a92a89ad011453eea1bd1d6b430e40a39c351e2ae616b05692a7b5a1`, `__et_training=3`, `aten::empty_permuted=0`
+  - `model/tinyllama_lora_chunk_1.pte`: size `1143656576`, SHA256 `6b2f7eca349b2b2df374b91573a96428251cba6153b02a6d5f50c2d84a96bc11`, `__et_training=3`, `aten::empty_permuted=0`
+- `coordinator/config/pipeline.json` was switched locally to `tinyllama_lora_chunk_0/1`, then `POST /api/v1/routing/reload` succeeded.
+- Direct ADB caching was used because coordinator admin HTTP became unresponsive while serving a large shard download:
+  - `adb push model\tinyllama_lora_chunk_0.pte /data/local/tmp/tinyllama_lora_chunk_0.pte`, then `run-as com.example.sid_trainer cp ... files/shards/tinyllama_lora_chunk_0.pte`
+  - same flow for `tinyllama_lora_chunk_1.pte`
+- Phone cache hashes matched the local hashes above.
+- Restarted both Android workers. Coordinator status then showed routing epoch `262`, `liveNodeCount=2`, `inactiveNodeCount=0`, both stages on port `26052`, node `56` for NX stage 0 and node `57` for Lenovo stage 1.
+- Submitted LoRA synthetic smoke request:
+  - `requestId=tinyllama-lora-smoke-20260525-1730`
+  - `modelPreset=tinyllama`, `seqLen=64`, `batchSize=1`, `chunkIdx=0`
+- Result: success. `message=Stage 1 finished request tinyllama-lora-smoke-20260525-1730`, `processedStageId=1`, `processedChunkIdx=1`, `terminal=true`, `outputHiddenBytes=262144`.
+- Coordinator events show stage 0 node `56` received chunk 0, completed local shard, forwarded to `192.168.214.59`, stage 1 node `57` received chunk 1, completed local shard, and returned terminal success.
+- Lenovo logcat explicitly confirms LoRA training runtime and optimizer: `Creating ExecuTorch SGD optimizer ... tinyllama_lora_chunk_1.pte parameters=20 lr=1.0E-5`, then `TrainingModule.executeForwardBackward() and SGD.step() succeeded ... with 5 inputs gradients=20`.
+- NX focused logcat still returns no app-tag lines on this device, but stage 0 evidence is: phone hash matches LoRA training PTE with `__et_training=3`; `NativeShardRunner` can only load such an artifact through `TrainingModule`; coordinator recorded stage 0 `LOCAL_COMPLETED` and `FORWARDING`.
+- Debug bundle: `debug_runs/android-20260525-174128` (ignored by git).
+
+LoRA real SFT request is still not completed because `data/sft_requests/` is not present on the Windows coordinator machine. Generate or copy a prepared request set before running `:coordinator:runSubmitPreparedRequest`.
 
 ## Commands That Should Be Used
 
