@@ -2,7 +2,7 @@
 
 This file is the first file to read after any context reset.
 
-Last updated: 2026-05-25 16:18 Asia/Shanghai
+Last updated: 2026-05-25 16:29 Asia/Shanghai
 
 ## Mainline
 
@@ -252,6 +252,7 @@ Validation performed locally:
 - `python -m py_compile tools\export\sid_export_mobile.py tools\data\prepare_lora_sft_requests.py`: passed.
 - `:coordinator:compileKotlin --offline --no-daemon`: passed when run outside the sandbox because sandboxed Gradle failed with a JVM loopback error.
 - `python tools\data\prepare_lora_sft_requests.py --help` and `python tools\export\sid_export_mobile.py --help` did not run in this Windows shell because this local Python has no `torch`; this is an environment limitation, not a syntax result. Run these on the server export environment.
+- Export dependency fix: `requirements-export.txt` now pins `torch==2.11.*` because `executorch==1.2.0` declares `torch>=2.11.0`; old `torch==2.9.0` caused pip resolver conflicts and `torchao` compatibility warnings.
 
 Do not claim LoRA mobile training has completed yet. The completed phone run at request `tinyllama-training-20260525-1542` was the non-LoRA training-PTE path.
 
