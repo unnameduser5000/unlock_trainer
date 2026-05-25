@@ -271,12 +271,12 @@ Verified 2026-05-25 17:41 after copying newly generated LoRA PTEs into `model/`:
   - `adb push model\tinyllama_lora_chunk_0.pte /data/local/tmp/tinyllama_lora_chunk_0.pte`, then `run-as com.example.sid_trainer cp ... files/shards/tinyllama_lora_chunk_0.pte`
   - same flow for `tinyllama_lora_chunk_1.pte`
 - Phone cache hashes matched the local hashes above.
-- Restarted both Android workers. Coordinator status then showed routing epoch `262`, `liveNodeCount=2`, `inactiveNodeCount=0`, both stages on port `26052`, node `56` for NX stage 0 and node `57` for Lenovo stage 1.
+- Restarted both Android workers. Coordinator status showed `liveNodeCount=2`, `inactiveNodeCount=0`, node `56` for NX stage 0 and node `57` for Lenovo stage 1. During the successful request, stage 0 forwarded to Lenovo at `192.168.214.59:39899`; this dynamic Lenovo port was route-ready and is not itself a failure.
 - Submitted LoRA synthetic smoke request:
   - `requestId=tinyllama-lora-smoke-20260525-1730`
   - `modelPreset=tinyllama`, `seqLen=64`, `batchSize=1`, `chunkIdx=0`
 - Result: success. `message=Stage 1 finished request tinyllama-lora-smoke-20260525-1730`, `processedStageId=1`, `processedChunkIdx=1`, `terminal=true`, `outputHiddenBytes=262144`.
-- Coordinator events show stage 0 node `56` received chunk 0, completed local shard, forwarded to `192.168.214.59`, stage 1 node `57` received chunk 1, completed local shard, and returned terminal success.
+- Coordinator events show stage 0 node `56` received chunk 0, completed local shard, forwarded to `192.168.214.59:39899`, stage 1 node `57` received chunk 1, completed local shard, and returned terminal success.
 - Lenovo logcat explicitly confirms LoRA training runtime and optimizer: `Creating ExecuTorch SGD optimizer ... tinyllama_lora_chunk_1.pte parameters=20 lr=1.0E-5`, then `TrainingModule.executeForwardBackward() and SGD.step() succeeded ... with 5 inputs gradients=20`.
 - NX focused logcat still returns no app-tag lines on this device, but stage 0 evidence is: phone hash matches LoRA training PTE with `__et_training=3`; `NativeShardRunner` can only load such an artifact through `TrainingModule`; coordinator recorded stage 0 `LOCAL_COMPLETED` and `FORWARDING`.
 - Debug bundle: `debug_runs/android-20260525-174128` (ignored by git).
