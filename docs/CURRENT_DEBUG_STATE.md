@@ -2,7 +2,7 @@
 
 This file is the first file to read after any context reset.
 
-Last updated: 2026-05-25 17:41 Asia/Shanghai
+Last updated: 2026-05-25 19:24 Asia/Shanghai
 
 ## Mainline
 
@@ -282,6 +282,30 @@ Verified 2026-05-25 17:41 after copying newly generated LoRA PTEs into `model/`:
 - Debug bundle: `debug_runs/android-20260525-174128` (ignored by git).
 
 LoRA real SFT request is still not completed because `data/sft_requests/` is not present on the Windows coordinator machine. Generate or copy a prepared request set before running `:coordinator:runSubmitPreparedRequest`.
+
+Verified 2026-05-25 19:24 for real prepared Dolly SFT requests:
+
+- Prepared request set is present at `data/sft_requests/tinyllama_dolly64_smoke`.
+- `metadata.json` shows `dataset=databricks/databricks-dolly-15k`, `seq_len=64`, `limit=2`, `attention_mask=causal`, `mask_prompt=true`.
+- Label audit:
+  - record index `0`, `request_id=dolly-lora-smoke-000000`: `prompt_token_count=64`, `valid_labels=0`; do not use this record as a training-signal proof because the prompt fills the fixed 64-token window.
+  - record index `1`, `request_id=dolly-lora-smoke-000001`: `prompt_token_count=22`, `valid_labels=3`; this is the valid smoke record.
+- First attempt with relative manifest path failed because Gradle `JavaExec` ran from the `coordinator/` module directory and could not find `data/sft_requests/...`.
+- Workaround run with absolute manifest path succeeded:
+  - `requestId=dolly-lora-prepared-20260525-1909`
+  - manifest: absolute path to `data\sft_requests\tinyllama_dolly64_smoke\requests.jsonl`
+  - record index `1`
+  - result: `success=true`, `message=Stage 1 finished request dolly-lora-prepared-20260525-1909`, `processedStageId=1`, `processedChunkIdx=1`, `terminal=true`, `outputHiddenBytes=262144`
+  - decoded stored payload: `hidden_states` float32 `[1,64,2048]`, `attention_mask` float32 `[1,1,64,64]`, `position_ids` int64 `[1,64]`, `labels` int64 `[1,64]`, empty `shift_log_p_prev`
+  - coordinator events: stage 0 node `60` received chunk 0, `LOCAL_COMPLETED`, forwarded to `192.168.214.59:26052`; stage 1 node `58` received chunk 1, `LOCAL_COMPLETED`, terminal `COMPLETED`
+  - Lenovo logcat confirms LoRA training runtime: `TrainingModule.executeForwardBackward() and SGD.step() succeeded ... tinyllama_lora_chunk_1.pte with 5 inputs gradients=20`
+- Fix added after that run: `coordinator/build.gradle.kts` now sets `workingDir = rootProject.projectDir` for `runSubmitPreparedRequest`.
+- Relative-path verification run succeeded after the fix:
+  - command shape: `:coordinator:runSubmitPreparedRequest --args="127.0.0.1 50051 data/sft_requests/tinyllama_dolly64_smoke/requests.jsonl 1 dolly-lora-prepared-relpath-20260525-1919"`
+  - result: `success=true`, `message=Stage 1 finished request dolly-lora-prepared-relpath-20260525-1919`
+  - coordinator events again show stage 0 node `60` local completion and forwarding, then stage 1 node `58` local completion and terminal success.
+  - Lenovo logcat again confirms `TrainingModule.executeForwardBackward() and SGD.step() succeeded ... gradients=20`.
+- Debug bundle after the prepared SFT run: `debug_runs/android-20260525-192457` (ignored by git).
 
 ## Commands That Should Be Used
 
