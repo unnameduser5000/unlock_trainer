@@ -2,7 +2,7 @@
 
 This file is the first file to read after any context reset.
 
-Last updated: 2026-05-25 15:15 Asia/Shanghai
+Last updated: 2026-05-25 15:44 Asia/Shanghai
 
 ## Mainline
 
@@ -10,7 +10,7 @@ The intended mainline experiment is BP-free / forward-only inter-stage training 
 
 Immediate target: restore the algorithm distinction before running more claims. BP-free means no cross-chunk backward-gradient traffic; it does not mean "no backward anywhere". A real BP-free training step still needs local backward/optimizer inside each chunk, while chunks exchange forward belief/log-prob signals.
 
-Current deployed `Module.execute()` artifacts only compute local CE/KD loss and forward belief/log-prob tensors. They are useful for validating the forward data plane and belief signal path, but they are not a complete training step because no chunk-local backward or optimizer update occurs.
+Current deployed `tinyllama_chunk_0/1.pte` artifacts are training PTEs with `__et_training=3`. They are served under the non-`_inf` filenames and should run through Android `TrainingModule.executeForwardBackward()` plus local `SGD.step()`.
 
 Do not confuse these three paths:
 
@@ -25,7 +25,7 @@ Real BP-free training target:
 - Android source now calls a chunk-local optimizer for training PTEs. In `NativeShardRunner.TrainingLoadedRuntime.execute`, the flow is `TrainingModule.executeForwardBackward("forward", *inputs)`, then `namedGradients("forward")`, lazy `SGD.create(namedParameters("forward"), 1e-5)`, then `SGD.step(gradients)`. This was verified by `:app:assembleDebug` on 2026-05-25 14:55. The currently deployed phone app still needs to be rebuilt/installed before this behavior exists on device.
 - Maven `org.pytorch:executorch-android:1.2.0` exposes `SGD`, `namedParameters`, and `namedGradients`, but does not expose `TrainingModule.close()` to Kotlin. Do not re-add `module.close()` unless the dependency is upgraded and a build confirms it.
 
-The recent successful request only proved a `Module.execute()` forward pipeline request at fixed `seqLen=64`; it did not prove the full training experiment.
+The older `tinyllama-mainline-20260524-2349` request only proved a `Module.execute()` forward pipeline request at fixed `seqLen=64`; it did not prove the full training experiment. The newer `tinyllama-training-20260525-1542` request used training PTEs and completed through both phones.
 
 ## Current Devices
 
@@ -143,6 +143,28 @@ Fixed a worker-active self-lock bug on 2026-05-25:
 - After reinstall, NX reproduced this as `isActive=false` while the process was alive and heartbeating.
 - Fix: Android now treats `"PAUSED"` as informational; only `"DRAIN"` actively disables local scheduling. This restored both stages to active.
 
+Verified 2026-05-25 15:44 after replacing `model/tinyllama_chunk_0.pte` and `model/tinyllama_chunk_1.pte` with training PTEs:
+
+- Local PTE inspection:
+  - `model/tinyllama_chunk_0.pte`: size `1143289984`, SHA256 `d936d5cd8fd24dd027ee52d638723e4bd66267a4bfd68e8c701f19b2f093b6ab`, `__et_training=3`, `aten::empty_permuted=0`
+  - `model/tinyllama_chunk_1.pte`: size `1143294592`, SHA256 `ea0b4a9705df241ac72292f0a336163afa07eaba029209c67fb6f5f6f2ae33c7`, `__et_training=3`, `aten::empty_permuted=0`
+  - `_inf` files remain markerless forward artifacts: chunk 0 SHA256 `c7a31652d9116b0848d579057478151dddcc9fe0a8528c639fd905ca4bc31cbd`; chunk 1 SHA256 `149d774ec8b2f4605da85cd3f20909cba3a4c7db712ffa91a779101807ce338e`.
+- Ran `POST /api/v1/routing/reload`, restarted both Android workers, and both phones redownloaded the new training PTEs.
+- Phone hashes:
+  - NX stage 0 `files/shards/tinyllama_chunk_0.pte`: `d936d5cd8fd24dd027ee52d638723e4bd66267a4bfd68e8c701f19b2f093b6ab`
+  - Lenovo stage 1 `files/shards/tinyllama_chunk_1.pte`: `ea0b4a9705df241ac72292f0a336163afa07eaba029209c67fb6f5f6f2ae33c7`
+- Coordinator status after deployment: routing epoch `227`, `liveNodeCount=2`, `inactiveNodeCount=0`, both stages on port `26052`.
+- Submitted true training-PTE request with:
+  - `requestId=tinyllama-training-20260525-1542`
+  - `modelPreset=tinyllama`, `seqLen=64`, `batchSize=1`, `chunkIdx=0`
+- Stored payload decode for `tinyllama-training-20260525-1542`: `hidden_states` float32 `[1,64,2048]`, `attention_mask` float32 `[1,1,64,64]`, `position_ids` int64 `[1,64]`, `labels` int64 `[1,64]`, empty `shift_log_p_prev`.
+- Result: success. `message=Stage 1 finished request tinyllama-training-20260525-1542`, `processedStageId=1`, `processedChunkIdx=1`, `terminal=true`, `outputHiddenBytes=262144`.
+- Coordinator events show stage 0 node `51` received chunk 0, completed local shard, forwarded to `192.168.214.59:26052`; stage 1 node `52` received chunk 1, completed local shard, and returned terminal success.
+- Lenovo logcat explicitly confirms training runtime and optimizer: `Creating ExecuTorch SGD optimizer ... parameters=47 lr=1.0E-5`, then `TrainingModule.executeForwardBackward() and SGD.step() succeeded ... with 5 inputs gradients=47`.
+- NX focused logcat still returns no app-tag lines on this device, but stage 0 evidence is: phone hash is a training PTE with `__et_training=3`; `NativeShardRunner` can only load such an artifact through `TrainingModule`; coordinator recorded stage 0 `LOCAL_COMPLETED` and `FORWARDING`.
+- No new NX tombstone beyond the old 2026-05-24 23:38 tombstone was listed. Lenovo tombstone listing is still permission-denied.
+- Debug bundle: `debug_runs/android-20260525-154400` (ignored by git).
+
 Important observed requests:
 
 - `tinyllama-mainline-20260524-2349`: stored payload proves `batch=1`, `seqLen=64`, hidden shape `[1,64,2048]`, labels shape `[1,64]`, empty `shift_log_p_prev`, default `chunkIdx=0`; completed through both phones.
@@ -184,7 +206,7 @@ Do not present either tombstone alone as the root cause. Use the newest logs and
 
 Debug bundle:
 
-- Latest local evidence bundle: `debug_runs/android-20260525-151510` (ignored by git).
+- Latest local evidence bundle: `debug_runs/android-20260525-154400` (ignored by git).
 
 ## Current Controversial Commit
 
