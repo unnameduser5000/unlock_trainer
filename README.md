@@ -289,6 +289,52 @@ python tools/export/sid_export_mobile.py \
   --output_dir model
 ```
 
+Two-phone LoRA training-runtime export:
+
+```bash
+CHUNK_IDX=0,1 OUTPUT_DIR=model bash tools/export/export_lora_tinyllama.sh
+```
+
+Equivalent explicit command:
+
+```bash
+python tools/export/sid_export_mobile.py \
+  --model_name tinyllama \
+  --num_chunks 4 \
+  --chunk_idx 0,1 \
+  --seq_len 64 \
+  --transport_dtype float16 \
+  --artifact_prefix tinyllama_lora \
+  --output_dir model \
+  --lora_rank 4 \
+  --lora_alpha 16 \
+  --lora_targets q_proj,v_proj
+```
+
+LoRA export freezes the base chunk weights and makes only the injected adapter tensors trainable inside `TrainingModule.executeForwardBackward()`. Cross-stage traffic is unchanged: hidden states and belief/log-prob signals go forward; no backward-gradient RPC is added.
+
+Prepare real SFT samples as SID requests:
+
+```bash
+python tools/data/prepare_lora_sft_requests.py \
+  --model_name tinyllama \
+  --dataset dolly \
+  --seq_len 64 \
+  --limit 32 \
+  --attention_mask causal \
+  --request_prefix dolly-lora \
+  --output_dir data/sft_requests/tinyllama_dolly64
+```
+
+Submit one prepared sample:
+
+```bash
+./gradlew :coordinator:runSubmitPreparedRequest \
+  --args="127.0.0.1 50051 data/sft_requests/tinyllama_dolly64/requests.jsonl 0"
+```
+
+Important: the current mobile shard contract starts stage 0 from `hidden_states`, not token IDs. The data preparation script tokenizes text and computes input embeddings on the server, then stores those embedded tensors for coordinator submission. Use `--attention_mask zero` only when reproducing the older synthetic demo request shape; real SFT samples should use the default causal mask.
+
 Notes:
 
 - exported `.pte` files are **not committed** to git

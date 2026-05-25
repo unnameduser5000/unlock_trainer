@@ -2,7 +2,7 @@
 
 This file is the first file to read after any context reset.
 
-Last updated: 2026-05-25 15:44 Asia/Shanghai
+Last updated: 2026-05-25 16:18 Asia/Shanghai
 
 ## Mainline
 
@@ -231,6 +231,30 @@ Before changing this again, decide explicitly whether the current artifact shoul
 
 Do not randomly switch to LoRA/PEFT or rewrite the algorithm.
 
+## LoRA / SFT Task Scaffold
+
+Status as of 2026-05-25 16:18:
+
+- LoRA is optional and does not change the default full-parameter training export. `tools/export/sid_export_mobile.py` keeps `--lora_rank 0` by default.
+- When LoRA is enabled, the exporter wraps selected `nn.Linear` children with local LoRA adapters, freezes the base chunk weights, and leaves only adapter tensors trainable for Android `TrainingModule.executeForwardBackward()` plus local `SGD.step()`.
+- Default LoRA wrapper: `tools/export/export_lora_tinyllama.sh`, with `CHUNK_IDX=0,1`, `SEQ_LEN=64`, `TRANSPORT_DTYPE=float16`, `ARTIFACT_PREFIX=tinyllama_lora`, `LORA_RANK=4`, `LORA_ALPHA=16`, `LORA_TARGETS=q_proj,v_proj`.
+- This still preserves the BP-free system distinction: stage-to-stage traffic is forward-only hidden states and belief/log-prob signals. LoRA only reduces which local chunk parameters are updated.
+- Real text data scaffold: `tools/data/prepare_lora_sft_requests.py`.
+  - Dataset presets: `dolly` -> `databricks/databricks-dolly-15k`, `alpaca` -> `tatsu-lab/alpaca`, `gsm8k` -> `openai/gsm8k` with `main/train`.
+  - Current mobile contract starts stage 0 from `hidden_states`, not token ids. Therefore the script tokenizes on the server, runs the model input embedding, and writes prepared tensor files plus `requests.jsonl`.
+  - Default attention mask is now `causal` for SFT. Use `--attention_mask zero` only for reproducing the older synthetic demo shape.
+  - Padding label handling was fixed so `pad_token=eos_token` does not mask a real EOS token; only positions added as padding are set to `-100`.
+- Coordinator submit scaffold: `coordinator/src/main/kotlin/com/example/sid_coordinator/SubmitPreparedRequestMain.kt`, exposed through Gradle task `:coordinator:runSubmitPreparedRequest`.
+- Generated request data under `data/sft_requests/` is ignored by git.
+
+Validation performed locally:
+
+- `python -m py_compile tools\export\sid_export_mobile.py tools\data\prepare_lora_sft_requests.py`: passed.
+- `:coordinator:compileKotlin --offline --no-daemon`: passed when run outside the sandbox because sandboxed Gradle failed with a JVM loopback error.
+- `python tools\data\prepare_lora_sft_requests.py --help` and `python tools\export\sid_export_mobile.py --help` did not run in this Windows shell because this local Python has no `torch`; this is an environment limitation, not a syntax result. Run these on the server export environment.
+
+Do not claim LoRA mobile training has completed yet. The completed phone run at request `tinyllama-training-20260525-1542` was the non-LoRA training-PTE path.
+
 ## Commands That Should Be Used
 
 Do not use `rg` in this Windows workspace. It repeatedly fails with Access Denied here. Use PowerShell `Get-ChildItem` and `Select-String`.
@@ -265,6 +289,31 @@ Inspect PTE markers:
 
 ```powershell
 python tools\export\inspect_pte.py model\tinyllama_chunk_0.pte model\tinyllama_chunk_1.pte
+```
+
+Export LoRA TinyLlama training PTEs on the Linux server:
+
+```bash
+CHUNK_IDX=0,1 OUTPUT_DIR=model bash tools/export/export_lora_tinyllama.sh
+```
+
+Prepare a small Dolly SFT smoke set on the Linux server:
+
+```bash
+python tools/data/prepare_lora_sft_requests.py \
+  --model_name tinyllama \
+  --dataset dolly \
+  --seq_len 64 \
+  --limit 2 \
+  --attention_mask causal \
+  --request_prefix dolly-lora-smoke \
+  --output_dir data/sft_requests/tinyllama_dolly64_smoke
+```
+
+Submit one prepared SFT request from Windows/coordinator:
+
+```powershell
+.\gradlew :coordinator:runSubmitPreparedRequest --args="127.0.0.1 50051 data/sft_requests/tinyllama_dolly64_smoke/requests.jsonl 0"
 ```
 
 Check coordinator:

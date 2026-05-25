@@ -25,6 +25,13 @@ tasks.register<JavaExec>("runSubmitDemo") {
     mainClass.set("com.example.sid_coordinator.SubmitRequestMainKt")
 }
 
+tasks.register<JavaExec>("runSubmitPreparedRequest") {
+    group = "application"
+    description = "Submit a prepared tensor ForwardChunkRequest JSONL record to the coordinator."
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("com.example.sid_coordinator.SubmitPreparedRequestMainKt")
+}
+
 sourceSets {
     main {
         proto {

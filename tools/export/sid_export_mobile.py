@@ -34,6 +34,81 @@ def transport_cast(tensor: torch.Tensor, transport_dtype: torch.dtype) -> torch.
     return tensor.to(transport_dtype)
 
 
+class LoRALinear(nn.Module):
+    def __init__(
+        self,
+        base: nn.Linear,
+        rank: int,
+        alpha: float,
+        init_std: float,
+    ) -> None:
+        super().__init__()
+        if rank <= 0:
+            raise ValueError("LoRA rank must be positive.")
+        self.base = base
+        self.rank = rank
+        self.scaling = alpha / rank
+        self.lora_a = nn.Parameter(torch.randn(rank, base.in_features) * init_std)
+        self.lora_b = nn.Parameter(torch.zeros(base.out_features, rank))
+
+        for param in self.base.parameters():
+            param.requires_grad = False
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        base_out = self.base(x)
+        lora_hidden = F.linear(x, self.lora_a)
+        lora_out = F.linear(lora_hidden, self.lora_b) * self.scaling
+        return base_out + lora_out
+
+
+def inject_lora_adapters(
+    module: nn.Module,
+    target_names: set[str],
+    rank: int,
+    alpha: float,
+    init_std: float,
+    prefix: str = "",
+) -> int:
+    injected = 0
+    for child_name, child in list(module.named_children()):
+        qualified_name = f"{prefix}.{child_name}" if prefix else child_name
+        if isinstance(child, nn.Linear) and child_name in target_names:
+            module._modules[child_name] = LoRALinear(
+                base=child,
+                rank=rank,
+                alpha=alpha,
+                init_std=init_std,
+            )
+            injected += 1
+        else:
+            injected += inject_lora_adapters(
+                module=child,
+                target_names=target_names,
+                rank=rank,
+                alpha=alpha,
+                init_std=init_std,
+                prefix=qualified_name,
+            )
+    return injected
+
+
+def configure_trainable_parameters(module: nn.Module, use_lora: bool) -> tuple[int, int]:
+    if use_lora:
+        for param in module.parameters():
+            param.requires_grad = False
+        for submodule in module.modules():
+            if isinstance(submodule, LoRALinear):
+                submodule.lora_a.requires_grad = True
+                submodule.lora_b.requires_grad = True
+    else:
+        for param in module.parameters():
+            param.requires_grad = True
+
+    trainable = sum(param.numel() for param in module.parameters() if param.requires_grad)
+    frozen = sum(param.numel() for param in module.parameters() if not param.requires_grad)
+    return trainable, frozen
+
+
 class ExportableSIDChunk(nn.Module):
     def __init__(
         self,
@@ -249,6 +324,10 @@ def export_chunk(
     label_smoothing: float,
     transport_dtype: torch.dtype,
     use_xnnpack: bool,
+    lora_rank: int,
+    lora_alpha: float,
+    lora_targets: set[str],
+    lora_init_std: float,
 ) -> Path:
     resolved_model_name = resolve_model_name(model_name)
     print(f"[1/5] Loading model: {resolved_model_name}")
@@ -269,8 +348,28 @@ def export_chunk(
     print(f"      layers=[{start}, {end - 1}]")
 
     chunk_module.train()
-    for param in chunk_module.parameters():
-        param.requires_grad = True
+    injected_lora = 0
+    if lora_rank > 0:
+        injected_lora = inject_lora_adapters(
+            module=chunk_module,
+            target_names=lora_targets,
+            rank=lora_rank,
+            alpha=lora_alpha,
+            init_std=lora_init_std,
+        )
+        if injected_lora == 0:
+            raise RuntimeError(
+                "LoRA was enabled but no target Linear modules were replaced. "
+                f"Requested targets: {sorted(lora_targets)}"
+            )
+    trainable_params, frozen_params = configure_trainable_parameters(
+        module=chunk_module,
+        use_lora=lora_rank > 0,
+    )
+    print(
+        "      trainable_params="
+        f"{trainable_params} frozen_params={frozen_params} lora_modules={injected_lora}"
+    )
 
     hidden_dim = backbone.config.hidden_size
     vocab_size = backbone.config.vocab_size
@@ -344,6 +443,13 @@ def parse_transport_dtype(raw: str) -> torch.dtype:
     raise ValueError(f"Unsupported transport dtype: {raw}")
 
 
+def parse_csv_set(raw: str) -> set[str]:
+    values = {item.strip() for item in raw.split(",") if item.strip()}
+    if not values:
+        raise ValueError("Expected at least one comma-separated value.")
+    return values
+
+
 def parse_chunk_indices(raw: str, num_chunks: int) -> list[int]:
     normalized = raw.strip()
     if normalized == "-1":
@@ -402,6 +508,30 @@ def main() -> None:
         action="store_true",
         help="Enable XNNPACK lowering. Leave off for the first joint-graph training export.",
     )
+    parser.add_argument(
+        "--lora_rank",
+        type=int,
+        default=0,
+        help="Enable LoRA adapter training with this rank. 0 keeps the current full-parameter chunk export.",
+    )
+    parser.add_argument(
+        "--lora_alpha",
+        type=float,
+        default=16.0,
+        help="LoRA scaling alpha. Effective scale is alpha/rank.",
+    )
+    parser.add_argument(
+        "--lora_targets",
+        type=str,
+        default="q_proj,v_proj",
+        help="Comma-separated Linear child module names to wrap, for example q_proj,v_proj,o_proj.",
+    )
+    parser.add_argument(
+        "--lora_init_std",
+        type=float,
+        default=0.01,
+        help="Stddev for LoRA A initialization. LoRA B starts at zero.",
+    )
     args = parser.parse_args()
 
     if args.num_chunks <= 0:
@@ -410,9 +540,16 @@ def main() -> None:
         raise ValueError("seq_len must be at least 2.")
     if args.batch_size <= 0:
         raise ValueError("batch_size must be positive.")
+    if args.lora_rank < 0:
+        raise ValueError("lora_rank must be non-negative.")
+    if args.lora_rank > 0 and args.lora_alpha <= 0:
+        raise ValueError("lora_alpha must be positive when LoRA is enabled.")
+    if args.lora_init_std <= 0:
+        raise ValueError("lora_init_std must be positive.")
 
     transport_dtype = parse_transport_dtype(args.transport_dtype)
     chunk_indices = parse_chunk_indices(args.chunk_idx, args.num_chunks)
+    lora_targets = parse_csv_set(args.lora_targets)
 
     for chunk_idx in chunk_indices:
         print("=" * 72)
@@ -429,6 +566,10 @@ def main() -> None:
             label_smoothing=args.label_smoothing,
             transport_dtype=transport_dtype,
             use_xnnpack=args.enable_xnnpack,
+            lora_rank=args.lora_rank,
+            lora_alpha=args.lora_alpha,
+            lora_targets=lora_targets,
+            lora_init_std=args.lora_init_std,
         )
 
 
