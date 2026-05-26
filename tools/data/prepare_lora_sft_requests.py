@@ -109,6 +109,10 @@ def build_token_tensors(
     )
 
 
+def count_valid_labels(labels: torch.Tensor) -> int:
+    return int((labels != -100).sum().item())
+
+
 def build_attention_mask(seq_len: int, mode: str) -> torch.Tensor:
     if mode == "zero":
         return torch.zeros((1, 1, seq_len, seq_len), dtype=torch.float32)
@@ -149,6 +153,12 @@ def main() -> None:
     parser.add_argument("--request_prefix", default="sft")
     parser.add_argument("--attention_mask", choices=["zero", "causal"], default="causal")
     parser.add_argument("--mask_prompt", action="store_true")
+    parser.add_argument(
+        "--min_valid_labels",
+        type=int,
+        default=0,
+        help="Skip examples with fewer trainable label positions after prompt/pad masking.",
+    )
     args = parser.parse_args()
 
     if args.seq_len < 2:
@@ -192,6 +202,13 @@ def main() -> None:
                 seq_len=args.seq_len,
                 mask_prompt=args.mask_prompt,
             )
+            valid_label_count = count_valid_labels(labels)
+            if valid_label_count < args.min_valid_labels:
+                print(
+                    f"Skipping dataset_index={dataset_index}: "
+                    f"valid_label_count={valid_label_count} < min_valid_labels={args.min_valid_labels}"
+                )
+                continue
             with torch.no_grad():
                 hidden_states = embedding(input_ids).float().cpu().numpy().astype("<f4")
 
@@ -219,6 +236,7 @@ def main() -> None:
                 "dataset_index": dataset_index,
                 "seq_len": args.seq_len,
                 "prompt_token_count": prompt_token_count,
+                "valid_label_count": valid_label_count,
                 "tensors": {
                     "hidden_states": tensor_record(args.output_dir, hidden_path, "float32", list(hidden_states.shape)),
                     "attention_mask": tensor_record(args.output_dir, mask_path, "float32", list(attention_mask.shape)),
@@ -243,6 +261,7 @@ def main() -> None:
         "limit": records_written,
         "attention_mask": args.attention_mask,
         "mask_prompt": args.mask_prompt,
+        "min_valid_labels": args.min_valid_labels,
         "manifest": manifest_path.name,
     }
     metadata_path.write_text(json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8")
