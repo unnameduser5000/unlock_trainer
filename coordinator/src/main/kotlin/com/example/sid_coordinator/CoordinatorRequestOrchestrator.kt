@@ -47,16 +47,17 @@ class CoordinatorRequestOrchestrator(
             nodeId = plan.nodeId,
             eventType = Sid.RequestEventType.REQUEST_RECEIVED,
             success = true,
-            message = "Coordinator accepted request from $source and dispatched it to stage 0 node ${plan.nodeId}",
+            message = "Coordinator accepted request from $source and dispatched it to stage 0 node ${plan.nodeId}; evalOnly=${request.evalOnly}",
             terminal = false
         )
 
         return try {
             logger.info(
-                "Submitting requestId={} batchId={} chunkIdx={} to stage0 node={} at {}:{} from {}",
+                "Submitting requestId={} batchId={} chunkIdx={} evalOnly={} to stage0 node={} at {}:{} from {}",
                 requestId,
                 request.batchId,
                 request.chunkIdx,
+                request.evalOnly,
                 plan.nodeId,
                 plan.host,
                 plan.port,

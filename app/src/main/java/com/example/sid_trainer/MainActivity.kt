@@ -3,6 +3,7 @@ package com.example.sid_trainer
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Trace
 import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -55,7 +56,7 @@ class MainActivity : ComponentActivity() {
     private val isWorkerRunning = mutableStateOf(false)
     private val modelFilePath = mutableStateOf<String?>(null)
     private val modelCacheSummary = mutableStateOf("No shard prepared")
-    private val coordinatorHost = mutableStateOf("192.168.214.35")
+    private val coordinatorHost = mutableStateOf("192.168.137.1")
     private val coordinatorPort = mutableStateOf("50051")
     private val deviceId = mutableStateOf(defaultDeviceId())
     private val localServerPort = mutableStateOf("26052")
@@ -427,7 +428,8 @@ class MainActivity : ComponentActivity() {
         request: Sid.ForwardChunkRequest
     ): Sid.ForwardChunkResponse {
         val requestId = request.requestId.ifBlank { "batch-${request.batchId}" }
-        appendLog("Chunk received request=$requestId chunk=${request.chunkIdx}")
+        val chunkStartedAtNs = System.nanoTime()
+        appendLog("Chunk received request=$requestId chunk=${request.chunkIdx} evalOnly=${request.evalOnly}")
         grpcManager.reportRequestEvent(
             registration = registration,
             requestId = requestId,
@@ -435,7 +437,7 @@ class MainActivity : ComponentActivity() {
             chunkIdx = request.chunkIdx,
             eventType = Sid.RequestEventType.REQUEST_RECEIVED,
             success = true,
-            message = "Chunk received on stage ${registration.stageId}",
+            message = "Chunk received on stage ${registration.stageId}; evalOnly=${request.evalOnly}",
             terminal = registration.isTerminal
         )
 
@@ -479,8 +481,14 @@ class MainActivity : ComponentActivity() {
             )
         }
 
+        val localStartedAtNs = System.nanoTime()
         val execution = try {
-            NativeShardRunner.execute(modelPath, request)
+            Trace.beginSection("sid_worker_local_execute")
+            try {
+                NativeShardRunner.execute(modelPath, request)
+            } finally {
+                Trace.endSection()
+            }
         } catch (t: Throwable) {
             appendLog("Native shard execution failed: ${t.message}")
             grpcManager.reportRequestEvent(
@@ -499,9 +507,15 @@ class MainActivity : ComponentActivity() {
                 message = "Native shard execution failed: ${t.message}"
             )
         }
+        val localElapsedMs = elapsedMsSince(localStartedAtNs)
+        val localTimingMessage = "runtime=${execution.runtimeName} method=${execution.methodName} " +
+            "inputs=${execution.inputCount} localMs=$localElapsedMs " +
+            "loss=${execution.localLoss} evalOnly=${execution.evalOnly} " +
+            "optimizerStepApplied=${execution.optimizerStepApplied} ${execution.timing.describeForLog()}"
 
         appendLog(
-            "Local shard finished stage=${registration.stageId}, bytes=${execution.outputHiddenStates.data.size()}"
+            "Local shard finished stage=${registration.stageId}, bytes=${execution.outputHiddenStates.data.size()} " +
+                localTimingMessage
         )
         grpcManager.reportRequestEvent(
             registration = registration,
@@ -510,7 +524,7 @@ class MainActivity : ComponentActivity() {
             chunkIdx = request.chunkIdx,
             eventType = Sid.RequestEventType.LOCAL_COMPLETED,
             success = true,
-            message = "Local shard finished on stage ${registration.stageId}",
+            message = "Local shard finished on stage ${registration.stageId}; $localTimingMessage",
             terminal = registration.isTerminal
         )
 
@@ -526,7 +540,8 @@ class MainActivity : ComponentActivity() {
             .build()
 
         if (registration.isTerminal) {
-            appendLog("Terminal response returned for request=$requestId")
+            val totalStageMs = elapsedMsSince(chunkStartedAtNs)
+            appendLog("Terminal response returned for request=$requestId totalStageMs=$totalStageMs")
             grpcManager.reportRequestEvent(
                 registration = registration,
                 requestId = requestId,
@@ -534,7 +549,7 @@ class MainActivity : ComponentActivity() {
                 chunkIdx = request.chunkIdx,
                 eventType = Sid.RequestEventType.COMPLETED,
                 success = true,
-                message = "Terminal stage completed request $requestId",
+                message = "Terminal stage completed request $requestId; totalStageMs=$totalStageMs",
                 terminal = true
             )
             return localResponse
@@ -553,6 +568,7 @@ class MainActivity : ComponentActivity() {
             .setLabels(request.labels)
             .setShiftLogPPrev(execution.outputShiftLogP)
             .setRequestId(requestId)
+            .setEvalOnly(request.evalOnly)
             .build()
 
         appendLog(
@@ -568,7 +584,19 @@ class MainActivity : ComponentActivity() {
             message = "Forwarding to ${nextHop.host}:${nextHop.port}",
             terminal = false
         )
-        val downstreamResponse = grpcManager.sendDataToNextNode(nextRequest)
+        val forwardStartedAtNs = System.nanoTime()
+        Trace.beginSection("sid_worker_forward_next")
+        val downstreamResponse = try {
+            grpcManager.sendDataToNextNode(nextRequest)
+        } finally {
+            Trace.endSection()
+        }
+        val forwardMs = elapsedMsSince(forwardStartedAtNs)
+        val totalStageMs = elapsedMsSince(chunkStartedAtNs)
+        appendLog(
+            "Forward completed request=$requestId success=${downstreamResponse.success} " +
+                "forwardMs=$forwardMs totalStageMs=$totalStageMs"
+        )
         if (!downstreamResponse.success) {
             appendLog("Downstream failed for request=$requestId: ${downstreamResponse.message}")
             grpcManager.reportRequestEvent(
@@ -578,7 +606,7 @@ class MainActivity : ComponentActivity() {
                 chunkIdx = request.chunkIdx,
                 eventType = Sid.RequestEventType.FAILED,
                 success = false,
-                message = downstreamResponse.message,
+                message = "${downstreamResponse.message}; forwardMs=$forwardMs totalStageMs=$totalStageMs",
                 terminal = downstreamResponse.terminal
             )
         } else {
@@ -589,7 +617,7 @@ class MainActivity : ComponentActivity() {
                 chunkIdx = request.chunkIdx,
                 eventType = Sid.RequestEventType.COMPLETED,
                 success = true,
-                message = downstreamResponse.message,
+                message = "${downstreamResponse.message}; forwardMs=$forwardMs totalStageMs=$totalStageMs",
                 terminal = downstreamResponse.terminal
             )
         }
@@ -696,6 +724,10 @@ class MainActivity : ComponentActivity() {
             bytes >= kib -> String.format("%.2f KiB", bytes.toDouble() / kib.toDouble())
             else -> "$bytes B"
         }
+    }
+
+    private fun elapsedMsSince(startedAtNs: Long): Long {
+        return (System.nanoTime() - startedAtNs) / 1_000_000
     }
 
     private fun defaultDeviceId(): String {

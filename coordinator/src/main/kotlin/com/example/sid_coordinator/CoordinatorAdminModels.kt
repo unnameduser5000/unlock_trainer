@@ -8,7 +8,13 @@ data class AdminSummarySnapshot(
     val liveNodeCount: Int,
     val inactiveNodeCount: Int,
     val offlineStageCount: Int,
-    val drainedStageCount: Int
+    val drainedStageCount: Int,
+    val schedulerEnabled: Boolean,
+    val schedulerPolicy: String,
+    val schedulerAllowUnlistedDevices: Boolean,
+    val schedulerPreferConfiguredDevices: Boolean,
+    val schedulerRebalanceOnRegister: Boolean,
+    val schedulerEventCount: Int
 )
 
 data class AdminNodeSnapshot(
@@ -19,6 +25,7 @@ data class AdminNodeSnapshot(
     val grpcPort: Int,
     val computeCapacity: Float,
     val memoryGb: Float,
+    val assignmentReason: String,
     val registeredAtEpochMs: Long,
     val lastHeartbeatAtEpochMs: Long,
     val isActive: Boolean,
@@ -35,6 +42,10 @@ data class AdminNextHopSnapshot(
 data class AdminStageSnapshot(
     val stageId: Int,
     val deviceId: String,
+    val preferredDeviceId: String,
+    val minMemoryGb: Float,
+    val minComputeCapacity: Float,
+    val schedulingWeight: Float,
     val modelShardId: String,
     val expectedHost: String,
     val expectedPort: Int,
@@ -45,10 +56,22 @@ data class AdminStageSnapshot(
     val nextHop: AdminNextHopSnapshot?
 )
 
+data class AdminSchedulerEventSnapshot(
+    val eventId: Long,
+    val eventEpochMs: Long,
+    val action: String,
+    val stageId: Int?,
+    val nodeId: Int?,
+    val deviceId: String?,
+    val reason: String,
+    val message: String
+)
+
 data class AdminStatusSnapshot(
     val summary: AdminSummarySnapshot,
     val stages: List<AdminStageSnapshot>,
-    val nodes: List<AdminNodeSnapshot>
+    val nodes: List<AdminNodeSnapshot>,
+    val schedulerEvents: List<AdminSchedulerEventSnapshot>
 )
 
 data class AdminRequestStateSnapshot(

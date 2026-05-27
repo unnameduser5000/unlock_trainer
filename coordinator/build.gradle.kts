@@ -33,6 +33,14 @@ tasks.register<JavaExec>("runSubmitPreparedRequest") {
     workingDir = rootProject.projectDir
 }
 
+tasks.register<JavaExec>("runPreparedExperiment") {
+    group = "application"
+    description = "Submit a range of prepared tensor ForwardChunkRequest JSONL records and write a CSV summary."
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("com.example.sid_coordinator.RunPreparedExperimentMainKt")
+    workingDir = rootProject.projectDir
+}
+
 sourceSets {
     main {
         proto {

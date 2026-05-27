@@ -1,5 +1,6 @@
 package com.example.sid_trainer
 
+import android.os.Trace
 import android.util.Log
 import com.google.protobuf.ByteString
 import org.pytorch.executorch.DType
@@ -19,8 +20,41 @@ import kotlin.concurrent.withLock
 data class ShardExecutionResult(
     val outputHiddenStates: Sid.TensorData,
     val outputShiftLogP: Sid.TensorData,
-    val localLoss: Float
+    val localLoss: Float,
+    val runtimeName: String,
+    val methodName: String,
+    val inputCount: Int,
+    val evalOnly: Boolean,
+    val optimizerStepApplied: Boolean,
+    val timing: ShardExecutionTiming
 )
+
+data class ShardExecutionTiming(
+    val inputBuildMs: Long = 0,
+    val executeMs: Long = 0,
+    val gradientsMs: Long = 0,
+    val optimizerCreateMs: Long = 0,
+    val optimizerStepMs: Long = 0,
+    val outputConvertMs: Long = 0
+) {
+    val totalMeasuredMs: Long
+        get() = inputBuildMs + executeMs + gradientsMs + optimizerCreateMs + optimizerStepMs + outputConvertMs
+
+    fun describeForLog(): String {
+        return "inputBuildMs=$inputBuildMs executeMs=$executeMs gradientsMs=$gradientsMs " +
+            "optimizerCreateMs=$optimizerCreateMs optimizerStepMs=$optimizerStepMs " +
+            "outputConvertMs=$outputConvertMs totalMeasuredMs=$totalMeasuredMs"
+    }
+}
+
+private inline fun <T> tracedSection(name: String, block: () -> T): T {
+    Trace.beginSection(name)
+    return try {
+        block()
+    } finally {
+        Trace.endSection()
+    }
+}
 
 object NativeShardRunner {
     private const val LOG_TAG = "ExecuTorchShardRunner"
@@ -193,6 +227,7 @@ object NativeShardRunner {
     }
 
     private fun InvocationResult.toExecutionResult(request: Sid.ForwardChunkRequest): ShardExecutionResult {
+        val startedAtNs = System.nanoTime()
         var localLoss = 0f
         val tensors = mutableListOf<Tensor>()
 
@@ -239,11 +274,25 @@ object NativeShardRunner {
             ?: copyTensorWithData(request.hiddenStates, request.hiddenStates.data.toByteArray())
         val shiftLogP = remainingTensors.getOrNull(1)?.toSidTensor()
             ?: copyTensorWithData(request.shiftLogPPrev, request.shiftLogPPrev.data.toByteArray())
+        val outputConvertMs = elapsedMsSince(startedAtNs)
+        val finalTiming = timing.copy(outputConvertMs = outputConvertMs)
+
+        Log.i(
+            LOG_TAG,
+            "Shard execution timing runtime=$runtimeName method=$methodName inputs=$inputCount " +
+                finalTiming.describeForLog()
+        )
 
         return ShardExecutionResult(
             outputHiddenStates = hiddenStates,
             outputShiftLogP = shiftLogP,
-            localLoss = localLoss
+            localLoss = localLoss,
+            runtimeName = runtimeName,
+            methodName = methodName,
+            inputCount = inputCount,
+            evalOnly = evalOnly,
+            optimizerStepApplied = optimizerStepApplied,
+            timing = finalTiming
         )
     }
 
@@ -522,7 +571,10 @@ object NativeShardRunner {
         val runtimeName: String,
         val methodName: String,
         val inputCount: Int,
-        val outputs: Array<EValue>
+        val outputs: Array<EValue>,
+        val evalOnly: Boolean,
+        val optimizerStepApplied: Boolean,
+        val timing: ShardExecutionTiming
     )
 
     private sealed interface LoadedRuntime : Closeable {
@@ -534,40 +586,157 @@ object NativeShardRunner {
         private val module: TrainingModule
     ) : LoadedRuntime {
         private var optimizer: SGD? = null
+        private var parameters: Map<String, Tensor>? = null
+        private var checkpointRestoreAttempted = false
+        private var optimizerStepCount = 0L
+        private val committedRequestKeys = LinkedHashSet<String>()
 
         override fun execute(request: Sid.ForwardChunkRequest): InvocationResult {
-            val inputs = buildTrainingInputs(request)
-            val outputs = module.executeForwardBackward(DEFAULT_METHOD, *inputs)
-            val gradients = module.namedGradients(DEFAULT_METHOD)
-            require(gradients.isNotEmpty()) {
-                "TrainingModule.executeForwardBackward() produced no gradients for $modelPath."
+            ensureCheckpointRestored()
+            val requestKey = request.commitKey()
+            val effectiveRequest = if (!request.evalOnly && committedRequestKeys.contains(requestKey)) {
+                Log.w(
+                    LOG_TAG,
+                    "Duplicate train request detected after local commit; rerunning forward without optimizer step key=$requestKey"
+                )
+                request.toBuilder().setEvalOnly(true).build()
+            } else {
+                request
             }
-            val sgd = optimizer ?: createOptimizer().also { optimizer = it }
-            sgd.step(gradients)
+            val inputBuildStartedAtNs = System.nanoTime()
+            val inputs = tracedSection("sid_build_training_inputs") {
+                buildTrainingInputs(effectiveRequest)
+            }
+            val inputBuildMs = elapsedMsSince(inputBuildStartedAtNs)
+
+            val executeStartedAtNs = System.nanoTime()
+            val outputs = tracedSection("sid_execute_forward_backward") {
+                module.executeForwardBackward(DEFAULT_METHOD, *inputs)
+            }
+            val executeMs = elapsedMsSince(executeStartedAtNs)
+
+            var optimizerCreateMs = 0L
+            var optimizerStepMs = 0L
+            var gradientsMs = 0L
+            var gradientCount = 0
+            var optimizerStepApplied = false
+
+            if (!effectiveRequest.evalOnly) {
+                val gradientsStartedAtNs = System.nanoTime()
+                val gradients = tracedSection("sid_named_gradients") {
+                    module.namedGradients(DEFAULT_METHOD)
+                }
+                gradientsMs = elapsedMsSince(gradientsStartedAtNs)
+                gradientCount = gradients.size
+                require(gradients.isNotEmpty()) {
+                    "TrainingModule.executeForwardBackward() produced no gradients for $modelPath."
+                }
+                val sgd = optimizer ?: run {
+                    val optimizerStartedAtNs = System.nanoTime()
+                    tracedSection("sid_create_sgd") {
+                        createOptimizer()
+                    }.also {
+                        optimizer = it
+                        optimizerCreateMs = elapsedMsSince(optimizerStartedAtNs)
+                    }
+                }
+                val stepStartedAtNs = System.nanoTime()
+                tracedSection("sid_sgd_step") {
+                    sgd.step(gradients)
+                }
+                optimizerStepMs = elapsedMsSince(stepStartedAtNs)
+                optimizerStepApplied = true
+                committedRequestKeys += requestKey
+                optimizerStepCount += 1
+                saveCheckpointAfterStep()
+            } else {
+                Log.i(
+                    LOG_TAG,
+                    "Eval-only request for $modelPath: skipped namedGradients(), SGD.create(), and SGD.step()."
+                )
+            }
             Log.i(
                 LOG_TAG,
-                "TrainingModule.executeForwardBackward() and SGD.step() succeeded for $modelPath " +
-                    "with ${inputs.size} inputs gradients=${gradients.size}"
+                "TrainingModule.executeForwardBackward() succeeded for $modelPath " +
+                    "with ${inputs.size} inputs evalOnly=${effectiveRequest.evalOnly} " +
+                    "optimizerStepApplied=$optimizerStepApplied gradients=$gradientCount " +
+                    "optimizerStepCount=$optimizerStepCount " +
+                    "inputBuildMs=$inputBuildMs executeMs=$executeMs gradientsMs=$gradientsMs " +
+                    "optimizerCreateMs=$optimizerCreateMs optimizerStepMs=$optimizerStepMs"
             )
             return InvocationResult(
                 runtimeName = "TrainingModule",
                 methodName = DEFAULT_METHOD,
                 inputCount = inputs.size,
-                outputs = outputs
+                outputs = outputs,
+                evalOnly = effectiveRequest.evalOnly,
+                optimizerStepApplied = optimizerStepApplied,
+                timing = ShardExecutionTiming(
+                    inputBuildMs = inputBuildMs,
+                    executeMs = executeMs,
+                    gradientsMs = gradientsMs,
+                    optimizerCreateMs = optimizerCreateMs,
+                    optimizerStepMs = optimizerStepMs
+                )
             )
         }
 
-        private fun createOptimizer(): SGD {
-            val parameters = module.namedParameters(DEFAULT_METHOD)
-            require(parameters.isNotEmpty()) {
+        private fun ensureCheckpointRestored() {
+            if (checkpointRestoreAttempted) {
+                return
+            }
+            checkpointRestoreAttempted = true
+            val params = parametersForRuntime()
+            val result = TrainingCheckpointStore.restoreLatest(modelPath, params)
+            if (result.restored) {
+                optimizerStepCount = result.step
+            }
+            Log.i(
+                LOG_TAG,
+                "Checkpoint restore status for $modelPath restored=${result.restored} " +
+                    "step=${result.step} parameters=${result.parameterCount} " +
+                    "path=${result.checkpointPath} message=${result.message}"
+            )
+        }
+
+        private fun parametersForRuntime(): Map<String, Tensor> {
+            val cached = parameters
+            if (cached != null) {
+                return cached
+            }
+            val loaded = module.namedParameters(DEFAULT_METHOD)
+            require(loaded.isNotEmpty()) {
                 "TrainingModule has no trainable parameters for $modelPath."
             }
+            parameters = loaded
+            return loaded
+        }
+
+        private fun saveCheckpointAfterStep() {
+            runCatching {
+                TrainingCheckpointStore.saveLatest(modelPath, optimizerStepCount, parametersForRuntime())
+            }.onFailure { error ->
+                Log.e(
+                    LOG_TAG,
+                    "Failed to save training checkpoint for $modelPath at step=$optimizerStepCount: ${error.message}",
+                    error
+                )
+            }
+        }
+
+        private fun createOptimizer(): SGD {
+            val parameters = parametersForRuntime()
             Log.i(
                 LOG_TAG,
                 "Creating ExecuTorch SGD optimizer for $modelPath " +
                     "parameters=${parameters.size} lr=$DEFAULT_TRAINING_LEARNING_RATE"
             )
             return SGD.create(parameters, DEFAULT_TRAINING_LEARNING_RATE)
+        }
+
+        private fun Sid.ForwardChunkRequest.commitKey(): String {
+            val stableRequestId = requestId.ifBlank { "batch-$batchId" }
+            return "$stableRequestId|batch=$batchId|chunk=$chunkIdx"
         }
 
         override fun close() {
@@ -581,20 +750,35 @@ object NativeShardRunner {
         private val methodName: String
     ) : LoadedRuntime {
         override fun execute(request: Sid.ForwardChunkRequest): InvocationResult {
-            val candidateInputs = buildInferenceInputCandidates(request)
+            val inputBuildStartedAtNs = System.nanoTime()
+            val candidateInputs = tracedSection("sid_build_inference_inputs") {
+                buildInferenceInputCandidates(request)
+            }
+            val inputBuildMs = elapsedMsSince(inputBuildStartedAtNs)
             var lastFailure: Throwable? = null
             for (inputs in candidateInputs) {
                 try {
-                    val outputs = module.execute(methodName, *inputs)
+                    val executeStartedAtNs = System.nanoTime()
+                    val outputs = tracedSection("sid_module_execute") {
+                        module.execute(methodName, *inputs)
+                    }
+                    val executeMs = elapsedMsSince(executeStartedAtNs)
                     Log.i(
                         LOG_TAG,
-                        "Module.execute() succeeded for $modelPath method=$methodName with ${inputs.size} inputs"
+                        "Module.execute() succeeded for $modelPath method=$methodName with ${inputs.size} inputs " +
+                            "inputBuildMs=$inputBuildMs executeMs=$executeMs"
                     )
                     return InvocationResult(
                         runtimeName = "Module",
                         methodName = methodName,
                         inputCount = inputs.size,
-                        outputs = outputs
+                        outputs = outputs,
+                        evalOnly = request.evalOnly,
+                        optimizerStepApplied = false,
+                        timing = ShardExecutionTiming(
+                            inputBuildMs = inputBuildMs,
+                            executeMs = executeMs
+                        )
                     )
                 } catch (t: Throwable) {
                     lastFailure = t
@@ -613,5 +797,9 @@ object NativeShardRunner {
         override fun close() {
             module.destroy()
         }
+    }
+
+    private fun elapsedMsSince(startedAtNs: Long): Long {
+        return (System.nanoTime() - startedAtNs) / 1_000_000
     }
 }

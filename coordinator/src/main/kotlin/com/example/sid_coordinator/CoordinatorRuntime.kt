@@ -37,6 +37,7 @@ class CoordinatorRuntime(
         drainStage = state::drainStage,
         resumeStage = state::resumeStage,
         evictNode = state::evictNode,
+        reconcileScheduler = state::reconcileScheduler,
         reloadRouting = ::reloadConfigFromDisk
     )
     private val healthStatusManager = HealthStatusManager()

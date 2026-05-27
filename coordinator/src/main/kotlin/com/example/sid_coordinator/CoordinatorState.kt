@@ -4,6 +4,7 @@ import org.slf4j.LoggerFactory
 import sid.Sid
 import java.time.Duration
 import java.time.Instant
+import java.util.ArrayDeque
 import kotlin.math.max
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
@@ -12,7 +13,7 @@ import kotlin.concurrent.withLock
 
 data class RegisteredNode(
     val nodeId: Int,
-    val stageId: Int,
+    var stageId: Int,
     val deviceId: String,
     var ipAddress: String,
     var grpcPort: Int,
@@ -20,7 +21,8 @@ data class RegisteredNode(
     var memoryGb: Float,
     var registeredAt: Instant,
     var lastHeartbeatAt: Instant,
-    var isActive: Boolean
+    var isActive: Boolean,
+    var assignmentReason: String = "unknown"
 ) {
     fun isExpired(now: Instant, leaseDuration: Duration): Boolean {
         return now.isAfter(lastHeartbeatAt.plus(leaseDuration))
@@ -49,10 +51,12 @@ class CoordinatorState(
     private val nextNodeId: AtomicInteger
     private val routingEpoch: AtomicLong
     private val lock = ReentrantLock()
-    private var stagesByDeviceId = initialConfig.stages.associateBy(StageConfig::deviceId)
+    private var preferredStageByDeviceId = preferredStageByDeviceId(initialConfig)
     private val nodesById = mutableMapOf<Int, RegisteredNode>()
     private val nodeIdByStageId = mutableMapOf<Int, Int>()
     private val drainedStageIds = mutableSetOf<Int>()
+    private val schedulerEvents = ArrayDeque<AdminSchedulerEventSnapshot>()
+    private var nextSchedulerEventId = 1L
 
     init {
         val snapshot = persistence.loadSnapshot()
@@ -61,7 +65,7 @@ class CoordinatorState(
         drainedStageIds.addAll(snapshot.drainedStageIds)
 
         snapshot.nodes.forEach { restored ->
-            val offlineNode = restored.copy(isActive = false)
+            val offlineNode = restored.copy(isActive = false, assignmentReason = "restored-from-state")
             nodesById[offlineNode.nodeId] = offlineNode
             nodeIdByStageId[offlineNode.stageId] = offlineNode.nodeId
         }
@@ -75,58 +79,131 @@ class CoordinatorState(
     }
 
     fun registerNode(request: Sid.NodeInfo): Sid.RegistrationResponse = lock.withLock {
-        val stage = stagesByDeviceId[request.deviceId]
-            ?: return failureResponse(
-                "device_id ${request.deviceId} is not present in pipeline ${config.pipelineName}"
-            )
-
         val now = Instant.now()
-        val existingNodeId = nodeIdByStageId[stage.stageId]
-        val topologyChanged: Boolean
-        val node = if (existingNodeId != null) {
-            val current = requireNotNull(nodesById[existingNodeId])
-            topologyChanged =
-                current.ipAddress != request.ipAddress ||
-                    current.grpcPort != request.grpcPort ||
-                    !current.isActive
-            current.ipAddress = request.ipAddress
-            current.grpcPort = request.grpcPort
-            current.computeCapacity = request.computeCapacity
-            current.memoryGb = request.memoryGb
-            current.registeredAt = now
-            current.lastHeartbeatAt = now
-            current.isActive = true
-            current
-        } else {
-            val newNode = RegisteredNode(
-                nodeId = nextNodeId.getAndIncrement(),
-                stageId = stage.stageId,
+        val existingDeviceNode = nodesById.values.firstOrNull { it.deviceId == request.deviceId }
+        val assignment = chooseStageForRegistration(request, now, existingDeviceNode)
+        if (assignment == null) {
+            recordSchedulerEvent(
+                action = "register_rejected",
+                stageId = null,
+                nodeId = existingDeviceNode?.nodeId,
                 deviceId = request.deviceId,
-                ipAddress = request.ipAddress,
-                grpcPort = request.grpcPort,
-                computeCapacity = request.computeCapacity,
-                memoryGb = request.memoryGb,
-                registeredAt = now,
-                lastHeartbeatAt = now,
-                isActive = true
+                reason = "no-schedulable-stage",
+                message = "No schedulable stage for device_id ${request.deviceId} in pipeline ${config.pipelineName}"
             )
-            nodesById[newNode.nodeId] = newNode
-            nodeIdByStageId[stage.stageId] = newNode.nodeId
-            topologyChanged = true
-            newNode
+            return failureResponse(
+                "No schedulable stage for device_id ${request.deviceId} in pipeline ${config.pipelineName}"
+            )
         }
+        val stage = assignment.stage
+        var topologyChanged = false
+        val nodesToPersist = linkedMapOf<Int, RegisteredNode>()
+
+        if (existingDeviceNode != null && existingDeviceNode.stageId != stage.stageId) {
+            if (nodeIdByStageId[existingDeviceNode.stageId] == existingDeviceNode.nodeId) {
+                nodeIdByStageId.remove(existingDeviceNode.stageId)
+            }
+            topologyChanged = true
+        }
+
+        val displacedNode = assignment.displacedNodeId?.let(nodesById::get)
+        if (displacedNode != null && displacedNode.nodeId != existingDeviceNode?.nodeId) {
+            val previousStageId = displacedNode.stageId
+            if (nodeIdByStageId[previousStageId] == displacedNode.nodeId) {
+                nodeIdByStageId.remove(previousStageId)
+            }
+            val relocationStage = assignment.displacedStage
+            if (relocationStage != null) {
+                displacedNode.stageId = relocationStage.stageId
+                displacedNode.assignmentReason = assignment.displacedReason ?: "relocated-by-scheduler"
+                nodeIdByStageId[relocationStage.stageId] = displacedNode.nodeId
+                nodesToPersist[displacedNode.nodeId] = displacedNode
+                recordSchedulerEvent(
+                    action = "relocate_node",
+                    stageId = relocationStage.stageId,
+                    nodeId = displacedNode.nodeId,
+                    deviceId = displacedNode.deviceId,
+                    reason = displacedNode.assignmentReason,
+                    message = "Moved node ${displacedNode.nodeId} from stage $previousStageId to stage ${relocationStage.stageId}"
+                )
+            } else {
+                nodesById.remove(displacedNode.nodeId)
+                persistence.deleteNode(displacedNode.nodeId, routingEpoch.get(), nextNodeId.get())
+                recordSchedulerEvent(
+                    action = "replace_node",
+                    stageId = previousStageId,
+                    nodeId = displacedNode.nodeId,
+                    deviceId = displacedNode.deviceId,
+                    reason = assignment.displacedReason ?: "replaced-by-scheduler",
+                    message = "Removed node ${displacedNode.nodeId} from stage $previousStageId for registering device ${request.deviceId}"
+                )
+            }
+            topologyChanged = true
+        }
+
+        val existingStageNode = nodeIdByStageId[stage.stageId]?.let(nodesById::get)
+        if (existingStageNode != null && existingStageNode.nodeId != existingDeviceNode?.nodeId) {
+            nodesById.remove(existingStageNode.nodeId)
+            nodeIdByStageId.remove(stage.stageId)
+            persistence.deleteNode(existingStageNode.nodeId, routingEpoch.get(), nextNodeId.get())
+            recordSchedulerEvent(
+                action = "replace_node",
+                stageId = stage.stageId,
+                nodeId = existingStageNode.nodeId,
+                deviceId = existingStageNode.deviceId,
+                reason = "stage-occupied",
+                message = "Replaced node ${existingStageNode.nodeId} on stage ${stage.stageId} with registering device ${request.deviceId}"
+            )
+            logger.warn(
+                "Scheduler replaced node {} device={} on stage={} with registering device={}",
+                existingStageNode.nodeId,
+                existingStageNode.deviceId,
+                stage.stageId,
+                request.deviceId
+            )
+            topologyChanged = true
+        }
+
+        val node = existingDeviceNode ?: newRegisteredNode(request, stage.stageId, now, assignment.reason).also {
+            nodesById[it.nodeId] = it
+            topologyChanged = true
+        }
+
+        if (existingDeviceNode != null) {
+            topologyChanged =
+                topologyChanged ||
+                    existingDeviceNode.stageId != stage.stageId ||
+                    existingDeviceNode.ipAddress != request.ipAddress ||
+                    existingDeviceNode.grpcPort != request.grpcPort ||
+                    !existingDeviceNode.isActive ||
+                    existingDeviceNode.assignmentReason != assignment.reason
+            existingDeviceNode.stageId = stage.stageId
+            updateNodeFromRegistration(existingDeviceNode, request, now, assignment.reason)
+        }
+        nodeIdByStageId[stage.stageId] = node.nodeId
 
         if (topologyChanged) {
             routingEpoch.incrementAndGet()
+            persistReassignedNodes(nodesToPersist.values + node)
+        } else {
+            persistNode(node)
         }
-        persistNode(node)
+        recordSchedulerEvent(
+            action = "register_node",
+            stageId = node.stageId,
+            nodeId = node.nodeId,
+            deviceId = node.deviceId,
+            reason = node.assignmentReason,
+            message = "Registered device ${node.deviceId} as node ${node.nodeId} on stage ${node.stageId}"
+        )
 
         val route = resolveRoute(stage.stageId)
         logger.info(
-            "Registered device={} stage={} nodeId={} runtime={}:{} nextHop={} routeReady={} epoch={}",
+            "Registered device={} stage={} nodeId={} reason={} runtime={}:{} nextHop={} routeReady={} epoch={}",
             node.deviceId,
             node.stageId,
             node.nodeId,
+            node.assignmentReason,
             node.ipAddress,
             node.grpcPort,
             route.nextHop?.let { "${it.ipAddress}:${it.grpcPort}" } ?: "terminal",
@@ -136,7 +213,7 @@ class CoordinatorState(
 
         Sid.RegistrationResponse.newBuilder()
             .setSuccess(true)
-            .setMessage("registered")
+            .setMessage("registered; stage=${stage.stageId}; reason=${node.assignmentReason}")
             .setNodeId(node.nodeId)
             .setStageId(route.stageId)
             .setTerminal(route.terminal)
@@ -150,6 +227,341 @@ class CoordinatorState(
                 route.nextHop?.let { setNextHop(it) }
             }
             .build()
+    }
+
+    private fun updateNodeFromRegistration(
+        node: RegisteredNode,
+        request: Sid.NodeInfo,
+        now: Instant,
+        assignmentReason: String
+    ) {
+        node.ipAddress = request.ipAddress
+        node.grpcPort = request.grpcPort
+        node.computeCapacity = request.computeCapacity
+        node.memoryGb = request.memoryGb
+        node.registeredAt = now
+        node.lastHeartbeatAt = now
+        node.isActive = true
+        node.assignmentReason = assignmentReason
+    }
+
+    private fun newRegisteredNode(
+        request: Sid.NodeInfo,
+        stageId: Int,
+        now: Instant,
+        assignmentReason: String
+    ): RegisteredNode {
+        return RegisteredNode(
+            nodeId = nextNodeId.getAndIncrement(),
+            stageId = stageId,
+            deviceId = request.deviceId,
+            ipAddress = request.ipAddress,
+            grpcPort = request.grpcPort,
+            computeCapacity = request.computeCapacity,
+            memoryGb = request.memoryGb,
+            registeredAt = now,
+            lastHeartbeatAt = now,
+            isActive = true,
+            assignmentReason = assignmentReason
+        )
+    }
+
+    private fun chooseStageForRegistration(
+        request: Sid.NodeInfo,
+        now: Instant,
+        existingDeviceNode: RegisteredNode?
+    ): StageAssignment? {
+        val scheduler = config.scheduler
+        val preferredStage = preferredStageByDeviceId[request.deviceId]
+        if (!scheduler.enabled) {
+            return preferredStage?.let { StageAssignment(it, "static-device-match") }
+        }
+
+        if (!scheduler.allowUnlistedDevices && preferredStage == null) {
+            return null
+        }
+        if (request.memoryGb < scheduler.minMemoryGb || request.computeCapacity < scheduler.minComputeCapacity) {
+            logger.warn(
+                "Scheduler rejected device={} memoryGb={} computeCapacity={} minMemoryGb={} minComputeCapacity={}",
+                request.deviceId,
+                request.memoryGb,
+                request.computeCapacity,
+                scheduler.minMemoryGb,
+                scheduler.minComputeCapacity
+            )
+            return null
+        }
+
+        if (
+            scheduler.preferConfiguredDevices &&
+            preferredStage != null &&
+            !drainedStageIds.contains(preferredStage.stageId) &&
+            nodeMeetsStageRequirements(request.computeCapacity, request.memoryGb, preferredStage)
+        ) {
+            val assigned = liveNodeForStage(preferredStage.stageId, now)
+            if (assigned == null || assigned.deviceId == request.deviceId) {
+                return StageAssignment(preferredStage, "preferred-device-match")
+            }
+            if (!isPreferredDeviceForStage(assigned.deviceId, preferredStage.stageId)) {
+                val relocationStage = chooseRelocationStageForNode(
+                    node = assigned,
+                    now = now,
+                    excludedStageIds = setOf(preferredStage.stageId),
+                    vacatedNodeId = existingDeviceNode?.nodeId
+                )
+                if (relocationStage != null) {
+                    return StageAssignment(
+                        stage = preferredStage,
+                        reason = "preferred-device-relocate-dynamic-worker",
+                        displacedNodeId = assigned.nodeId,
+                        displacedStage = relocationStage,
+                        displacedReason = "relocated-for-preferred-device"
+                    )
+                }
+            }
+            if (scheduler.rebalanceOnRegister && !isPreferredDeviceForStage(assigned.deviceId, preferredStage.stageId)) {
+                return StageAssignment(
+                    stage = preferredStage,
+                    reason = "preferred-device-replace-dynamic-worker",
+                    displacedNodeId = assigned.nodeId,
+                    displacedStage = null,
+                    displacedReason = "evicted-for-preferred-device"
+                )
+            }
+        }
+
+        if (existingDeviceNode != null) {
+            val existingStage = config.stages.getOrNull(existingDeviceNode.stageId)
+            if (
+                existingStage != null &&
+                !drainedStageIds.contains(existingStage.stageId) &&
+                nodeMeetsStageRequirements(request.computeCapacity, request.memoryGb, existingStage)
+            ) {
+                return StageAssignment(existingStage, "sticky-existing-assignment")
+            }
+        }
+
+        val offlineStages = config.stages
+            .filterNot { drainedStageIds.contains(it.stageId) }
+            .filter { liveNodeForStage(it.stageId, now) == null }
+            .filter { nodeMeetsStageRequirements(request.computeCapacity, request.memoryGb, it) }
+
+        if (offlineStages.isNotEmpty()) {
+            return StageAssignment(
+                stage = chooseStageByPolicy(offlineStages, scheduler.policy),
+                reason = "dynamic-fill-offline-stage"
+            )
+        }
+
+        if (scheduler.rebalanceOnRegister) {
+            val replaceableStage = config.stages
+                .filterNot { drainedStageIds.contains(it.stageId) }
+                .filter { nodeMeetsStageRequirements(request.computeCapacity, request.memoryGb, it) }
+                .filter { stage ->
+                    !isPreferredDeviceForStage(liveNodeForStage(stage.stageId, now)?.deviceId, stage.stageId)
+                }
+                .maxByOrNull { stage -> replacementGain(stage, request, now) }
+                ?.takeIf { stage -> replacementGain(stage, request, now) > 0f }
+            if (replaceableStage != null) {
+                return StageAssignment(
+                    stage = replaceableStage,
+                    reason = "dynamic-rebalance-better-capacity",
+                    displacedNodeId = liveNodeForStage(replaceableStage.stageId, now)?.nodeId,
+                    displacedStage = null,
+                    displacedReason = "evicted-for-better-capacity"
+                )
+            }
+        }
+
+        return null
+    }
+
+    private fun chooseStageByPolicy(
+        stages: List<StageConfig>,
+        policy: String
+    ): StageConfig {
+        return when (policy) {
+            "memory-first" -> stages.maxWith(
+                compareBy<StageConfig> { stageMemoryDemand(it) }
+                    .thenBy { it.schedulingWeight }
+                    .thenBy { it.stageId }
+            )
+
+            "compute-first" -> stages.maxWith(
+                compareBy<StageConfig> { stageComputeDemand(it) }
+                    .thenBy { stageMemoryDemand(it) }
+                    .thenBy { it.stageId }
+            )
+
+            else -> stages.minBy(StageConfig::stageId)
+        }
+    }
+
+    private fun chooseRelocationStageForNode(
+        node: RegisteredNode,
+        now: Instant,
+        excludedStageIds: Set<Int>,
+        vacatedNodeId: Int?
+    ): StageConfig? {
+        val candidates = config.stages
+            .filterNot { drainedStageIds.contains(it.stageId) }
+            .filterNot { excludedStageIds.contains(it.stageId) }
+            .filter { stage ->
+                val liveNode = liveNodeForStage(stage.stageId, now)
+                liveNode == null || liveNode.nodeId == vacatedNodeId
+            }
+            .filter { stage ->
+                nodeMeetsStageRequirements(node.computeCapacity, node.memoryGb, stage)
+            }
+        return candidates.takeIf { it.isNotEmpty() }
+            ?.let { chooseStageByPolicy(it, config.scheduler.policy) }
+    }
+
+    private fun nodeMeetsStageRequirements(
+        computeCapacity: Float,
+        memoryGb: Float,
+        stage: StageConfig
+    ): Boolean {
+        return memoryGb >= maxOf(config.scheduler.minMemoryGb, stage.minMemoryGb) &&
+            computeCapacity >= maxOf(config.scheduler.minComputeCapacity, stage.minComputeCapacity)
+    }
+
+    private fun stageMemoryDemand(stage: StageConfig): Float {
+        val modelGib = stage.modelBytes.toFloat() / (1024f * 1024f * 1024f)
+        return stage.minMemoryGb + modelGib + stage.schedulingWeight
+    }
+
+    private fun stageComputeDemand(stage: StageConfig): Float {
+        return stage.minComputeCapacity + stage.schedulingWeight
+    }
+
+    private fun replacementGain(stage: StageConfig, request: Sid.NodeInfo, now: Instant): Float {
+        val current = liveNodeForStage(stage.stageId, now) ?: return Float.MAX_VALUE
+        return nodeScore(request.computeCapacity, request.memoryGb) -
+            nodeScore(current.computeCapacity, current.memoryGb)
+    }
+
+    private fun nodeScore(computeCapacity: Float, memoryGb: Float): Float {
+        return computeCapacity + memoryGb * 10f
+    }
+
+    private fun liveNodeForStage(stageId: Int, now: Instant): RegisteredNode? {
+        return nodeIdByStageId[stageId]
+            ?.let(nodesById::get)
+            ?.takeIf { it.isLive(now, leaseDuration) }
+    }
+
+    private fun isPreferredDeviceForStage(deviceId: String?, stageId: Int): Boolean {
+        if (deviceId.isNullOrBlank()) {
+            return false
+        }
+        return preferredStageByDeviceId[deviceId]?.stageId == stageId
+    }
+
+    private fun reconcilePreferredAssignmentsLocked(): Int {
+        val now = Instant.now()
+        val nodesToPersist = linkedMapOf<Int, RegisteredNode>()
+        var moveCount = 0
+
+        config.stages.forEach { preferredStage ->
+            val preferredDeviceId = preferredStage.deviceId.takeIf { it.isNotBlank() }
+                ?: return@forEach
+            if (drainedStageIds.contains(preferredStage.stageId)) {
+                return@forEach
+            }
+            val preferredNode = nodesById.values.firstOrNull { node ->
+                node.deviceId == preferredDeviceId && node.isLive(now, leaseDuration)
+            } ?: return@forEach
+            if (preferredNode.stageId == preferredStage.stageId) {
+                return@forEach
+            }
+            if (!nodeMeetsStageRequirements(preferredNode.computeCapacity, preferredNode.memoryGb, preferredStage)) {
+                return@forEach
+            }
+
+            val occupant = liveNodeForStage(preferredStage.stageId, now)
+            if (occupant == null || occupant.nodeId == preferredNode.nodeId) {
+                if (moveNodeToStageLocked(preferredNode, preferredStage, "reconciled-preferred-device")) {
+                    nodesToPersist[preferredNode.nodeId] = preferredNode
+                    moveCount += 1
+                }
+                return@forEach
+            }
+            if (isPreferredDeviceForStage(occupant.deviceId, preferredStage.stageId)) {
+                return@forEach
+            }
+
+            val relocationStage = chooseRelocationStageForNode(
+                node = occupant,
+                now = now,
+                excludedStageIds = setOf(preferredStage.stageId),
+                vacatedNodeId = preferredNode.nodeId
+            )
+            if (relocationStage != null) {
+                if (moveNodeToStageLocked(occupant, relocationStage, "relocated-for-preferred-device")) {
+                    nodesToPersist[occupant.nodeId] = occupant
+                    moveCount += 1
+                }
+                if (moveNodeToStageLocked(preferredNode, preferredStage, "reconciled-preferred-device")) {
+                    nodesToPersist[preferredNode.nodeId] = preferredNode
+                    moveCount += 1
+                }
+            } else if (config.scheduler.rebalanceOnRegister) {
+                nodesById.remove(occupant.nodeId)
+                nodeIdByStageId.remove(occupant.stageId)
+                persistence.deleteNode(occupant.nodeId, routingEpoch.get(), nextNodeId.get())
+                recordSchedulerEvent(
+                    action = "replace_node",
+                    stageId = occupant.stageId,
+                    nodeId = occupant.nodeId,
+                    deviceId = occupant.deviceId,
+                    reason = "evicted-for-preferred-device",
+                    message = "Scheduler reconcile evicted node ${occupant.nodeId} so ${preferredNode.deviceId} can return to preferred stage ${preferredStage.stageId}"
+                )
+                if (moveNodeToStageLocked(preferredNode, preferredStage, "reconciled-preferred-device")) {
+                    nodesToPersist[preferredNode.nodeId] = preferredNode
+                    moveCount += 1
+                }
+            }
+        }
+
+        if (nodesToPersist.isNotEmpty()) {
+            routingEpoch.incrementAndGet()
+            persistReassignedNodes(nodesToPersist.values)
+        }
+        return moveCount
+    }
+
+    private fun moveNodeToStageLocked(
+        node: RegisteredNode,
+        stage: StageConfig,
+        reason: String
+    ): Boolean {
+        if (node.stageId == stage.stageId && node.assignmentReason == reason) {
+            return false
+        }
+        val previousStageId = node.stageId
+        if (nodeIdByStageId[previousStageId] == node.nodeId) {
+            nodeIdByStageId.remove(previousStageId)
+        }
+        node.stageId = stage.stageId
+        node.assignmentReason = reason
+        nodeIdByStageId[stage.stageId] = node.nodeId
+        recordSchedulerEvent(
+            action = "move_node",
+            stageId = stage.stageId,
+            nodeId = node.nodeId,
+            deviceId = node.deviceId,
+            reason = reason,
+            message = "Moved node ${node.nodeId} from stage $previousStageId to stage ${stage.stageId}"
+        )
+        return true
+    }
+
+    private fun preferredStageByDeviceId(config: CoordinatorConfig): Map<String, StageConfig> {
+        return config.stages.mapNotNull { stage ->
+            stage.deviceId.trim().takeIf { it.isNotBlank() }?.let { it to stage }
+        }.toMap()
     }
 
     fun heartbeat(request: Sid.HeartbeatRequest): Sid.HeartbeatResponse = lock.withLock {
@@ -199,7 +611,10 @@ class CoordinatorState(
     }
 
     fun evictExpiredNodes(): Int = lock.withLock {
-        val now = Instant.now()
+        evictExpiredNodesLocked(Instant.now(), "lease-expired")
+    }
+
+    private fun evictExpiredNodesLocked(now: Instant, reason: String): Int {
         val expiredNodeIds = nodesById.values
             .filter { it.isExpired(now, leaseDuration) }
             .map { it.nodeId }
@@ -215,6 +630,14 @@ class CoordinatorState(
                 node.lastHeartbeatAt
             )
             persistence.deleteNode(nodeId, routingEpoch.get(), nextNodeId.get())
+            recordSchedulerEvent(
+                action = "evict_expired_node",
+                stageId = node.stageId,
+                nodeId = node.nodeId,
+                deviceId = node.deviceId,
+                reason = reason,
+                message = "Lease expired for node ${node.nodeId} on stage ${node.stageId}"
+            )
         }
 
         if (expiredNodeIds.isNotEmpty()) {
@@ -222,7 +645,7 @@ class CoordinatorState(
             persistence.saveMetaOnly(routingEpoch.get(), nextNodeId.get())
         }
 
-        expiredNodeIds.size
+        return expiredNodeIds.size
     }
 
     fun drainStage(stageId: Int): AdminMutationResult = lock.withLock {
@@ -233,6 +656,14 @@ class CoordinatorState(
             persistence.setStageDrained(stageId, true)
             persistence.saveMetaOnly(routingEpoch.get(), nextNodeId.get())
             logger.info("Stage {} ({}) drained manually", stageId, stage.deviceId)
+            recordSchedulerEvent(
+                action = "drain_stage",
+                stageId = stageId,
+                nodeId = nodeIdByStageId[stageId],
+                deviceId = stage.deviceId,
+                reason = "manual-drain",
+                message = "Stage $stageId drained manually"
+            )
         }
         mutationSuccess("drain_stage", "Stage $stageId drained")
     }
@@ -245,6 +676,14 @@ class CoordinatorState(
             persistence.setStageDrained(stageId, false)
             persistence.saveMetaOnly(routingEpoch.get(), nextNodeId.get())
             logger.info("Stage {} ({}) resumed manually", stageId, stage.deviceId)
+            recordSchedulerEvent(
+                action = "resume_stage",
+                stageId = stageId,
+                nodeId = nodeIdByStageId[stageId],
+                deviceId = stage.deviceId,
+                reason = "manual-resume",
+                message = "Stage $stageId resumed manually"
+            )
         }
         mutationSuccess("resume_stage", "Stage $stageId resumed")
     }
@@ -261,20 +700,53 @@ class CoordinatorState(
             node.stageId,
             node.deviceId
         )
+        recordSchedulerEvent(
+            action = "evict_node",
+            stageId = node.stageId,
+            nodeId = node.nodeId,
+            deviceId = node.deviceId,
+            reason = "manual-evict",
+            message = "Node ${node.nodeId} evicted manually from stage ${node.stageId}"
+        )
         return mutationSuccess("evict_node", "Node $nodeId evicted")
+    }
+
+    fun reconcileScheduler(): AdminMutationResult = lock.withLock {
+        val expiredCount = evictExpiredNodesLocked(Instant.now(), "scheduler-reconcile")
+        val reassignedCount = if (config.scheduler.enabled && config.scheduler.preferConfiguredDevices) {
+            reconcilePreferredAssignmentsLocked()
+        } else {
+            0
+        }
+        if (expiredCount == 0 && reassignedCount == 0) {
+            recordSchedulerEvent(
+                action = "scheduler_reconcile",
+                stageId = null,
+                nodeId = null,
+                deviceId = null,
+                reason = "no-op",
+                message = "Scheduler reconcile found no expired leases or preferred-device moves"
+            )
+        }
+        mutationSuccess(
+            "scheduler_reconcile",
+            "Scheduler reconcile complete: expired=$expiredCount reassigned=$reassignedCount"
+        )
     }
 
     fun reloadConfig(newConfig: CoordinatorConfig): AdminMutationResult = lock.withLock {
         config = newConfig
         leaseDuration = Duration.ofSeconds(newConfig.heartbeatLeaseSeconds)
-        stagesByDeviceId = newConfig.stages.associateBy(StageConfig::deviceId)
+        preferredStageByDeviceId = preferredStageByDeviceId(newConfig)
 
         val validStageIds = newConfig.stages.mapTo(mutableSetOf()) { it.stageId }
         val validDeviceIdsByStageId = newConfig.stages.associate { it.stageId to it.deviceId }
 
         val invalidNodes = nodesById.values.filter { node ->
             val expectedDeviceId = validDeviceIdsByStageId[node.stageId]
-            expectedDeviceId == null || expectedDeviceId != node.deviceId
+            expectedDeviceId == null ||
+                (!newConfig.scheduler.enabled && expectedDeviceId != node.deviceId) ||
+                (newConfig.scheduler.enabled && !newConfig.scheduler.allowUnlistedDevices && expectedDeviceId != node.deviceId)
         }
         invalidNodes.forEach { node ->
             nodesById.remove(node.nodeId)
@@ -293,8 +765,9 @@ class CoordinatorState(
         persistence.saveMetaOnly(routingEpoch.get(), nextNodeId.get())
 
         logger.info(
-            "Config reloaded. pipeline={} stages={} drainedStages={}",
+            "Config reloaded. pipeline={} scheduler={} stages={} drainedStages={}",
             newConfig.pipelineName,
+            "${newConfig.scheduler.enabled}:${newConfig.scheduler.policy}",
             newConfig.stages.joinToString { "${it.stageId}:${it.deviceId}" },
             drainedStageIds.sorted()
         )
@@ -345,6 +818,10 @@ class CoordinatorState(
             AdminStageSnapshot(
                 stageId = stage.stageId,
                 deviceId = stage.deviceId,
+                preferredDeviceId = stage.deviceId,
+                minMemoryGb = stage.minMemoryGb,
+                minComputeCapacity = stage.minComputeCapacity,
+                schedulingWeight = stage.schedulingWeight,
                 modelShardId = stage.modelShardId,
                 expectedHost = stage.expectedHost,
                 expectedPort = stage.expectedPort,
@@ -364,7 +841,9 @@ class CoordinatorState(
 
         val liveNodeCount = nodeSnapshots.count(AdminNodeSnapshot::isLive)
         val inactiveNodeCount = nodeSnapshots.count { !it.isLive }
-        val offlineStageCount = stageSnapshots.count { !it.terminal && !it.routeReady }
+        val offlineStageCount = stageSnapshots.count { stage ->
+            !stage.drained && stage.assignedNode?.isLive != true
+        }
         val drainedStageCount = stageSnapshots.count(AdminStageSnapshot::drained)
 
         AdminStatusSnapshot(
@@ -376,10 +855,17 @@ class CoordinatorState(
                 liveNodeCount = liveNodeCount,
                 inactiveNodeCount = inactiveNodeCount,
                 offlineStageCount = offlineStageCount,
-                drainedStageCount = drainedStageCount
+                drainedStageCount = drainedStageCount,
+                schedulerEnabled = config.scheduler.enabled,
+                schedulerPolicy = config.scheduler.policy,
+                schedulerAllowUnlistedDevices = config.scheduler.allowUnlistedDevices,
+                schedulerPreferConfiguredDevices = config.scheduler.preferConfiguredDevices,
+                schedulerRebalanceOnRegister = config.scheduler.rebalanceOnRegister,
+                schedulerEventCount = schedulerEvents.size
             ),
             stages = stageSnapshots,
-            nodes = nodeSnapshots
+            nodes = nodeSnapshots,
+            schedulerEvents = schedulerEvents.toList()
         )
     }
 
@@ -660,6 +1146,14 @@ class CoordinatorState(
         )
     }
 
+    private fun persistReassignedNodes(nodes: Collection<RegisteredNode>) {
+        val uniqueNodes = nodes.associateBy(RegisteredNode::nodeId).values
+        uniqueNodes.forEach { node ->
+            persistence.deleteNode(node.nodeId, routingEpoch.get(), nextNodeId.get())
+        }
+        uniqueNodes.forEach(::persistNode)
+    }
+
     private fun toAdminRequestStateSnapshot(state: PersistedRequestState): AdminRequestStateSnapshot {
         val nowEpochMs = Instant.now().toEpochMilli()
         val lifecycleState = deriveRequestLifecycleState(state, nowEpochMs)
@@ -712,12 +1206,38 @@ class CoordinatorState(
             grpcPort = grpcPort,
             computeCapacity = computeCapacity,
             memoryGb = memoryGb,
+            assignmentReason = assignmentReason,
             registeredAtEpochMs = registeredAt.toEpochMilli(),
             lastHeartbeatAtEpochMs = lastHeartbeatAt.toEpochMilli(),
             isActive = isActive,
             isExpired = expired,
             isLive = isActive && !expired
         )
+    }
+
+    private fun recordSchedulerEvent(
+        action: String,
+        stageId: Int?,
+        nodeId: Int?,
+        deviceId: String?,
+        reason: String,
+        message: String
+    ) {
+        schedulerEvents.addFirst(
+            AdminSchedulerEventSnapshot(
+                eventId = nextSchedulerEventId++,
+                eventEpochMs = Instant.now().toEpochMilli(),
+                action = action,
+                stageId = stageId,
+                nodeId = nodeId,
+                deviceId = deviceId,
+                reason = reason,
+                message = message
+            )
+        )
+        while (schedulerEvents.size > MAX_SCHEDULER_EVENTS) {
+            schedulerEvents.removeLast()
+        }
     }
 
     private fun failureResponse(message: String): Sid.RegistrationResponse {
@@ -767,6 +1287,14 @@ class CoordinatorState(
         val routingEpoch: Long
     )
 
+    private data class StageAssignment(
+        val stage: StageConfig,
+        val reason: String,
+        val displacedNodeId: Int? = null,
+        val displacedStage: StageConfig? = null,
+        val displacedReason: String? = null
+    )
+
     data class RequestSubmissionPlan(
         val accepted: Boolean,
         val stageId: Int,
@@ -775,4 +1303,8 @@ class CoordinatorState(
         val port: Int?,
         val message: String
     )
+
+    private companion object {
+        private const val MAX_SCHEDULER_EVENTS = 100
+    }
 }

@@ -23,6 +23,7 @@ class CoordinatorAdminServer(
     private val drainStage: (Int) -> AdminMutationResult,
     private val resumeStage: (Int) -> AdminMutationResult,
     private val evictNode: (Int) -> AdminMutationResult,
+    private val reconcileScheduler: () -> AdminMutationResult,
     private val reloadRouting: () -> AdminMutationResult
 ) {
     private val logger = LoggerFactory.getLogger(CoordinatorAdminServer::class.java)
@@ -82,6 +83,9 @@ class CoordinatorAdminServer(
         server.createContext("/api/v1/routing/reload") { exchange ->
             handleMutation(exchange) { reloadRouting() }
         }
+        server.createContext("/api/v1/scheduler/reconcile") { exchange ->
+            handleMutation(exchange) { reconcileScheduler() }
+        }
         server.createContext("/api/v1/stages/") { exchange ->
             handleStageMutation(exchange)
         }
@@ -105,6 +109,7 @@ class CoordinatorAdminServer(
                             "POST /api/v1/stages/{stageId}/drain",
                             "POST /api/v1/stages/{stageId}/resume",
                             "POST /api/v1/nodes/{nodeId}/evict",
+                            "POST /api/v1/scheduler/reconcile",
                             "POST /api/v1/routing/reload"
                         )
                     )
