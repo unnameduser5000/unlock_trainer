@@ -1358,6 +1358,7 @@ python tools/data/prepare_lora_sft_requests.py \
   --limit 512 \
   --attention_mask causal \
   --mask_prompt \
+  --max_prompt_tokens 48 \
   --min_valid_labels 4 \
   --request_prefix rt-lora-train \
   --output_dir data/sft_requests/tinyllama_rotten_tomatoes64_train512

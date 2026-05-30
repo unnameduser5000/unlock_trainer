@@ -156,8 +156,11 @@ def build_token_tensors(
     response: str,
     seq_len: int,
     mask_prompt: bool,
+    max_prompt_tokens: int,
 ) -> tuple[torch.Tensor, torch.Tensor, int]:
     prompt_ids = tokenizer(prompt, add_special_tokens=False)["input_ids"]
+    if max_prompt_tokens > 0:
+        prompt_ids = prompt_ids[:max_prompt_tokens]
     response_ids = tokenizer(response, add_special_tokens=False)["input_ids"]
     eos_id = tokenizer.eos_token_id
     if eos_id is not None:
@@ -252,6 +255,16 @@ def main() -> None:
     parser.add_argument("--attention_mask", choices=["zero", "causal"], default="causal")
     parser.add_argument("--mask_prompt", action="store_true")
     parser.add_argument(
+        "--max_prompt_tokens",
+        type=int,
+        default=0,
+        help=(
+            "Truncate the prompt to this many tokens before appending the response. "
+            "Use this with seq_len=64 classification tasks so response labels are not truncated away. "
+            "0 keeps the old behavior."
+        ),
+    )
+    parser.add_argument(
         "--min_valid_labels",
         type=int,
         default=0,
@@ -263,6 +276,10 @@ def main() -> None:
         raise ValueError("seq_len must be at least 2.")
     if args.limit <= 0:
         raise ValueError("limit must be positive.")
+    if args.max_prompt_tokens < 0:
+        raise ValueError("max_prompt_tokens must be non-negative.")
+    if args.max_prompt_tokens >= args.seq_len:
+        raise ValueError("max_prompt_tokens must be smaller than seq_len.")
 
     resolved_model = resolve_model_name(args.model_name)
     dataset_name, default_split = resolve_dataset(args.dataset)
@@ -291,8 +308,11 @@ def main() -> None:
     metadata_path = args.output_dir / "metadata.json"
 
     records_written = 0
+    last_dataset_index = args.offset - 1
     with manifest_path.open("w", encoding="utf-8") as manifest:
-        for dataset_index in range(args.offset, min(args.offset + args.limit, len(dataset))):
+        dataset_index = args.offset
+        while records_written < args.limit and dataset_index < len(dataset):
+            last_dataset_index = dataset_index
             example = dataset[dataset_index]
             prompt, response = format_example(example, dataset_name)
             input_ids, labels, prompt_token_count = build_token_tensors(
@@ -301,6 +321,7 @@ def main() -> None:
                 response=response,
                 seq_len=args.seq_len,
                 mask_prompt=args.mask_prompt,
+                max_prompt_tokens=args.max_prompt_tokens,
             )
             valid_label_count = count_valid_labels(labels)
             if valid_label_count < args.min_valid_labels:
@@ -308,6 +329,7 @@ def main() -> None:
                     f"Skipping dataset_index={dataset_index}: "
                     f"valid_label_count={valid_label_count} < min_valid_labels={args.min_valid_labels}"
                 )
+                dataset_index += 1
                 continue
             with torch.no_grad():
                 hidden_states = embedding(input_ids).float().cpu().numpy().astype("<f4")
@@ -350,6 +372,13 @@ def main() -> None:
             }
             manifest.write(json.dumps(record, ensure_ascii=False) + "\n")
             records_written += 1
+            dataset_index += 1
+
+    if records_written < args.limit:
+        print(
+            f"Warning: dataset exhausted after dataset_index={last_dataset_index}; "
+            f"wrote {records_written}/{args.limit} requested records."
+        )
 
     metadata = {
         "model_name": args.model_name,
@@ -358,9 +387,13 @@ def main() -> None:
         "dataset_config": dataset_config,
         "dataset_split": dataset_split,
         "seq_len": args.seq_len,
+        "requested_limit": args.limit,
         "limit": records_written,
+        "offset": args.offset,
+        "last_dataset_index": last_dataset_index,
         "attention_mask": args.attention_mask,
         "mask_prompt": args.mask_prompt,
+        "max_prompt_tokens": args.max_prompt_tokens,
         "min_valid_labels": args.min_valid_labels,
         "manifest": manifest_path.name,
     }
