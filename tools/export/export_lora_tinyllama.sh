@@ -21,10 +21,14 @@ LORA_ALPHA="${LORA_ALPHA:-16}"
 LORA_TARGETS="${LORA_TARGETS:-q_proj,v_proj}"
 LORA_INIT_STD="${LORA_INIT_STD:-0.01}"
 ENABLE_XNNPACK="${ENABLE_XNNPACK:-0}"
+DUMP_JOINT_GRAPH="${DUMP_JOINT_GRAPH:-0}"
 
 EXTRA_ARGS=()
 if [[ "${ENABLE_XNNPACK}" == "1" ]]; then
   EXTRA_ARGS+=(--enable_xnnpack)
+fi
+if [[ "${DUMP_JOINT_GRAPH}" == "1" ]]; then
+  EXTRA_ARGS+=(--dump_joint_graph)
 fi
 
 python tools/export/sid_export_mobile.py \

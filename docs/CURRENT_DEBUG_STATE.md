@@ -2,11 +2,447 @@
 
 This file is the first file to read after any context reset.
 
-Last updated: 2026-05-27 17:55 Asia/Shanghai
+Last updated: 2026-05-30 Asia/Shanghai
 
 ## Current Mainline Position
 
 Do not restart from inference smoke or one-request smoke after a context reset. Those paths have already served their purpose.
+
+### 2026-05-30 Pipeline-Overlap Scheduler Proof
+
+Current pipeline-overlap evidence directory:
+
+- `debug_runs/pipeline-overlap-20260530-114725`
+
+Why this stage exists:
+
+- The successful stay-awake `train512` proved the three-stage Android BP-free training chain is stable, but `runPreparedExperiment` was still request-level serial.
+- The new target is to prove bounded in-flight scheduling: while one request is on downstream stages, upstream stages can execute later requests.
+
+Code changes added for this stage:
+
+- Android worker:
+  - `MainActivity.kt` now wraps only `NativeShardRunner.execute(modelPath, request)` in a coroutine `Mutex`.
+  - The downstream `sendDataToNextNode` call remains outside the local execution mutex, so one stage can start the next local request while an earlier request waits for downstream completion.
+  - This protects ExecuTorch `TrainingModule` / local SGD from concurrent same-phone calls while still permitting inter-stage overlap.
+- Coordinator:
+  - New Gradle task: `:coordinator:runPreparedPipelineExperiment`.
+  - New runner: `coordinator/src/main/kotlin/com/example/sid_coordinator/RunPreparedPipelineExperimentMain.kt`.
+  - Arguments mirror `runPreparedExperiment`, plus final `maxInFlight` argument.
+  - `CoordinatorState.reportRequestEvent()` now stores coordinator-observed request-event time in `event_epoch_ms`; raw worker phone time is appended as `workerEventEpochMs=...` in the message. Use this new data for Gantt plots because phone clocks are not guaranteed synchronized.
+- Reporting:
+  - New script: `tools/report/plot_pipeline_overlap.py`.
+  - It reads `stage-timings.csv`, uses `LOCAL_COMPLETED` rows and `total_measured_ms` to estimate actual local ExecuTorch execution intervals, writes `pipeline_overlap_intervals.csv`, `pipeline_overlap_summary.txt`, and `pipeline_overlap_gantt.png`.
+  - Do not use `local_ms` alone for Gantt intervals after the mutex change; it includes time waiting for the local execution mutex. Use `total_measured_ms` or `execute_ms` for the actual local work interval.
+
+Build and deployment status:
+
+- `.\gradlew.bat :coordinator:compileKotlin --offline --no-daemon`: passed.
+- `.\gradlew.bat :app:assembleDebug --offline --no-daemon`: passed.
+- New APK installed on:
+  - NX ADB `91260221021D`
+  - Lenovo ADB `ZY22G2HC5C`
+  - Pixel ADB `58151FDCQ006A8`
+- Coordinator was restarted from the new build and workers were relaunched.
+
+Current clean post-probe device state:
+
+- stage 0: NX / node `115` / `192.168.137.211:26052` / `tinyllama_lora_chunk_0`
+- stage 1: Lenovo / node `108` / `192.168.137.124:26052` / `tinyllama_lora_chunk_1`
+- stage 2: Pixel / node `116` / `192.168.137.139:26052` / `tinyllama_lora_chunk_2`
+- Status after cleanup: `liveNodeCount=3`, `offlineStageCount=0`, route chain NX -> Lenovo -> Pixel.
+- The small train pipeline probe saved `*.latest.sidckpt` files on all three phones. These were deleted after evidence export:
+  - NX: `files/shards/checkpoints/tinyllama_lora_chunk_0.latest.sidckpt`
+  - Lenovo: `files/shards/checkpoints/tinyllama_lora_chunk_1.latest.sidckpt`
+  - Pixel: `files/shards/checkpoints/tinyllama_lora_chunk_2.latest.sidckpt`
+- Workers were restarted after deleting latest checkpoints, so the next formal run should start from the PTE initial state. Old `backup_20260527_1516` checkpoint directories on NX/Lenovo were left untouched.
+
+Pipeline eval-only probe:
+
+- Directory: `debug_runs/pipeline-overlap-20260530-114725/pipeline-eval6-window3`
+- Run id: `pipeline-eval6-window3-20260530-1150`
+- Command: recorded in `command.txt`.
+- Arguments: `evalOnly=true`, `maxSubmitted=6`, `maxInFlight=3`, `stopOnFailure=true`, transient retry count `0`.
+- Result: 6/6 success.
+- Summary: avg local loss `7.527053`, token accuracy `0.373832` over `107` tokens.
+- Artifacts:
+  - `results.csv`
+  - `metrics.csv`
+  - `stage-timings.csv`
+  - `coordinator-run-summary.json`
+  - `figures/pipeline_overlap_gantt.png`
+  - `figures/pipeline_overlap_summary.txt`
+  - `figures/pipeline_overlap_intervals.csv`
+- Overlap evidence using `total_measured_ms` intervals:
+  - `local_completed_intervals=18`
+  - `overlap_pair_count=17`
+  - `max_overlap_ms=5994`
+  - Example: request `000005` stage 0 overlapped request `000004` stage 1 by `5994 ms`.
+
+Pipeline train probe:
+
+- Directory: `debug_runs/pipeline-overlap-20260530-114725/pipeline-train6-window3`
+- Run id: `pipeline-train6-window3-20260530-1155`
+- Command: recorded in `command.txt`.
+- Arguments: `evalOnly=false`, `maxSubmitted=6`, `maxInFlight=3`, `delayMs=1000`, `stopOnFailure=true`, transient retry count `0`.
+- Result: 6/6 success.
+- Summary: avg local loss `7.478127`, token accuracy `0.565957` over `235` tokens.
+- Artifacts:
+  - `results.csv`
+  - `metrics.csv`
+  - `stage-timings.csv`
+  - `coordinator-run-summary.json`
+  - `figures/pipeline_overlap_gantt.png`
+  - `figures/pipeline_overlap_summary.txt`
+  - `figures/pipeline_overlap_intervals.csv`
+- Overlap evidence using `total_measured_ms` intervals:
+  - `local_completed_intervals=18`
+  - `overlap_pair_count=19`
+  - `max_overlap_ms=6229`
+  - Examples:
+    - request `000005` stage 0 overlapped request `000004` stage 1 by `6229 ms`
+    - request `000004` stage 0 overlapped request `000003` stage 1 by `6011 ms`
+    - request `000000` stage 2 overlapped request `000002` stage 0 by `5689 ms`
+
+Pipeline train512 window-3 run:
+
+- Directory: `debug_runs/pipeline-overlap-20260530-114725/pipeline-train512-window3-20260530-121154`
+- Run id: `pipeline-train512-window3-20260530-121154`
+- Command args are recorded in `args.txt`.
+- Arguments: `maxSubmitted=512`, `maxInFlight=3`, `delayMs=0`, `evalOnly=false`, `stopOnFailure=true`, retry count `18`, retry delay `10000 ms`, submit deadline `420000 ms`.
+- Status at the 128-request snapshot:
+  - `128/512` terminal requests completed.
+  - `128` success, `0` failed.
+  - `maxTerminalInFlight=3`, so the window is actually being filled.
+  - Throughput about `5.57 req/min`.
+  - Average terminal elapsed about `32136 ms`.
+  - Token accuracy snapshot about `0.5611`.
+  - Battery snapshot around the same period: NX `100%`, Lenovo `97%`, Pixel `99%`; phone temperatures about `36-37 C`.
+- Partial artifacts fixed at the 128-request snapshot:
+  - `results.csv` keeps growing while the 512 run continues.
+  - `coordinator-run-summary-128.json`
+  - `metrics-128.csv`
+  - `stage-timings-128.csv`
+  - `figures-128/pipeline_overlap_gantt.png`
+  - `figures-128/pipeline_overlap_summary.txt`
+  - `figures-128/pipeline_overlap_intervals.csv`
+- 128-snapshot overlap evidence using `total_measured_ms` intervals:
+  - `local_completed_intervals=389`
+  - `overlap_pair_count=483`
+  - `max_overlap_ms=8317`
+  - Examples:
+    - request `000063` stage 0 overlapped request `000061` stage 2 by `8317 ms`
+    - request `000064` stage 2 overlapped request `000066` stage 0 by `7962 ms`
+    - request `000116` stage 0 overlapped request `000115` stage 1 by `7883 ms`
+- Final status:
+  - Completed `512/512` terminal requests with `0` final failures and no missing record indices through `511`.
+  - Gradle stdout ended with `BUILD SUCCESSFUL in 1h 55m 51s`.
+  - Wall-clock duration from runner timestamps: about `115.62 min`, throughput about `4.43 req/min`.
+  - Runner-observed terminal latency: average about `40.6 s`, p50 about `33.9 s`, p95 about `54.8 s`, p99 about `174.3 s`, max about `463.9 s`.
+  - Coordinator summary: average local loss `7.410730381496251`, token accuracy `0.557944895839697` over `16369` tokens.
+  - `metrics-final.csv` contains `5` transient failed attempts, all recovered by retry:
+    - request indices `294`, `299`, `303`, `306`, and `325`
+    - message: `Coordinator dispatch to stage 0 failed: Read timed out`
+  - This is useful systems evidence: bounded in-flight scheduling works and transient retry can recover requests, but stragglers/read-timeouts can occupy window slots and reduce effective concurrency.
+  - Worker telemetry was exported from coordinator SQLite after the run, not just sampled as a final snapshot:
+    - `worker-telemetry-final.csv`: 4135 heartbeat samples across the run window.
+    - `worker-telemetry-summary.txt`: per-device battery, current, temperature, and memory summary.
+    - `worker-telemetry-timeseries.png`: battery level, battery temperature, device-reported current, and app PSS over time.
+    - NX / stage 0: 1380 samples, battery stayed `100%`, temp avg `36.0 C`, app PSS avg about `3256.0 MB`.
+    - Lenovo / stage 1: 1379 samples, battery `99% -> 94%`, temp avg `35.4 C`, app PSS avg about `3259.4 MB`.
+    - Pixel / stage 2: 1376 samples, battery `100% -> 95%`, temp avg `35.5 C`, app PSS avg about `3643.3 MB`.
+    - `battery-final.txt` is only the final status snapshot before coordinator shutdown.
+    - Treat device-reported current as qualitative unless backed by Android Studio Power Profiler or an external power meter.
+  - Coordinator status before shutdown was saved in `status-final-before-shutdown.json`.
+  - Coordinator process listening on `50051/18080` was stopped after final artifacts were exported.
+- Final artifacts:
+  - `coordinator-run-summary-final.json`
+  - `metrics-final.csv`
+  - `stage-timings-final.csv`
+  - `figures-final/pipeline_overlap_gantt.png`
+  - `figures-final/pipeline_overlap_summary.txt`
+  - `figures-final/pipeline_overlap_intervals.csv`
+  - `figures-final/worker-telemetry-final.csv`
+  - `figures-final/worker-telemetry-summary.txt`
+  - `figures-final/worker-telemetry-timeseries.png`
+  - `figures-final/training_loss_curve.png`
+  - `figures-final/training_latency_curve.png`
+  - `figures-final/training_token_accuracy_curve.png`
+  - `figures-final/run_metrics_summary.txt`
+  - Training loss is roughly flat: average `7.4107`, first 50 successful requests about `7.4113`, last 50 about `7.5643`.
+
+Interpretation:
+
+- This is the first direct evidence that the mobile pipeline runner is not merely serial request submission.
+- The probe demonstrates bounded in-flight request submission and cross-stage local execution overlap on the real Android ExecuTorch training path.
+- The local execution mutex is a correctness guard, not a serialization of the whole request: upstream local execution can proceed while an earlier request is forwarding or waiting downstream.
+- The train probe is a scheduler/data-path proof, not a model-quality result. For any next formal train/eval, start from the clean post-probe worker state or explicitly re-clear checkpoints.
+- Request-order/FIFO and serial are not the same. Serial means submit one request and wait for the terminal stage before submitting the next. Request-ordered pipeline means each stage should apply local work in request order, while different requests can occupy different stages at the same time. The current implementation proves bounded in-flight overlap with a local execution mutex; strict per-stage FIFO ordering should still be added before making a model-quality/order-determinism claim.
+
+Useful commands:
+
+```powershell
+.\gradlew.bat :coordinator:runPreparedPipelineExperiment --offline --no-daemon --args="127.0.0.1 50051 data/sft_requests/tinyllama_dolly64_train512/requests.jsonl 0 6 debug_runs/<run>/pipeline-train6-window3/results.csv pipeline-train6-window3-<ts> 1 1000 false true 0 10000 420000 3"
+
+python tools\report\plot_pipeline_overlap.py debug_runs\<run>\pipeline-train6-window3\stage-timings.csv --output_dir debug_runs\<run>\pipeline-train6-window3\figures
+
+python tools\report\export_worker_telemetry.py `
+  --db coordinator\coordinator\data\coordinator.db `
+  --results_csv debug_runs\pipeline-overlap-20260530-114725\pipeline-train512-window3-20260530-121154\results.csv `
+  --output_dir debug_runs\pipeline-overlap-20260530-114725\pipeline-train512-window3-20260530-121154\figures-final
+
+python tools\report\plot_run_metrics.py `
+  --csv debug_runs\pipeline-overlap-20260530-114725\pipeline-train512-window3-20260530-121154\metrics-final.csv `
+  --output_dir debug_runs\pipeline-overlap-20260530-114725\pipeline-train512-window3-20260530-121154\figures-final `
+  --title "Train512 window=3"
+```
+
+### 2026-05-30 Four-Phone Scheduler Probe
+
+Current four-phone scheduler evidence directory:
+
+- `debug_runs/four-phone-scheduler-20260530-0005`
+
+Connected ADB devices during the probe:
+
+- Pixel / ADB `58151FDCQ006A8` / deviceId `Pixel_10_Pro_XL` / `192.168.137.139` / battery 99% / has cached `tinyllama_lora_chunk_2.pte`
+- NX / ADB `91260221021D` / deviceId `NX809J` / `192.168.137.211` / battery 100% / has cached `tinyllama_lora_chunk_0.pte`
+- Huawei / ADB `APFQUT2C19005486` / deviceId `AGT-AN00` / `192.168.137.243` / battery 67% / no shard cache
+- Lenovo / ADB `ZY22G2HC5C` / deviceId `Lenovo_L71091` / `192.168.137.124` / battery 100% / has cached `tinyllama_lora_chunk_1.pte`
+
+Important: the active model is still a three-stage LoRA TinyLlama pipeline. Four phones do not automatically mean four model stages. In this run the fourth phone was used to test scheduler spare/rejection behavior.
+
+Observed scheduler result after relaunching workers in stage order:
+
+- stage 0: NX node `111`, `assignmentReason=preferred-device-match`, shard `tinyllama_lora_chunk_0`
+- stage 1: Lenovo node `108`, `assignmentReason=preferred-device-match`, shard `tinyllama_lora_chunk_1`
+- stage 2: Pixel node `112`, `assignmentReason=dynamic-fill-offline-stage`, shard `tinyllama_lora_chunk_2`
+- Huawei registered as `AGT-AN00` but was rejected with `reason=no-schedulable-stage` because all three stages were already live.
+
+Status after the scheduler probe:
+
+- `liveNodeCount=3`
+- `offlineStageCount=0`
+- route chain: NX `192.168.137.211:26052` -> Lenovo `192.168.137.124:26052` -> Pixel `192.168.137.139:26052`
+- saved snapshots:
+  - `debug_runs/four-phone-scheduler-20260530-0005/status-after-relaunch.json`
+  - `debug_runs/four-phone-scheduler-20260530-0005/status-after-probe.json`
+
+One prepared request was submitted as a scheduler/data-path probe, not as a new mainline smoke reset:
+
+- Run id: `four-phone-scheduler-probe`
+- CSV: `debug_runs/four-phone-scheduler-20260530-0005/scheduler-probe/results.csv`
+- Result: 1/1 success, `evalOnly=true`, terminal stage 2 on Pixel, elapsed `44916 ms`, loss `8.239365`, token accuracy `1/3`.
+- Coordinator export:
+  - `debug_runs/four-phone-scheduler-20260530-0005/scheduler-probe/coordinator-run-summary.json`
+  - `debug_runs/four-phone-scheduler-20260530-0005/scheduler-probe/stage-timings.csv`
+
+Stage timing evidence confirms all three stages executed `TrainingModule` forward:
+
+- stage 0 NX: `executeMs=5152`, local loss `12.037177`
+- stage 1 Lenovo: `executeMs=7798`, local loss `5.682226`
+- stage 2 Pixel: `executeMs=6777`, local loss `8.239365`
+
+Caveat: Pixel's device-local `eventEpochMs` is not synchronized with the coordinator clock. For timeline figures, prefer coordinator request metrics or event ids over raw worker-local epoch ordering.
+
+If a true four-stage model is needed, export new artifacts on the Linux server instead of trying to use the current three-stage PTEs:
+
+```bash
+NUM_CHUNKS=4 CHUNK_IDX=-1 OUTPUT_DIR=model bash tools/export/export_lora_tinyllama.sh
+```
+
+With joint graph diagnostics:
+
+```bash
+DUMP_JOINT_GRAPH=1 NUM_CHUNKS=4 CHUNK_IDX=-1 OUTPUT_DIR=model bash tools/export/export_lora_tinyllama.sh
+```
+
+Then update `coordinator/config/pipeline.json` to four stages with `tinyllama_lora_chunk_0/1/2/3`, pre-cache each shard on its intended phone, call `POST /api/v1/routing/reload`, and relaunch workers. Current exporter still duplicates `final_norm + lm_head` into each chunk, so four-stage memory will not shrink linearly.
+
+512-row training retry after the scheduler probe:
+
+- Run directory: `debug_runs/train512-pixel-stage2-20260530-0030`
+- Run id: `train512-pixel-stage2-20260530`
+- Command is recorded in `debug_runs/train512-pixel-stage2-20260530-0030/command-attempt2.txt`.
+- Background runner PID is in `debug_runs/train512-pixel-stage2-20260530-0030/pid-attempt2.txt`; the process has exited normally after fail-fast.
+- ADB perf monitor PID is in `debug_runs/train512-pixel-stage2-20260530-0030/monitor.pid.txt`; the monitor was stopped after failure evidence was saved.
+- Worker mapping at start: NX stage 0, Lenovo stage 1, Pixel stage 2. Huawei was force-stopped to avoid spare-node noise.
+- Arguments: train512 prepared Dolly SFT manifest, `startIndex=0`, `maxSubmitted=512`, `evalOnly=false`, `stopOnFailure=true`, explicit transient retry count `18`, retry delay `10000 ms`, submit deadline `420000 ms`.
+- Result: 28 submitted, 27 successful training requests, 1 failed request.
+- Final failed request: `train512-pixel-stage2-20260530-000027`, after 19 attempts including 18 transient retries, message `Stage 2 has no live worker.`
+- Runner stdout/stderr and final CSV:
+  - `debug_runs/train512-pixel-stage2-20260530-0030/gradle-combined.log`
+  - `debug_runs/train512-pixel-stage2-20260530-0030/results.csv`
+- Failure evidence bundle:
+  - `debug_runs/train512-pixel-stage2-20260530-0030/failure-evidence-stage2-lease-expired/`
+- Coordinator status after failure: `liveNodeCount=2`, `offlineStageCount=1`; stage 2 was evicted with `reason=lease-expired`.
+- Pixel process did not disappear after the failure. `adb pidof com.example.sid_trainer` returned pid `20682`; Pixel battery was 100%, AC powered, about `29.3 C`.
+- Pixel `dumpsys activity exit-info` showed only the earlier manual force-stop, not a new LOW_MEMORY/LMK or native crash record.
+- Pixel logcat tail did not show a new app `AndroidRuntime` fatal or `OutOfMemory` line. It mainly showed repeated `BestClock: No network time available` noise and unrelated Google service `ManagedChannel allocation site` messages.
+- Coordinator worker telemetry before eviction showed Pixel stage 2 active, thermal status `NONE`, app PSS about `3.79 GB`, private dirty about `3.78 GB`, Java/runtime memory about `76 MB`.
+- Stage timing evidence shows stage 2 completed request `000026` successfully with `TrainingModule`, `evalOnly=false`, `optimizerStepApplied=true`, `executeMs=6900`, PSS about `3.77 GB`.
+- Interpretation: replacing the old stage-2 phone with Pixel did not complete 512. This run did not reproduce the previous clear Android LOW_MEMORY kill; instead stage 2 remained as a process but stopped satisfying the coordinator lease, so the immediate failure mode is heartbeat/RPC stall or worker responsiveness collapse under the high native memory plateau.
+- Caveat: the ADB `monitor_perf.ps1` invocation only sampled NX in this run, so use coordinator `worker-telemetry.csv` for Pixel memory/thermal evidence.
+
+Stay-awake rerun started after noticing the previous failure may have coincided with screen-off behavior:
+
+- Run directory pointer: `debug_runs/CURRENT_TRAIN512_RUN.txt`
+- Active run directory at start: `debug_runs/train512-pixel-stage2-stayon-20260530-012301`
+- Run id: `train512-pixel-stayon-20260530-012301`
+- Before relaunching workers, NX, Lenovo, and Pixel were configured with:
+  - `adb shell input keyevent KEYCODE_WAKEUP`
+  - `adb shell svc power stayon true`
+  - `adb shell settings put global stay_on_while_plugged_in 7`
+- Verified on all three: `mWakefulness=Awake`, `mStayOn=true`, `mHoldingDisplaySuspendBlocker=true`, `mStayOnWhilePluggedInSetting=7`.
+- Workers were force-stopped and relaunched cleanly: NX stage 0, Lenovo stage 1, Pixel stage 2 node `114`.
+- Huawei was force-stopped as a spare to avoid repeated no-stage registration noise.
+- Background runner PID: `debug_runs/train512-pixel-stage2-stayon-20260530-012301/pid.txt`.
+- Monitor PID: `debug_runs/train512-pixel-stage2-stayon-20260530-012301/monitor.pid.txt`.
+- Monitor wrapper fixed the previous serial passing issue; initial samples include all three serials: NX, Lenovo, and Pixel.
+- Final result: 512 submitted, 512 succeeded, 0 failed.
+- Runner stdout reports `BUILD SUCCESSFUL in 4h 23m 53s`.
+- Local CSV summary from `results.csv`: avg elapsed `30851.48 ms`, avg loss `7.407001`, token accuracy `0.558067` over `16369` tokens.
+- Coordinator summary: avg elapsed `30804.94 ms`, avg loss `7.40700065`, token accuracy `0.558067`.
+- Last request `train512-pixel-stayon-20260530-012301-000511` succeeded on terminal stage 2 with elapsed `30757 ms`, loss `7.328057`, token accuracy `31/50`.
+- Coordinator export was saved to `debug_runs/train512-pixel-stage2-stayon-20260530-012301/coordinator-export/`:
+  - `run-summary.json`
+  - `metrics.csv`
+  - `stage-timings.csv`
+- Monitor samples were saved under `debug_runs/train512-pixel-stage2-stayon-20260530-012301/monitor/perf-monitor-20260530-012352/`.
+- Monitor captured all three active serials: NX 4027 rows, Lenovo 4027 rows, Pixel 4027 rows.
+- Pixel stayed alive through the end: pid `21785`, battery 100%, about `28.8-29.0 C`, app PSS about `3.73 GB`, private dirty about `3.71 GB`.
+- Interpretation: the previous 27-success failure was consistent with screen-off / lease-expiry behavior. Keeping the phones awake and plugged in allowed the same three-stage Pixel-as-stage2 pipeline to complete the full 512-row training run despite the high stage-2 memory plateau.
+- The heartbeat follow-up `check-stay-awake-train512` was deleted after completion.
+
+Eval-after started immediately after the successful 512-row train, without restarting workers:
+
+- Eval directory: `debug_runs/train512-pixel-stage2-stayon-20260530-012301/eval-after`
+- Run id: `train512-pixel-stayon-20260530-eval-after`
+- Manifest: `data/sft_requests/tinyllama_dolly64_eval128/requests.jsonl`
+- Arguments: `startIndex=0`, `maxSubmitted=128`, `evalOnly=true`, `stopOnFailure=true`, retry count `18`, retry delay `10000 ms`, submit deadline `420000 ms`.
+- Background PID: `debug_runs/train512-pixel-stage2-stayon-20260530-012301/eval-after/pid.txt`; the process has exited normally.
+- Final result: 128 submitted, 128 succeeded, 0 failed.
+- Runner stdout reports `BUILD SUCCESSFUL in 1h 5m 19s`.
+- Local CSV summary from `results.csv`: avg elapsed `30476.67 ms`, avg loss `7.389941`, token accuracy `0.536709` over `3950` tokens.
+- Last request `train512-pixel-stayon-20260530-eval-after-000127` succeeded on terminal stage 2 with elapsed `25380 ms`, loss `6.7106795`, token accuracy `18/31`.
+- Coordinator status after eval-after: `liveNodeCount=3`, `offlineStageCount=0`.
+- Coordinator export was saved to `debug_runs/train512-pixel-stage2-stayon-20260530-012301/eval-after/coordinator-export/`:
+  - `run-summary.json`
+  - `metrics.csv`
+  - `stage-timings.csv`
+- Compared with the earlier three-phone eval128 (`avg loss 7.405194`, token accuracy `0.536203`), eval-after is a tiny improvement in loss and essentially unchanged token accuracy. Treat this as continuity/model-sanity evidence, not a strong accuracy claim.
+- The heartbeat follow-up `check-eval-after-run` was deleted after completion.
+
+### 2026-05-29 Active Three-Phone Mainline
+
+Current active run directory:
+
+- `debug_runs/three-phone-mainline-20260528-145049`
+
+Current devices and stage mapping:
+
+- stage 0: NX / ADB `91260221021D` / deviceId `NX809J` / `192.168.137.211:26052` / `tinyllama_lora_chunk_0`
+- stage 1: Lenovo / ADB `ZY22G2HC5C` / deviceId `Lenovo_L71091` / `192.168.137.124:26052` / `tinyllama_lora_chunk_1`
+- stage 2: third phone / ADB `267d1faa` / deviceId `23043RP34C` / `192.168.137.174:26052` / `tinyllama_lora_chunk_2`
+
+Latest train512 rerun result:
+
+- Run id: `three-main-train512-dataplanefix`
+- Run directory: `debug_runs/three-phone-mainline-20260528-145049/train512-dataplanefix-20260529-1240`
+- Started after reinstalling the APK and force-stopping/relaunching all workers so the LoRA state reloaded from the PTE files.
+- Command args are recorded in `debug_runs/three-phone-mainline-20260528-145049/train512-dataplanefix-20260529-1240/command.txt`.
+- PID file: `debug_runs/three-phone-mainline-20260528-145049/train512-dataplanefix-20260529-1240/pid.txt`.
+- The run has finished; use the final `results.csv` plus coordinator export for analysis:
+
+```powershell
+Invoke-WebRequest -UseBasicParsing "http://127.0.0.1:18080/api/v1/runs/three-main-train512-dataplanefix?metrics=10" |
+  Select-Object -ExpandProperty Content
+```
+
+- Final result on `2026-05-29 15:01 Asia/Shanghai`: 194 submitted rows, 193 successful training requests, 1 failed request. Average elapsed about `42825.82 ms`, average loss `7.4249`, token accuracy `0.5632` over `6198` tokens.
+- The run completed a clean 128-request training window and passed the old request-84 heartbeat/offline failure point, but did not complete the full 512-request train.
+- First/final failure: `three-main-train512-dataplanefix-000193`, after 19 attempts, message `Stage 2 has no live worker.`
+- Root cause evidence: stage 2 Android process `pid=3797` exited at `2026-05-29 14:58:14.673` with `reason=3 (LOW_MEMORY)`, PSS/RSS about `3.6GB`; no Java crash log was present. The worker later restarted as `pid=11750` and re-registered as node `110`, but that reloads stage 2 state and is not a valid continuation of the same in-memory LoRA training run.
+- OOM interpretation: this does not look like a classic per-request Kotlin/Java leak. Worker telemetry shows stage 2 jumps from about `166 MB` PSS before model load to about `3.67 GB` after the training PTE/runtime is active, then stays near that high plateau until Android LMK kills it; Java heap remains under about `98 MB`. Stage 2 is also the largest artifact (`tinyllama_lora_chunk_2.pte` about `1.56 GiB` versus `1.39 GiB` for chunks 0/1). The exported BP-free LoRA chunk currently includes `final_norm` and a full `lm_head` in every chunk, so adding more stages reduces transformer-layer burden but does not remove the duplicated full-vocabulary head unless the exporter/algorithm is changed.
+- ExecuTorch Android API note: the actual Maven dependency is `org.pytorch:executorch-android:1.2.0`. `javap` on the Gradle-cached AAR shows `TrainingModule` exposes `load`, `executeForwardBackward`, `namedParameters`, and `namedGradients`, but no `close/destroy`; `Tensor`/`EValue` also expose no explicit close. The local official `executorch/` clone may contain newer Java source with `TrainingModule.close()`, but that is not the API currently compiled into this app.
+- Immediate low-risk app optimizations after the OOM diagnosis:
+  - `NativeShardRunner.kt` no longer writes the LoRA checkpoint after every training step. It now saves step 1 and every 16 optimizer steps, reducing per-step parameter-copy and flash-write churn. The request event message includes `checkpointSaved` and `checkpointIntervalSteps`.
+  - `MainActivity.kt` now records per-local-step memory telemetry in the `LOCAL_COMPLETED` request event message: `pssBeforeKb`, `pssAfterKb`, `pssDeltaKb`, `privateDirtyBeforeKb`, `privateDirtyAfterKb`, `javaHeapBeforeKb`, `javaHeapAfterKb`, and `javaHeapDeltaKb`. This gives ADB-free evidence for whether PSS grows request by request.
+  - `BeliefTopKCodec.kt` adds optional top-k belief transport without changing the protobuf schema or re-exporting PTEs. It is currently default-disabled in `MainActivity.kt` because simulation suggests belief may not be a useful training signal compared with CE-only. If re-enabled, non-terminal workers encode dense `outputShiftLogP` as `topk_log_probs:k=16` in `TensorData`; the downstream worker decodes it back to dense float32 immediately before `TrainingModule.executeForwardBackward()`.
+  - Verified with `.\gradlew.bat :app:assembleDebug --offline --no-daemon`.
+- Operator-level ExecuTorch exploration is now recorded in `docs/BPFREE_EXECUTORCH_OPERATOR_NOTES.md`.
+  - Do not claim that a redundant cross-stage hidden-gradient op has been found. Current export likely already avoids hidden/input gradient outputs because only LoRA params require grad and `dummy_hidden` does not.
+  - The concrete mismatch points are dense CE/KL/log-prob branches, duplicated full `lm_head`, generic TrainingModule gradient/parameter outputs, Java/native `namedGradients -> SGD.step(map)`, and Android TrainingModule's `FileDataLoader` path.
+  - The exporter now supports `--dump_joint_graph`, exposed through `DUMP_JOINT_GRAPH=1` in `tools/export/export_lora_tinyllama.sh`, to print/save joint graph output specs and operator counts on the Linux export server.
+- Do not tail-resume this train512 as a valid continuous training run. Either restart all workers for a new clean run after reducing memory pressure, or first prove checkpoint restore correctness and resume from a restored state.
+- A lightweight background monitor ran from `debug_runs/three-phone-mainline-20260528-145049/train512-dataplanefix-20260529-1240/monitor_run.ps1`; it stopped automatically after the failure and wrote snapshots to `monitor_snapshots.csv`.
+- Live coordinator export at the 132-success point:
+  - `debug_runs/three-phone-mainline-20260528-145049/coordinator-export-train512-dataplanefix-live132/run-summary.json`
+  - `debug_runs/three-phone-mainline-20260528-145049/coordinator-export-train512-dataplanefix-live132/metrics.csv`
+  - `debug_runs/three-phone-mainline-20260528-145049/coordinator-export-train512-dataplanefix-live132/stage-timings.csv`
+  - generated figures in `debug_runs/three-phone-mainline-20260528-145049/coordinator-export-train512-dataplanefix-live132/figures/`
+- Live worker telemetry snapshot at the same point: `debug_runs/three-phone-mainline-20260528-145049/worker-telemetry-train512-dataplanefix-live129.csv`.
+- Final failure evidence bundle:
+  - `debug_runs/three-phone-mainline-20260528-145049/train512-dataplanefix-20260529-1240/failure-evidence-20260529-1501/`
+- Final coordinator export and figures:
+  - `debug_runs/three-phone-mainline-20260528-145049/coordinator-export-train512-dataplanefix-final193/`
+
+Completed in this run:
+
+- Three-phone smoke: `debug_runs/three-phone-mainline-20260528-145049/smoke/results.csv`, 1/1 success.
+- Three-phone eval128: `debug_runs/three-phone-mainline-20260528-145049/eval128/results.csv`, 128/128 success, avg loss `7.4051939`, token accuracy `0.5362025`.
+- Eval128 timing caveat: Windows wall clock jumped from `2026-05-28 16:27` to `2026-05-29 00:27`, producing one bad `elapsed_ms` outlier. Keep raw data, but compute throughput/latency with that outlier flagged or removed.
+- Data-plane fix probe: `debug_runs/three-phone-mainline-20260528-145049/dataplane-fix-probe-20260529-1236/results.csv`, 3/3 success. This specifically verified the previous second-request broken-pipe crash path, not a generic smoke rerun.
+
+Fixes added before train512:
+
+- Coordinator request metrics and `runPreparedExperiment` now use monotonic `System.nanoTime()` for `elapsed_ms`; epoch timestamps are still kept only for log readability.
+- Android workers now report heartbeat telemetry to coordinator, reducing dependence on ADB/logcat:
+  - battery level/status/current/voltage
+  - charging source
+  - battery temperature
+  - thermal status
+  - app PSS/private dirty
+  - runtime used memory
+  - worker state
+- New coordinator endpoints:
+  - `GET /api/v1/worker-telemetry?limit=1000`
+  - `GET /api/v1/worker-telemetry.csv?limit=100000`
+- Verified telemetry after reinstalling the APK on all three phones. Latest rows include real values such as NX battery `57%`, `powerSource=AC`, temperature about `30-33 C`, and per-worker PSS around `3.3-3.8 GB` during training.
+
+Latest three-phone train512 result and control-plane fix:
+
+- `three-main-train512` is no longer running.
+- Local CSV: `debug_runs/three-phone-mainline-20260528-145049/train512/results.csv`.
+- Result: 512 rows submitted, 84 succeeded, 428 failed.
+- First failure: `three-main-train512-000084`, message `Stage 2 has no live worker.`
+- Root-cause evidence: stage 2 battery was 96-97%, charging over USB, about 33 C, `thermal_status=NONE`, and the Android process did not crash. Logcat shows the same pid completed request `000083` with `TrainingModule.executeForwardBackward()` at `2026-05-29 11:17:41`, then coordinator evicted old node 99 after missing heartbeat lease, and the worker later re-registered. This points to a heartbeat RPC/network stall, not battery, thermal, or native model crash.
+- Fix committed locally on `2026-05-29`:
+  - `GrpcManager.kt` heartbeat and registration RPCs now have deadlines/timeouts so one stuck heartbeat cannot block the heartbeat loop for minutes.
+  - `RunPreparedExperimentMain.kt` now retries transient route failures such as `Stage X has no live worker`, `connection reset`, `deadline exceeded`, and downstream route failures. With `stopOnFailure=false`, default retry is 18 attempts with 10 s delay.
+  - `coordinator/config/pipeline.json` and the three-phone template now use `heartbeatLeaseSeconds=45` instead of 15.
+- Verification/deployment after fix:
+  - `:coordinator:test --offline --no-daemon` passed.
+  - `:app:assembleDebug --offline --no-daemon` passed.
+  - New APK installed on all three phones.
+  - Coordinator restarted in `debug_runs/coordinator-restart-20260529-control-fix-2`.
+  - Current `/api/v1/status`: `liveNodeCount=3`, `offlineStageCount=0`, `leaseDurationSeconds=45`.
+- Coordinator run summaries now aggregate the latest metric attempt for each `requestId`; detailed metrics CSV still keeps all attempts. This avoids transient retry failures polluting the run-level success/failure counts after a later successful retry.
+- To resume the partial training without replaying the first 84 successful rows, use start index 84 and max submitted 428 with a new output directory/request prefix.
+
+Latest data-plane crash fix on 2026-05-29:
+
+- The failed clean train run `three-main-train512-cleanfix` reached request 1, then Lenovo and stage 2 crashed with `java.net.SocketException: Broken pipe` / `Software caused connection abort` in `HttpDataPlane.kt:136`.
+- Raw crash evidence was saved in `debug_runs/three-phone-mainline-20260528-145049/data-plane-crash-20260529-1224/`.
+- Root cause: `HttpForwardChunkServer.handleClient()` wrote an error response and then unconditionally flushed the socket in `finally`; if the upstream client disconnected while a large shard response was being written, the flush exception escaped the coroutine and became an AndroidRuntime fatal exception.
+- Fix: `HttpDataPlane.kt` now catches per-client data-plane exceptions, treats socket disconnects as request-level warnings, and uses quiet error-response/flush helpers. The accept loop also logs and retries instead of killing the data-plane server.
+- Runner fix: `RunPreparedExperimentMain.kt` now applies a default `SubmitRequest` RPC deadline of `420000 ms`, configurable as optional arg 13, so a stuck request becomes a retryable deadline failure instead of hanging forever.
+- Verification:
+  - `:coordinator:test --offline --no-daemon` passed.
+  - `:app:assembleDebug --offline --no-daemon` passed.
+  - APK installed on all three phones.
+  - `dataplane-fix-probe` completed 3/3 after relaunch.
+  - The active `three-main-train512-dataplanefix` run reached 129/129 with no recorded failures, crossing the old `three-main-train512` failure point at request `000084` and completing a clean 128-request training window.
 
 Current valid system evidence:
 
@@ -29,7 +465,7 @@ Scheduler state for three phones:
 - Coordinator scheduling was extended on 2026-05-27. The scheduler now supports dynamic unlisted workers, configured-device preference, safe relocation of a temporary worker when the preferred phone later registers, stage-level minimum memory/compute requirements, a manual reconcile endpoint, and admin-visible scheduler events.
 - New admin endpoint: `POST /api/v1/scheduler/reconcile`. Use it after editing config, after a worker restart sequence, or before a long run to evict expired leases and move live preferred devices back to their configured stages when a safe relocation exists.
 - `/api/v1/status` now includes scheduler config flags, per-node `assignmentReason`, per-stage scheduling requirements, and recent `schedulerEvents`.
-- Active `coordinator/config/pipeline.json` is still the two-stage LoRA pipeline. Do not switch it to three stages until `model/tinyllama_lora_chunk_2.pte` exists and the third phone IP/device id is known.
+- Active `coordinator/config/pipeline.json` is the three-stage LoRA pipeline with `tinyllama_lora_chunk_0/1/2` on NX, Lenovo, and `23043RP34C`.
 - Three-phone template added at `coordinator/config/pipeline_three_phone.template.json`. Stage 2 deliberately has blank `deviceId`; with `allowUnlistedDevices=true`, the first extra live phone can fill it.
 - Server-side export command for a consistent 3-stage LoRA pipeline:
 
@@ -38,6 +474,67 @@ NUM_CHUNKS=3 CHUNK_IDX=-1 OUTPUT_DIR=model bash tools/export/export_lora_tinylla
 ```
 
 - Regression check passed after the scheduler change:
+
+```powershell
+C:\Users\wentaodai\.gradle\wrapper\dists\gradle-8.7-bin\bhs2wmbdwecv87pi65oeuq5iu\gradle-8.7\bin\gradle.bat :coordinator:test --offline --no-daemon
+```
+
+Three-phone validation update on 2026-05-28:
+
+- Three fresh LoRA full-split artifacts are present in `model/`:
+  - `tinyllama_lora_chunk_0.pte`: 1496232320 bytes
+  - `tinyllama_lora_chunk_1.pte`: 1496236800 bytes
+  - `tinyllama_lora_chunk_2.pte`: 1672526848 bytes
+- `coordinator/config/pipeline.json` was switched to a 3-stage pipeline:
+  - stage 0: `NX809J`, `192.168.137.211:26052`
+  - stage 1: `Lenovo_L71091`, `192.168.137.124:26052`
+  - stage 2: `23043RP34C`, `192.168.137.77:26052`
+- The three corresponding PTE files were pre-pushed into each Android app's `files/shards/` cache to avoid large coordinator HTTP downloads during the run.
+- Three-stage coordinator status reached `liveNodeCount=3`, `offlineStageCount=0`, and all stages had `assignmentReason=preferred-device-match`.
+- Completed three-phone eval-only smoke:
+  - CSV: `debug_runs/three-phone-20260528/smoke/results.csv`
+  - request `three3-smoke-000001`
+  - terminal stage 2, processed chunk 2
+  - success=true, elapsed `44233 ms`, local loss `8.2441435`, token accuracy `0.333333` over 3 valid labels
+- A three-phone eval128 run was started but is partial because the user intentionally interrupted after one phone was borrowed for another experiment:
+  - CSV: `debug_runs/three-phone-20260528/eval128/results.csv`
+  - attempted 10 rows, 9 success, first failure `three3-eval128-000009`
+  - failure message: `Coordinator dispatch to stage 0 failed: Connection reset`
+  - successful subset average elapsed `31586.67 ms`, average loss `7.322979`, token accuracy `0.468468` over 222 valid labels
+- Do not report this as completed eval128. It is safe to report as a full-model three-phone smoke plus partial eval evidence.
+- A report draft was created at `docs/DEMO_REPORT_DRAFT.md`. Continue polishing the report from there instead of restarting low-level smoke debugging.
+- Report figures were generated on 2026-05-28 and updated on 2026-05-29 into `docs/figures/` with:
+
+```powershell
+python tools\report\generate_demo_figures.py
+```
+
+- The figure script reads the existing formal/fault/three-phone CSVs and perf monitor samples, then emits architecture, BP-free/BP pipeline mind maps, loss, latency, token accuracy, fault-tolerance, partial three-phone, memory, temperature, and coarse current plots. Use these for presentation visuals before starting another phone run.
+- For the report design section, use `docs/figures/bpfree_pipeline_mindmap.png` to explain this prototype and `docs/figures/bp_pipeline_mindmap.png` as the conventional 1F1B/BP pipeline contrast. The intended claim is: both can pipeline stages, but conventional BP sends backward gradients across workers while the current BP-free mobile path only sends forward hidden/belief information and lets every phone run local backward/optimizer.
+- The figure script also accepts coordinator exports:
+
+```powershell
+python tools\report\generate_demo_figures.py --coordinator_run_dir debug_runs\<run>\coordinator-export
+```
+
+  Put `metrics.csv` and `stage-timings.csv` in that export directory. When present, the script also emits `coordinator_run_metrics.png`, `stage_local_timing_breakdown.png`, and `stage_forward_timing_breakdown.png`.
+- Convenience export command for a live coordinator:
+
+```powershell
+.\tools\report\export_coordinator_run.ps1 -RunId <runId> -OutDir debug_runs\<run>\coordinator-export -GenerateFigures
+```
+
+- Coordinator experiment-record persistence was extended after the figures work:
+  - New SQLite tables: `runs`, `request_metrics`, and `scheduler_events`.
+  - Every coordinator-submitted request now writes a structured request metric row, grouped by `runId` inferred from request ids like `train-000123 -> train`.
+  - Admin endpoints:
+    - `GET /api/v1/runs`
+    - `GET /api/v1/runs/{runId}?metrics=1000`
+    - `GET /api/v1/runs/{runId}/metrics.csv?limit=100000`
+    - `GET /api/v1/runs/{runId}/stage-timings.csv?limit=100000`
+  - Scheduler events are now persisted and restored after coordinator restart, not only kept in memory.
+  - Worker `RequestEvent` messages are parsed into `stage_timing_metrics` when they contain timing keys such as `localMs`, `executeMs`, `optimizerStepMs`, `forwardMs`, or `totalStageMs`. This enables per-stage timing breakdown plots from coordinator data.
+  - Regression command passed:
 
 ```powershell
 C:\Users\wentaodai\.gradle\wrapper\dists\gradle-8.7-bin\bhs2wmbdwecv87pi65oeuq5iu\gradle-8.7\bin\gradle.bat :coordinator:test --offline --no-daemon
@@ -841,6 +1338,56 @@ Decode stored request payload shapes:
 ```powershell
 python tools\android\decode_request_payload.py tinyllama-mainline-20260524-2349
 ```
+
+## Easy Real-Dataset Training-Signal Run
+
+Use this when you want a cleaner loss curve than Dolly without falling back to a fully synthetic toy dataset.
+
+Recommended first choice: `rotten_tomatoes`.
+
+- Real movie-review sentiment data.
+- About 8.53k train rows, so the full dataset is smaller than Dolly.
+- Binary labels, so the response entropy is much lower than Dolly/SFT.
+- The formatted response is still text: `The movie review expresses a positive/negative sentiment.`
+
+```bash
+python tools/data/prepare_lora_sft_requests.py \
+  --model_name tinyllama \
+  --dataset rotten_tomatoes \
+  --seq_len 64 \
+  --limit 512 \
+  --attention_mask causal \
+  --mask_prompt \
+  --min_valid_labels 4 \
+  --request_prefix rt-lora-train \
+  --output_dir data/sft_requests/tinyllama_rotten_tomatoes64_train512
+
+# Then run the same prepared-experiment flow against the Rotten Tomatoes manifest.
+```
+
+Example train command:
+
+```powershell
+C:\Users\wentaodai\.gradle\wrapper\dists\gradle-8.7-bin\bhs2wmbdwecv87pi65oeuq5iu\gradle-8.7\bin\gradle.bat :coordinator:runPreparedExperiment --offline --no-daemon --args="127.0.0.1 50051 data/sft_requests/tinyllama_rotten_tomatoes64_train512/requests.jsonl 0 512 debug_runs/rotten-tomatoes-easy/train/results.csv rt-train 1 0 false true"
+```
+
+Second choice: `sst2`.
+
+- Same binary sentiment framing, but the full train split is larger than Dolly.
+- Still useful if you want a well-known benchmark-style comparison.
+
+Third choice: `ag_news`.
+
+- Real news-topic classification.
+- Four labels: World, Sports, Business, Science and Technology.
+- Slightly harder than SST-2, but still much more controlled than Dolly.
+
+Optional QA-style choice: `sciq`.
+
+- Real science multiple-choice questions.
+- Useful if you want a task that feels closer to QA, but it may be noisier than SST-2/AG News.
+
+The old `toy` preset still exists only as an internal overfit sanity check. Do not use it as the main report dataset.
 
 ## Debugging Discipline
 

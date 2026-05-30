@@ -1,4 +1,5 @@
 import argparse
+from collections import Counter
 import os
 from pathlib import Path
 from typing import Iterable
@@ -310,6 +311,74 @@ def rewrite_empty_permuted(joint_graph) -> int:
     return rewritten
 
 
+def dump_joint_graph_diagnostics(
+    joint_graph,
+    *,
+    output_path: Path | None = None,
+) -> None:
+    graph_signature = joint_graph.graph_signature
+    output_specs = list(getattr(graph_signature, "output_specs", []))
+
+    lines: list[str] = []
+    lines.append("== Joint Graph Signature ==")
+    lines.append(str(graph_signature))
+    lines.append("")
+    lines.append("== Output Specs ==")
+    gradient_targets: list[str] = []
+    user_input_gradient_targets: list[str] = []
+    for index, spec in enumerate(output_specs):
+        kind = getattr(spec.kind, "name", str(spec.kind))
+        target = getattr(spec, "target", None)
+        arg = getattr(spec, "arg", None)
+        lines.append(f"{index:04d}: kind={kind} target={target} arg={arg}")
+        if kind == "GRADIENT_TO_PARAMETER":
+            gradient_targets.append(str(target))
+        elif "GRADIENT" in kind:
+            user_input_gradient_targets.append(str(target))
+
+    lines.append("")
+    lines.append("== Gradient Summary ==")
+    lines.append(f"parameter_gradient_count={len(gradient_targets)}")
+    for target in gradient_targets:
+        lines.append(f"  parameter_grad={target}")
+    lines.append(f"non_parameter_gradient_count={len(user_input_gradient_targets)}")
+    for target in user_input_gradient_targets:
+        lines.append(f"  non_parameter_grad={target}")
+
+    op_counter = Counter(
+        str(node.target)
+        for node in joint_graph.graph.nodes
+        if node.op == "call_function"
+    )
+    lines.append("")
+    lines.append("== Operator Counts ==")
+    for target, count in sorted(op_counter.items()):
+        lines.append(f"{count:04d} {target}")
+
+    interesting_terms = (
+        "log_softmax",
+        "_softmax",
+        "softmax",
+        "cross_entropy",
+        "nll_loss",
+        "kl_div",
+        "mm",
+        "matmul",
+        "linear",
+    )
+    lines.append("")
+    lines.append("== Interesting Operator Counts ==")
+    for target, count in sorted(op_counter.items()):
+        if any(term in target for term in interesting_terms):
+            lines.append(f"{count:04d} {target}")
+
+    text = "\n".join(lines)
+    print(text)
+    if output_path is not None:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(text + "\n", encoding="utf-8")
+
+
 def export_chunk(
     *,
     model_name: str,
@@ -328,6 +397,7 @@ def export_chunk(
     lora_alpha: float,
     lora_targets: set[str],
     lora_init_std: float,
+    dump_joint_graph: bool,
 ) -> Path:
     resolved_model_name = resolve_model_name(model_name)
     print(f"[1/5] Loading model: {resolved_model_name}")
@@ -388,6 +458,12 @@ def export_chunk(
     with sdpa_kernel([SDPBackend.MATH]):
         ep = export(chunk_module, example_args, strict=False)
         joint_ep = _export_forward_backward(ep)
+        if dump_joint_graph:
+            diagnostic_path = (
+                output_dir
+                / f"{artifact_prefix}_chunk_{target_chunk}{artifact_suffix}.joint_graph.txt"
+            )
+            dump_joint_graph_diagnostics(joint_ep, output_path=diagnostic_path)
         rewritten_empty_permuted = rewrite_empty_permuted(joint_ep)
         if rewritten_empty_permuted:
             print(
@@ -532,6 +608,14 @@ def main() -> None:
         default=0.01,
         help="Stddev for LoRA A initialization. LoRA B starts at zero.",
     )
+    parser.add_argument(
+        "--dump_joint_graph",
+        action="store_true",
+        help=(
+            "Print and save joint forward/backward graph diagnostics before lowering. "
+            "Use this to verify gradient output targets and BP-free boundary behavior."
+        ),
+    )
     args = parser.parse_args()
 
     if args.num_chunks <= 0:
@@ -570,6 +654,7 @@ def main() -> None:
             lora_alpha=args.lora_alpha,
             lora_targets=lora_targets,
             lora_init_std=args.lora_init_std,
+            dump_joint_graph=args.dump_joint_graph,
         )
 
 

@@ -1,4 +1,5 @@
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -21,7 +22,12 @@ MODEL_PRESETS = {
 DATASET_PRESETS = {
     "dolly": ("databricks/databricks-dolly-15k", "train"),
     "alpaca": ("tatsu-lab/alpaca", "train"),
+    "rotten_tomatoes": ("cornell-movie-review-data/rotten_tomatoes", "train"),
+    "sst2": ("glue", "sst2/train"),
+    "ag_news": ("fancyzhx/ag_news", "train"),
+    "sciq": ("allenai/sciq", "train"),
     "gsm8k": ("openai/gsm8k", "main/train"),
+    "toy": ("toy", "train"),
 }
 
 
@@ -45,6 +51,74 @@ def split_config(raw_split: str) -> tuple[str | None, str]:
 
 
 def format_example(example: dict[str, Any], dataset_name: str) -> tuple[str, str]:
+    if dataset_name == "toy":
+        instruction = str(example.get("instruction", "")).strip()
+        response = str(example.get("response", "")).strip()
+        prompt = f"Instruction:\n{instruction}\n\nResponse:\n"
+        return prompt, response
+
+    if dataset_name == "glue" and "sentence" in example and "label" in example:
+        sentence = str(example.get("sentence", "")).strip()
+        label = int(example.get("label", 0))
+        sentiment = "positive" if label == 1 else "negative"
+        prompt = (
+            "Movie review:\n"
+            f"{sentence}\n\n"
+            "Classify the sentiment as positive or negative.\n\n"
+            "Answer:\n"
+        )
+        response = f"The movie review expresses a {sentiment} sentiment."
+        return prompt, response
+
+    if "rotten_tomatoes" in dataset_name:
+        text = str(example.get("text", "")).strip()
+        label = int(example.get("label", 0))
+        sentiment = "positive" if label == 1 else "negative"
+        prompt = (
+            "Movie review:\n"
+            f"{text}\n\n"
+            "Classify the sentiment as positive or negative.\n\n"
+            "Answer:\n"
+        )
+        response = f"The movie review expresses a {sentiment} sentiment."
+        return prompt, response
+
+    if "ag_news" in dataset_name:
+        text = str(example.get("text", "")).strip()
+        label = int(example.get("label", 0))
+        label_names = {
+            0: "World",
+            1: "Sports",
+            2: "Business",
+            3: "Science and Technology",
+        }
+        topic = label_names.get(label, str(label))
+        prompt = (
+            "News article:\n"
+            f"{text}\n\n"
+            "Classify the news topic as World, Sports, Business, or Science and Technology.\n\n"
+            "Answer:\n"
+        )
+        response = f"The topic is {topic} news."
+        return prompt, response
+
+    if "sciq" in dataset_name:
+        question = str(example.get("question", "")).strip()
+        correct_answer = str(example.get("correct_answer", "")).strip()
+        distractors = [
+            str(example.get("distractor1", "")).strip(),
+            str(example.get("distractor2", "")).strip(),
+            str(example.get("distractor3", "")).strip(),
+        ]
+        options = [correct_answer, *distractors]
+        digest = hashlib.sha256(question.encode("utf-8", errors="ignore")).digest()
+        rotation = digest[0] % len(options)
+        options = options[rotation:] + options[:rotation]
+        option_lines = "\n".join(f"{chr(65 + idx)}. {option}" for idx, option in enumerate(options))
+        prompt = f"Science question:\n{question}\n\nOptions:\n{option_lines}\n\nAnswer:\n"
+        response = f"The correct answer is {correct_answer}."
+        return prompt, response
+
     if "databricks-dolly-15k" in dataset_name:
         instruction = str(example.get("instruction", "")).strip()
         context = str(example.get("context", "")).strip()
@@ -113,6 +187,23 @@ def count_valid_labels(labels: torch.Tensor) -> int:
     return int((labels != -100).sum().item())
 
 
+def build_toy_dataset(total_count: int) -> list[dict[str, str]]:
+    toy_responses = [
+        "The correct answer is always option A for this toy run.",
+        "The correct answer is always option A for this toy run.",
+        "The correct answer is always option A for this toy run.",
+        "The correct answer is always option A for this toy run.",
+    ]
+    dataset: list[dict[str, str]] = []
+    for index in range(total_count):
+        response = toy_responses[index % len(toy_responses)]
+        instruction = (
+            f"Toy overfit sample {index:04d}: read the prompt and return the same fixed answer."
+        )
+        dataset.append({"instruction": instruction, "response": response})
+    return dataset
+
+
 def build_attention_mask(seq_len: int, mode: str) -> torch.Tensor:
     if mode == "zero":
         return torch.zeros((1, 1, seq_len, seq_len), dtype=torch.float32)
@@ -144,7 +235,14 @@ def main() -> None:
         )
     )
     parser.add_argument("--model_name", default="tinyllama")
-    parser.add_argument("--dataset", default="dolly", help="Preset: dolly, alpaca, gsm8k, or a HF dataset name.")
+    parser.add_argument(
+        "--dataset",
+        default="dolly",
+        help=(
+            "Preset: dolly, alpaca, rotten_tomatoes, sst2, ag_news, sciq, "
+            "gsm8k, toy, or a HF dataset name."
+        ),
+    )
     parser.add_argument("--split", default="", help="Override split. For configs use config/split, e.g. main/train.")
     parser.add_argument("--seq_len", type=int, default=64)
     parser.add_argument("--limit", type=int, default=32)
@@ -180,7 +278,9 @@ def main() -> None:
     embedding = model.get_input_embeddings()
 
     print(f"Loading dataset: {dataset_name} config={dataset_config} split={dataset_split}")
-    if dataset_config:
+    if dataset_name == "toy":
+        dataset = build_toy_dataset(args.offset + args.limit)
+    elif dataset_config:
         dataset = load_dataset(dataset_name, dataset_config, split=dataset_split)
     else:
         dataset = load_dataset(dataset_name, split=dataset_split)
