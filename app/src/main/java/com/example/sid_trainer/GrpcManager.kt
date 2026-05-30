@@ -1,5 +1,6 @@
 package com.example.sid_trainer
 
+import android.content.Context
 import android.util.Log
 import io.grpc.ManagedChannel
 import io.grpc.ManagedChannelBuilder
@@ -11,6 +12,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import sid.CoordinatingServiceGrpcKt
 import sid.Sid
 import java.util.concurrent.TimeUnit
@@ -62,6 +64,7 @@ data class WorkerRegistration(
 }
 
 class GrpcManager(
+    private val appContext: Context,
     private val coordinatorHost: String,
     private val coordinatorPort: Int,
     private val requestedLocalServerPort: Int,
@@ -70,6 +73,10 @@ class GrpcManager(
     private val onCoordinatorCommand: (String) -> Unit = {}
 ) {
     private val maxMessageSizeBytes = 50 * 1024 * 1024
+    private val heartbeatIntervalMs = 5_000L
+    private val heartbeatRpcDeadlineMs = 3_000L
+    private val heartbeatCoroutineTimeoutMs = 4_000L
+    private val registrationRpcDeadlineMs = 5_000L
     private val scope = CoroutineScope(Dispatchers.IO)
     private val routingLock = Any()
 
@@ -115,7 +122,9 @@ class GrpcManager(
                 .setGrpcPort(actualLocalServerPort)
                 .build()
 
-            val response = requireNotNull(coordinatorStub).registerNode(request)
+            val response = requireNotNull(coordinatorStub)
+                .withDeadlineAfter(registrationRpcDeadlineMs, TimeUnit.MILLISECONDS)
+                .registerNode(request)
             if (!response.success) {
                 Log.e("GrpcManager", "Registration rejected: ${response.message}")
                 return@withContext null
@@ -240,26 +249,40 @@ class GrpcManager(
     private fun startHeartbeat(deviceId: String) {
         heartbeatJob?.cancel()
         heartbeatJob = scope.launch {
+            var consecutiveFailures = 0
             while (isActive) {
                 try {
                     val currentNodeId = workerRegistration?.nodeId
                     if (currentNodeId == null) {
-                        delay(5_000)
+                        delay(heartbeatIntervalMs)
                         continue
                     }
-                    val response = requireNotNull(coordinatorStub).heartbeat(
+                    val request = WorkerTelemetryReader.read(appContext).applyTo(
                         Sid.HeartbeatRequest.newBuilder()
                             .setDeviceId(deviceId)
                             .setNodeId(currentNodeId)
-                            .setBatteryLevel(100.0f)
-                            .setIsActive(workerActiveForScheduling)
-                            .build()
-                    )
+                            .setIsActive(workerActiveForScheduling),
+                        workerState = if (workerActiveForScheduling) "ACTIVE" else "PAUSED"
+                    ).build()
+                    val startedAtNs = System.nanoTime()
+                    val response = withTimeout(heartbeatCoroutineTimeoutMs) {
+                        requireNotNull(coordinatorStub)
+                            .withDeadlineAfter(heartbeatRpcDeadlineMs, TimeUnit.MILLISECONDS)
+                            .heartbeat(request)
+                    }
+                    val heartbeatMs = ((System.nanoTime() - startedAtNs) / 1_000_000L).coerceAtLeast(0L)
+                    if (consecutiveFailures > 0) {
+                        Log.i(
+                            "GrpcManager",
+                            "Heartbeat recovered after $consecutiveFailures failure(s); latencyMs=$heartbeatMs"
+                        )
+                    }
+                    consecutiveFailures = 0
                     if (!response.ack && response.command.equals("REREGISTER", ignoreCase = true)) {
                         Log.w("GrpcManager", "Coordinator requested re-registration for deviceId=$deviceId")
                         performRegistration(deviceId, startHeartbeat = false)
                         onCoordinatorCommand("REREGISTER")
-                        delay(5_000)
+                        delay(heartbeatIntervalMs)
                         continue
                     }
                     if (response.ack && workerRegistration != null) {
@@ -281,9 +304,14 @@ class GrpcManager(
                         onCoordinatorCommand(response.command)
                     }
                 } catch (t: Throwable) {
-                    Log.e("GrpcManager", "Heartbeat failed", t)
+                    consecutiveFailures++
+                    Log.w(
+                        "GrpcManager",
+                        "Heartbeat failed count=$consecutiveFailures; will retry in ${heartbeatIntervalMs}ms",
+                        t
+                    )
                 }
-                delay(5_000)
+                delay(heartbeatIntervalMs)
             }
         }
     }

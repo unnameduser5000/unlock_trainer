@@ -2,6 +2,7 @@ package com.example.sid_coordinator
 
 import org.slf4j.LoggerFactory
 import sid.Sid
+import java.security.MessageDigest
 import java.time.Duration
 import java.time.Instant
 import java.util.ArrayDeque
@@ -75,6 +76,10 @@ class CoordinatorState(
                 "Restored {} node records from SQLite. They will remain offline until heartbeat or re-registration.",
                 snapshot.nodes.size
             )
+        }
+        persistence.listRecentSchedulerEvents(MAX_SCHEDULER_EVENTS).asReversed().forEach { event ->
+            schedulerEvents.addFirst(event)
+            nextSchedulerEventId = maxOf(nextSchedulerEventId, event.eventId + 1)
         }
     }
 
@@ -577,12 +582,34 @@ class CoordinatorState(
         }
 
         val previousActive = node.isActive
-        node.lastHeartbeatAt = Instant.now()
+        val observedAt = Instant.now()
+        node.lastHeartbeatAt = observedAt
         node.isActive = request.isActive
         if (previousActive != node.isActive) {
             routingEpoch.incrementAndGet()
         }
         persistNode(node)
+        persistence.appendWorkerTelemetry(
+            PersistedWorkerTelemetry(
+                observedEpochMs = observedAt.toEpochMilli(),
+                deviceId = request.deviceId,
+                nodeId = request.nodeId,
+                stageId = node.stageId,
+                isActive = request.isActive,
+                batteryLevel = request.batteryLevel,
+                isCharging = request.isCharging,
+                powerSource = request.powerSource,
+                batteryStatus = request.batteryStatus,
+                batteryTempC = request.batteryTempC.takeIf { it != 0f },
+                batteryVoltageMv = request.batteryVoltageMv.takeIf { it != 0 },
+                batteryCurrentUa = request.batteryCurrentUa.takeIf { it != 0L },
+                thermalStatus = request.thermalStatus,
+                appPssKb = request.appPssKb.takeIf { it != 0L },
+                appPrivateDirtyKb = request.appPrivateDirtyKb.takeIf { it != 0L },
+                runtimeUsedMemoryKb = request.runtimeUsedMemoryKb.takeIf { it != 0L },
+                workerState = request.workerState
+            )
+        )
 
         val route = resolveRoute(node.stageId)
         val command = when {
@@ -877,6 +904,12 @@ class CoordinatorState(
                 .build()
         }
 
+        val observedEpochMs = Instant.now().toEpochMilli()
+        val message = if (event.eventEpochMs > 0L) {
+            "${event.message} workerEventEpochMs=${event.eventEpochMs}"
+        } else {
+            event.message
+        }
         persistence.appendRequestEvent(
             PersistedRequestEvent(
                 eventId = 0L,
@@ -887,8 +920,8 @@ class CoordinatorState(
                 nodeId = event.nodeId,
                 eventType = event.eventType.name,
                 success = event.success,
-                message = event.message,
-                eventEpochMs = event.eventEpochMs,
+                message = message,
+                eventEpochMs = observedEpochMs,
                 terminal = event.terminal
             )
         )
@@ -938,6 +971,208 @@ class CoordinatorState(
                 )
             }
         )
+    }
+
+    fun listRecentRuns(limit: Int): List<AdminRunSummarySnapshot> {
+        return persistence.listRecentRuns(limit.coerceIn(1, 500))
+            .map { summary ->
+                AdminRunSummarySnapshot(
+                    runId = summary.runId,
+                    pipelineName = summary.pipelineName,
+                    modelShards = summary.modelShards,
+                    configHash = summary.configHash,
+                    firstSeenEpochMs = summary.firstSeenEpochMs,
+                    lastUpdatedEpochMs = summary.lastUpdatedEpochMs,
+                    requestRows = summary.requestRows,
+                    successRows = summary.successRows,
+                    failedRows = summary.failedRows,
+                    evalOnlyRows = summary.evalOnlyRows,
+                    trainRows = summary.trainRows,
+                    avgElapsedMs = summary.avgElapsedMs,
+                    avgLoss = summary.avgLoss,
+                    tokenCorrect = summary.tokenCorrect,
+                    tokenCount = summary.tokenCount,
+                    tokenAccuracy = summary.tokenAccuracy
+                )
+            }
+    }
+
+    fun loadRunDetail(runId: String, metricLimit: Int): AdminRunDetailSnapshot {
+        return persistence.loadRunDetail(runId, metricLimit.coerceIn(1, 10_000))
+    }
+
+    fun exportRunMetricsCsv(runId: String, metricLimit: Int): String {
+        val header = listOf(
+            "metric_id",
+            "run_id",
+            "request_id",
+            "request_index",
+            "attempt",
+            "batch_id",
+            "eval_only",
+            "submitted_epoch_ms",
+            "completed_epoch_ms",
+            "elapsed_ms",
+            "success",
+            "terminal",
+            "processed_stage_id",
+            "processed_chunk_idx",
+            "output_hidden_bytes",
+            "output_shift_log_p_bytes",
+            "local_loss",
+            "token_correct",
+            "token_count",
+            "token_accuracy",
+            "message"
+        )
+        val lines = mutableListOf(header.joinToString(","))
+        persistence.listRunMetrics(runId, metricLimit.coerceIn(1, 100_000)).forEach { metric ->
+            lines += listOf(
+                metric.metricId.toString(),
+                metric.runId,
+                metric.requestId,
+                metric.requestIndex?.toString().orEmpty(),
+                metric.attempt.toString(),
+                metric.batchId.toString(),
+                metric.evalOnly.toString(),
+                metric.submittedEpochMs.toString(),
+                metric.completedEpochMs.toString(),
+                metric.elapsedMs.toString(),
+                metric.success.toString(),
+                metric.terminal.toString(),
+                metric.processedStageId.toString(),
+                metric.processedChunkIdx.toString(),
+                metric.outputHiddenBytes.toString(),
+                metric.outputShiftLogPBytes.toString(),
+                metric.localLoss?.toString().orEmpty(),
+                metric.tokenCorrect.toString(),
+                metric.tokenCount.toString(),
+                (if (metric.tokenCount == 0) 0.0 else metric.tokenCorrect.toDouble() / metric.tokenCount.toDouble()).toString(),
+                metric.message
+            ).joinToString(",") { it.csvEscape() }
+        }
+        return lines.joinToString("\n") + "\n"
+    }
+
+    fun exportRunStageTimingsCsv(runId: String, metricLimit: Int): String {
+        val header = listOf(
+            "stage_metric_id",
+            "request_event_id",
+            "run_id",
+            "request_id",
+            "batch_id",
+            "chunk_idx",
+            "stage_id",
+            "node_id",
+            "event_type",
+            "event_epoch_ms",
+            "runtime",
+            "method",
+            "input_count",
+            "eval_only",
+            "optimizer_step_applied",
+            "local_loss",
+            "local_ms",
+            "input_build_ms",
+            "execute_ms",
+            "gradients_ms",
+            "optimizer_create_ms",
+            "optimizer_step_ms",
+            "output_convert_ms",
+            "total_measured_ms",
+            "forward_ms",
+            "total_stage_ms",
+            "output_bytes",
+            "message"
+        )
+        val lines = mutableListOf(header.joinToString(","))
+        persistence.listStageTimingMetrics(runId, metricLimit.coerceIn(1, 100_000)).forEach { metric ->
+            lines += listOf(
+                metric.stageMetricId.toString(),
+                metric.requestEventId.toString(),
+                metric.runId,
+                metric.requestId,
+                metric.batchId.toString(),
+                metric.chunkIdx.toString(),
+                metric.stageId.toString(),
+                metric.nodeId.toString(),
+                metric.eventType,
+                metric.eventEpochMs.toString(),
+                metric.runtime.orEmpty(),
+                metric.method.orEmpty(),
+                metric.inputCount?.toString().orEmpty(),
+                metric.evalOnly?.toString().orEmpty(),
+                metric.optimizerStepApplied?.toString().orEmpty(),
+                metric.localLoss?.toString().orEmpty(),
+                metric.localMs?.toString().orEmpty(),
+                metric.inputBuildMs?.toString().orEmpty(),
+                metric.executeMs?.toString().orEmpty(),
+                metric.gradientsMs?.toString().orEmpty(),
+                metric.optimizerCreateMs?.toString().orEmpty(),
+                metric.optimizerStepMs?.toString().orEmpty(),
+                metric.outputConvertMs?.toString().orEmpty(),
+                metric.totalMeasuredMs?.toString().orEmpty(),
+                metric.forwardMs?.toString().orEmpty(),
+                metric.totalStageMs?.toString().orEmpty(),
+                metric.outputBytes?.toString().orEmpty(),
+                metric.message
+            ).joinToString(",") { it.csvEscape() }
+        }
+        return lines.joinToString("\n") + "\n"
+    }
+
+    fun listRecentWorkerTelemetry(limit: Int, deviceId: String?): List<AdminWorkerTelemetrySnapshot> {
+        return persistence.listRecentWorkerTelemetry(limit.coerceIn(1, 100_000), deviceId)
+            .map { it.toAdminSnapshot() }
+    }
+
+    fun exportWorkerTelemetryCsv(limit: Int, deviceId: String?): String {
+        val header = listOf(
+            "telemetry_id",
+            "observed_epoch_ms",
+            "device_id",
+            "node_id",
+            "stage_id",
+            "is_active",
+            "battery_level",
+            "is_charging",
+            "power_source",
+            "battery_status",
+            "battery_temp_c",
+            "battery_voltage_mv",
+            "battery_current_ua",
+            "thermal_status",
+            "app_pss_kb",
+            "app_private_dirty_kb",
+            "runtime_used_memory_kb",
+            "worker_state"
+        )
+        val lines = mutableListOf(header.joinToString(","))
+        persistence.listRecentWorkerTelemetry(limit.coerceIn(1, 100_000), deviceId)
+            .asReversed()
+            .forEach { telemetry ->
+                lines += listOf(
+                    telemetry.telemetryId.toString(),
+                    telemetry.observedEpochMs.toString(),
+                    telemetry.deviceId,
+                    telemetry.nodeId.toString(),
+                    telemetry.stageId.toString(),
+                    telemetry.isActive.toString(),
+                    telemetry.batteryLevel.toString(),
+                    telemetry.isCharging.toString(),
+                    telemetry.powerSource,
+                    telemetry.batteryStatus.toString(),
+                    telemetry.batteryTempC?.toString().orEmpty(),
+                    telemetry.batteryVoltageMv?.toString().orEmpty(),
+                    telemetry.batteryCurrentUa?.toString().orEmpty(),
+                    telemetry.thermalStatus,
+                    telemetry.appPssKb?.toString().orEmpty(),
+                    telemetry.appPrivateDirtyKb?.toString().orEmpty(),
+                    telemetry.runtimeUsedMemoryKb?.toString().orEmpty(),
+                    telemetry.workerState
+                ).joinToString(",") { it.csvEscape() }
+            }
+        return lines.joinToString("\n") + "\n"
     }
 
     fun purgeRequest(requestId: String): AdminMutationResult = lock.withLock {
@@ -1073,6 +1308,19 @@ class CoordinatorState(
                 .setTerminal(terminal)
                 .build()
         )
+    }
+
+    fun recordRequestMetric(metric: PersistedRequestMetric) {
+        lock.withLock {
+            persistence.appendRequestMetric(
+                metric = metric,
+                pipelineName = config.pipelineName,
+                modelShards = config.stages.joinToString("|") { stage ->
+                    "${stage.stageId}:${stage.modelShardId}:${stage.modelSha256.ifBlank { "sha256-unset" }}"
+                },
+                configHash = configHash()
+            )
+        }
     }
 
     private fun resolveRoute(stageId: Int): RouteSnapshot {
@@ -1223,9 +1471,9 @@ class CoordinatorState(
         reason: String,
         message: String
     ) {
-        schedulerEvents.addFirst(
+        val persisted = persistence.appendSchedulerEvent(
             AdminSchedulerEventSnapshot(
-                eventId = nextSchedulerEventId++,
+                eventId = 0L,
                 eventEpochMs = Instant.now().toEpochMilli(),
                 action = action,
                 stageId = stageId,
@@ -1235,9 +1483,67 @@ class CoordinatorState(
                 message = message
             )
         )
+        nextSchedulerEventId = maxOf(nextSchedulerEventId, persisted.eventId + 1)
+        schedulerEvents.addFirst(persisted)
         while (schedulerEvents.size > MAX_SCHEDULER_EVENTS) {
             schedulerEvents.removeLast()
         }
+    }
+
+    private fun configHash(): String {
+        val material = buildString {
+            append(config.pipelineName)
+            append('|')
+            append(config.scheduler)
+            append('|')
+            config.stages.forEach { stage ->
+                append(stage.stageId)
+                append(':')
+                append(stage.deviceId)
+                append(':')
+                append(stage.modelShardId)
+                append(':')
+                append(stage.modelSha256)
+                append(':')
+                append(stage.modelBytes)
+                append(';')
+            }
+        }
+        val digest = MessageDigest.getInstance("SHA-256")
+            .digest(material.toByteArray(Charsets.UTF_8))
+        return digest.joinToString("") { "%02x".format(it) }
+    }
+
+    private fun String.csvEscape(): String {
+        val escaped = replace("\"", "\"\"")
+        return if (escaped.any { it == ',' || it == '"' || it == '\n' || it == '\r' }) {
+            "\"$escaped\""
+        } else {
+            escaped
+        }
+    }
+
+    private fun PersistedWorkerTelemetry.toAdminSnapshot(): AdminWorkerTelemetrySnapshot {
+        return AdminWorkerTelemetrySnapshot(
+            telemetryId = telemetryId,
+            observedEpochMs = observedEpochMs,
+            deviceId = deviceId,
+            nodeId = nodeId,
+            stageId = stageId,
+            isActive = isActive,
+            batteryLevel = batteryLevel,
+            isCharging = isCharging,
+            powerSource = powerSource,
+            batteryStatus = batteryStatus,
+            batteryTempC = batteryTempC,
+            batteryVoltageMv = batteryVoltageMv,
+            batteryCurrentUa = batteryCurrentUa,
+            thermalStatus = thermalStatus,
+            appPssKb = appPssKb,
+            appPrivateDirtyKb = appPrivateDirtyKb,
+            runtimeUsedMemoryKb = runtimeUsedMemoryKb,
+            workerState = workerState
+        )
     }
 
     private fun failureResponse(message: String): Sid.RegistrationResponse {

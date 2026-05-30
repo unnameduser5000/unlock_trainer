@@ -2,10 +2,13 @@ package com.example.sid_trainer
 
 import android.util.Log
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
 import sid.Sid
@@ -32,7 +35,10 @@ class HttpForwardChunkServer(
     private val bindPort: Int,
     private val onChunkReceived: suspend (Sid.ForwardChunkRequest) -> Sid.ForwardChunkResponse
 ) {
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val exceptionHandler = CoroutineExceptionHandler { _, t ->
+        Log.e("HttpDataPlane", "Unhandled data-plane coroutine failure", t)
+    }
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO + exceptionHandler)
     @Volatile
     private var serverSocket: ServerSocket? = null
     @Volatile
@@ -83,13 +89,25 @@ class HttpForwardChunkServer(
                     ensureActive()
                     val client = boundSocket.accept()
                     scope.launch {
-                        handleClient(client)
+                        try {
+                            handleClient(client)
+                        } catch (cancelled: CancellationException) {
+                            throw cancelled
+                        } catch (t: Throwable) {
+                            Log.e("HttpDataPlane", "Unhandled shard client failure", t)
+                        }
                     }
                 } catch (closed: SocketException) {
                     if (boundSocket.isClosed) {
                         return@launch
                     }
-                    throw closed
+                    Log.w("HttpDataPlane", "Shard accept failed; retrying", closed)
+                    delay(1_000)
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (t: Throwable) {
+                    Log.e("HttpDataPlane", "Shard accept loop failed; retrying", t)
+                    delay(1_000)
                 }
             }
         }
@@ -106,35 +124,44 @@ class HttpForwardChunkServer(
     }
 
     private suspend fun handleClient(socket: Socket) {
-        socket.use { client ->
-            client.soTimeout = 120_000
-            val input = BufferedInputStream(client.getInputStream())
-            val output = BufferedOutputStream(client.getOutputStream())
+        try {
+            socket.use { client ->
+                client.soTimeout = 120_000
+                val input = BufferedInputStream(client.getInputStream())
+                val output = BufferedOutputStream(client.getOutputStream())
 
-            try {
-                val requestLine = readAsciiLine(input)
-                if (!requestLine.startsWith("POST $FORWARD_CHUNK_PATH ")) {
-                    writeErrorResponse(output, 404, "Unsupported path")
+                try {
+                    val requestLine = readAsciiLine(input)
+                    if (!requestLine.startsWith("POST $FORWARD_CHUNK_PATH ")) {
+                        writeErrorResponse(output, 404, "Unsupported path")
+                        return
+                    }
+
+                    val headers = readHeaders(input)
+                    val contentLength = headers[HEADER_CONTENT_LENGTH]?.toIntOrNull()
+                    if (contentLength == null || contentLength < 0) {
+                        writeErrorResponse(output, 411, "Missing content length")
+                        return
+                    }
+
+                    val requestBytes = readFully(input, contentLength)
+                    val request = Sid.ForwardChunkRequest.parseFrom(requestBytes)
+                    val response = onChunkReceived(request)
+                    writeSuccessResponse(output, response.toByteArray())
+                } catch (closed: SocketException) {
+                    Log.w("HttpDataPlane", "Shard client disconnected: ${closed.message}")
                     return
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (t: Throwable) {
+                    Log.e("HttpDataPlane", "Failed to handle incoming shard request", t)
+                    writeErrorResponseQuietly(output, 500, t.message ?: "Internal server error")
+                } finally {
+                    flushQuietly(output)
                 }
-
-                val headers = readHeaders(input)
-                val contentLength = headers[HEADER_CONTENT_LENGTH]?.toIntOrNull()
-                if (contentLength == null || contentLength < 0) {
-                    writeErrorResponse(output, 411, "Missing content length")
-                    return
-                }
-
-                val requestBytes = readFully(input, contentLength)
-                val request = Sid.ForwardChunkRequest.parseFrom(requestBytes)
-                val response = onChunkReceived(request)
-                writeSuccessResponse(output, response.toByteArray())
-            } catch (t: Throwable) {
-                Log.e("HttpDataPlane", "Failed to handle incoming shard request", t)
-                writeErrorResponse(output, 500, t.message ?: "Internal server error")
-            } finally {
-                output.flush()
             }
+        } catch (closed: SocketException) {
+            Log.w("HttpDataPlane", "Shard socket closed before response completed: ${closed.message}")
         }
     }
 
@@ -178,6 +205,26 @@ class HttpForwardChunkServer(
         }.toByteArray(StandardCharsets.US_ASCII)
         output.write(header)
         output.write(body)
+    }
+
+    private fun writeErrorResponseQuietly(output: BufferedOutputStream, status: Int, message: String) {
+        try {
+            writeErrorResponse(output, status, message)
+        } catch (closed: SocketException) {
+            Log.w("HttpDataPlane", "Could not write error response; shard client disconnected: ${closed.message}")
+        } catch (t: Throwable) {
+            Log.e("HttpDataPlane", "Could not write error response", t)
+        }
+    }
+
+    private fun flushQuietly(output: BufferedOutputStream) {
+        try {
+            output.flush()
+        } catch (closed: SocketException) {
+            Log.w("HttpDataPlane", "Could not flush shard response; client disconnected: ${closed.message}")
+        } catch (t: Throwable) {
+            Log.e("HttpDataPlane", "Could not flush shard response", t)
+        }
     }
 
     private fun readAsciiLine(input: InputStream): String {

@@ -1,12 +1,12 @@
 {
   "bindPort": 50051,
   "adminBindPort": 18080,
-  "heartbeatLeaseSeconds": 15,
+  "heartbeatLeaseSeconds": 45,
   "cleanupIntervalSeconds": 5,
   "requestStallTimeoutSeconds": 30,
   "resolvedRequestRetentionSeconds": 86400,
   "artifactBaseUrl": "http://192.168.137.1:18080",
-  "pipelineName": "demo-pipeline",
+  "pipelineName": "demo-pipeline-three-phone",
   "stateDbPath": "coordinator/data/coordinator.db",
   "scheduler": {
     "enabled": true,
@@ -21,19 +21,31 @@
   {
     "stageId": 0,
     "deviceId": "NX809J",
-    "modelShardId": "tinyllama_lora_chunk_0",
-    "modelArtifactPath": "../../model/tinyllama_lora_chunk_0.pte",
+    "modelShardId": "tinyllama_lora_chunk_0_seq128",
+    "modelArtifactPath": "../../model/tinyllama_lora_chunk_0_seq128.pte",
     "expectedHost": "192.168.137.211",
-    "expectedPort": 26052
+    "expectedPort": 26052,
+    "schedulingWeight": 1
   },
 
   {
     "stageId": 1,
     "deviceId": "Lenovo_L71091",
-    "modelShardId": "tinyllama_lora_chunk_1",
-    "modelArtifactPath": "../../model/tinyllama_lora_chunk_1.pte",
+    "modelShardId": "tinyllama_lora_chunk_1_seq128",
+    "modelArtifactPath": "../../model/tinyllama_lora_chunk_1_seq128.pte",
     "expectedHost": "192.168.137.124",
-    "expectedPort": 26052
+    "expectedPort": 26052,
+    "schedulingWeight": 1
+  },
+
+  {
+    "stageId": 2,
+    "deviceId": "Pixel_10_Pro_XL",
+    "modelShardId": "tinyllama_lora_chunk_2_seq128",
+    "modelArtifactPath": "../../model/tinyllama_lora_chunk_2_seq128.pte",
+    "expectedHost": "192.168.137.139",
+    "expectedPort": 26052,
+    "schedulingWeight": 1
   }
   ]
 }

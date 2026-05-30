@@ -210,6 +210,196 @@ class CoordinatorStateTest {
         assertEquals(1f, validated.stages.single().schedulingWeight)
     }
 
+    @Test
+    fun requestMetricsAreGroupedIntoRunSummaries() {
+        val state = CoordinatorState(
+            initialConfig = testConfig(),
+            persistence = CoordinatorPersistence(
+                Files.createTempDirectory("sid-coordinator-runs-test")
+                    .resolve("coordinator.db")
+                    .toString()
+            )
+        )
+
+        state.recordRequestMetric(
+            PersistedRequestMetric(
+                runId = inferRunId("train-000123"),
+                requestId = "train-000123",
+                requestIndex = inferRequestIndex("train-000123"),
+                batchId = 1,
+                evalOnly = false,
+                submittedEpochMs = 10,
+                completedEpochMs = 30,
+                elapsedMs = 20,
+                success = true,
+                terminal = true,
+                processedStageId = 1,
+                processedChunkIdx = 1,
+                outputHiddenBytes = 16,
+                outputShiftLogPBytes = 32,
+                localLoss = 5.5f,
+                tokenCorrect = 2,
+                tokenCount = 4,
+                message = "ok"
+            )
+        )
+
+        val runs = state.listRecentRuns(10)
+        assertEquals(1, runs.size)
+        val run = runs.single()
+        assertEquals("train", run.runId)
+        assertEquals(1, run.requestRows)
+        assertEquals(1, run.successRows)
+        assertEquals(0, run.failedRows)
+        assertEquals(1, run.trainRows)
+        assertEquals(20.0, run.avgElapsedMs)
+        assertEquals(5.5, run.avgLoss)
+        assertEquals(0.5, run.tokenAccuracy)
+
+        val csv = state.exportRunMetricsCsv("train", 10)
+        assertTrue(csv.contains("train-000123"))
+        assertTrue(csv.contains("0.5"))
+    }
+
+    @Test
+    fun runSummaryUsesLatestAttemptForEachRequest() {
+        val state = CoordinatorState(
+            initialConfig = testConfig(),
+            persistence = CoordinatorPersistence(
+                Files.createTempDirectory("sid-coordinator-run-attempt-test")
+                    .resolve("coordinator.db")
+                    .toString()
+            )
+        )
+
+        state.recordRequestMetric(
+            PersistedRequestMetric(
+                runId = "retry-train",
+                requestId = "retry-train-000001",
+                requestIndex = 1,
+                batchId = 1,
+                evalOnly = false,
+                submittedEpochMs = 10,
+                completedEpochMs = 20,
+                elapsedMs = 10,
+                success = false,
+                terminal = false,
+                processedStageId = -1,
+                processedChunkIdx = 0,
+                outputHiddenBytes = 0,
+                outputShiftLogPBytes = 0,
+                localLoss = null,
+                tokenCorrect = 0,
+                tokenCount = 0,
+                message = "Stage 2 has no live worker."
+            )
+        )
+        state.recordRequestMetric(
+            PersistedRequestMetric(
+                runId = "retry-train",
+                requestId = "retry-train-000001",
+                requestIndex = 1,
+                batchId = 1,
+                evalOnly = false,
+                submittedEpochMs = 30,
+                completedEpochMs = 60,
+                elapsedMs = 30,
+                success = true,
+                terminal = true,
+                processedStageId = 2,
+                processedChunkIdx = 2,
+                outputHiddenBytes = 16,
+                outputShiftLogPBytes = 32,
+                localLoss = 4.0f,
+                tokenCorrect = 3,
+                tokenCount = 4,
+                message = "ok"
+            )
+        )
+
+        val run = state.listRecentRuns(10).single()
+        assertEquals(1, run.requestRows)
+        assertEquals(1, run.successRows)
+        assertEquals(0, run.failedRows)
+        assertEquals(30.0, run.avgElapsedMs)
+        assertEquals(0.75, run.tokenAccuracy)
+
+        val detail = state.loadRunDetail("retry-train", 10)
+        assertEquals(2, detail.metrics.size)
+        assertEquals(listOf(1, 2), detail.metrics.map { it.attempt })
+    }
+
+    @Test
+    fun schedulerEventsAreRestoredFromPersistence() {
+        val dbPath = Files.createTempDirectory("sid-coordinator-scheduler-events-test")
+            .resolve("coordinator.db")
+            .toString()
+        val persistence = CoordinatorPersistence(dbPath)
+        val firstState = CoordinatorState(
+            initialConfig = testConfig(scheduler = SchedulerConfig(enabled = true)),
+            persistence = persistence
+        )
+
+        firstState.registerNode(nodeInfo("stage-0", "127.0.0.1"))
+        assertTrue(firstState.adminStatus().schedulerEvents.any { it.action == "register_node" })
+
+        val restoredState = CoordinatorState(
+            initialConfig = testConfig(scheduler = SchedulerConfig(enabled = true)),
+            persistence = CoordinatorPersistence(dbPath)
+        )
+
+        assertTrue(restoredState.adminStatus().schedulerEvents.any { it.action == "register_node" })
+    }
+
+    @Test
+    fun workerTimingEventsAreParsedIntoStageTimingMetrics() {
+        val state = CoordinatorState(
+            initialConfig = testConfig(),
+            persistence = CoordinatorPersistence(
+                Files.createTempDirectory("sid-coordinator-stage-timing-test")
+                    .resolve("coordinator.db")
+                    .toString()
+            )
+        )
+
+        val ack = state.reportRequestEvent(
+            Sid.RequestEvent.newBuilder()
+                .setRequestId("train-000124")
+                .setBatchId(1)
+                .setChunkIdx(1)
+                .setStageId(1)
+                .setNodeId(7)
+                .setEventType(Sid.RequestEventType.LOCAL_COMPLETED)
+                .setSuccess(true)
+                .setTerminal(false)
+                .setEventEpochMs(1234)
+                .setMessage(
+                    "Local shard finished stage=1, bytes=262144 runtime=TrainingModule method=forward " +
+                        "inputs=5 localMs=5121 loss=5.881173 evalOnly=false optimizerStepApplied=true " +
+                        "inputBuildMs=160 executeMs=4955 gradientsMs=0 optimizerCreateMs=0 " +
+                        "optimizerStepMs=0 outputConvertMs=3 totalMeasuredMs=5118"
+                )
+                .build()
+        )
+
+        assertTrue(ack.ack)
+        val detail = state.loadRunDetail("train", 10)
+        val timing = detail.stageTimings.single()
+        assertEquals("train-000124", timing.requestId)
+        assertEquals(1, timing.stageId)
+        assertEquals("TrainingModule", timing.runtime)
+        assertEquals(false, timing.evalOnly)
+        assertEquals(true, timing.optimizerStepApplied)
+        assertEquals(5121L, timing.localMs)
+        assertEquals(4955L, timing.executeMs)
+        assertEquals(262144, timing.outputBytes)
+
+        val csv = state.exportRunStageTimingsCsv("train", 10)
+        assertTrue(csv.contains("optimizer_step_applied"))
+        assertTrue(csv.contains("TrainingModule"))
+        assertTrue(csv.contains("5121"))
+    }
+
     private fun nodeInfo(
         deviceId: String,
         ipAddress: String,

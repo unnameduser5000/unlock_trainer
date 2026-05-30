@@ -25,6 +25,7 @@ data class PreparedRequestRecord(
     val seq_len: Int? = null,
     val prompt_token_count: Int? = null,
     val valid_label_count: Int? = null,
+    val learning_rate: Float? = null,
     val tensors: Map<String, PreparedTensorRecord>
 )
 
@@ -72,6 +73,7 @@ fun PreparedRequestRecord.toForwardChunkRequest(
         .setBatchId(batch_id)
         .setChunkIdx(chunk_idx)
         .setEvalOnly(evalOnly)
+        .setLearningRate(learning_rate?.takeIf { it > 0f } ?: 0f)
         .setHiddenStates(requiredTensor("hidden_states", manifestDir))
         .setAttentionMask(requiredTensor("attention_mask", manifestDir))
         .setPositionIds(requiredTensor("position_ids", manifestDir))

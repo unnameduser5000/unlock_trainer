@@ -17,6 +17,12 @@ class CoordinatorAdminServer(
     private val loadStageArtifact: (Int) -> StageArtifactHandle?,
     private val listRecentRequests: (Int, String?) -> List<AdminRequestStateSnapshot>,
     private val loadRequestDetail: (String, Int) -> AdminRequestDetailSnapshot,
+    private val listRecentRuns: (Int) -> List<AdminRunSummarySnapshot>,
+    private val loadRunDetail: (String, Int) -> AdminRunDetailSnapshot,
+    private val exportRunMetricsCsv: (String, Int) -> String,
+    private val exportRunStageTimingsCsv: (String, Int) -> String,
+    private val listRecentWorkerTelemetry: (Int, String?) -> List<AdminWorkerTelemetrySnapshot>,
+    private val exportWorkerTelemetryCsv: (Int, String?) -> String,
     private val retryRequest: (String) -> AdminMutationResult,
     private val purgeRequest: (String) -> AdminMutationResult,
     private val purgeResolvedRequests: (Long?) -> AdminMutationResult,
@@ -80,6 +86,51 @@ class CoordinatorAdminServer(
                 }
             }
         }
+        server.createContext("/api/v1/runs") { exchange ->
+            handleRequest(exchange, "application/json; charset=utf-8") {
+                val limit = queryParam(exchange, "limit")?.toIntOrNull() ?: 50
+                gson.toJson(listRecentRuns(limit))
+            }
+        }
+        server.createContext("/api/v1/runs/") { exchange ->
+            val segments = exchange.requestURI.path.trim('/').split('/')
+            if (exchange.requestMethod == "GET" && segments.size == 5 && segments[4] == "metrics.csv") {
+                handleRequest(exchange, "text/csv; charset=utf-8") {
+                    val runId = URLDecoder.decode(segments[3], StandardCharsets.UTF_8)
+                    val limit = queryParam(exchange, "limit")?.toIntOrNull() ?: 100_000
+                    exportRunMetricsCsv(runId, limit)
+                }
+            } else if (exchange.requestMethod == "GET" && segments.size == 5 && segments[4] == "stage-timings.csv") {
+                handleRequest(exchange, "text/csv; charset=utf-8") {
+                    val runId = URLDecoder.decode(segments[3], StandardCharsets.UTF_8)
+                    val limit = queryParam(exchange, "limit")?.toIntOrNull() ?: 100_000
+                    exportRunStageTimingsCsv(runId, limit)
+                }
+            } else {
+                handleRequest(exchange, "application/json; charset=utf-8") {
+                    val runId = exchange.requestURI.path
+                        .removePrefix("/api/v1/runs/")
+                        .substringBefore('/')
+                        .let { URLDecoder.decode(it, StandardCharsets.UTF_8) }
+                    val metricLimit = queryParam(exchange, "metrics")?.toIntOrNull() ?: 1000
+                    gson.toJson(loadRunDetail(runId, metricLimit))
+                }
+            }
+        }
+        server.createContext("/api/v1/worker-telemetry.csv") { exchange ->
+            handleRequest(exchange, "text/csv; charset=utf-8") {
+                val limit = queryParam(exchange, "limit")?.toIntOrNull() ?: 100_000
+                val deviceId = queryParam(exchange, "device_id")
+                exportWorkerTelemetryCsv(limit, deviceId)
+            }
+        }
+        server.createContext("/api/v1/worker-telemetry") { exchange ->
+            handleRequest(exchange, "application/json; charset=utf-8") {
+                val limit = queryParam(exchange, "limit")?.toIntOrNull() ?: 1000
+                val deviceId = queryParam(exchange, "device_id")
+                gson.toJson(listRecentWorkerTelemetry(limit, deviceId))
+            }
+        }
         server.createContext("/api/v1/routing/reload") { exchange ->
             handleMutation(exchange) { reloadRouting() }
         }
@@ -103,6 +154,12 @@ class CoordinatorAdminServer(
                             "/api/v1/status",
                             "/api/v1/requests",
                             "/api/v1/requests/{requestId}",
+                            "/api/v1/runs",
+                            "/api/v1/runs/{runId}",
+                            "/api/v1/runs/{runId}/metrics.csv",
+                            "/api/v1/runs/{runId}/stage-timings.csv",
+                            "/api/v1/worker-telemetry",
+                            "/api/v1/worker-telemetry.csv",
                             "POST /api/v1/requests/{requestId}/retry",
                             "POST /api/v1/requests/{requestId}/purge",
                             "POST /api/v1/requests/purge-resolved",

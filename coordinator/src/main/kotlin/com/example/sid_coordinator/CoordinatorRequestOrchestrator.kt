@@ -20,6 +20,7 @@ class CoordinatorRequestOrchestrator(
         val requestId = request.requestId
         val plan = state.planRequestSubmission()
         val submittedAtEpochMs = System.currentTimeMillis()
+        val submittedAtNs = System.nanoTime()
         state.storeRequestPayload(requestId, request.toByteArray(), submittedAtEpochMs)
 
         if (!plan.accepted || plan.host == null || plan.port == null) {
@@ -36,7 +37,17 @@ class CoordinatorRequestOrchestrator(
                 message = message,
                 terminal = false
             )
-            return failureResponse(request, plan.message)
+            val completedAtMs = System.currentTimeMillis()
+            val response = failureResponse(request, plan.message)
+            recordMetric(
+                request,
+                response,
+                submittedAtEpochMs,
+                completedAtMs,
+                elapsedMsSince(submittedAtNs),
+                TokenPredictionMetrics(0, 0)
+            )
+            return response
         }
 
         state.recordCoordinatorRequestEvent(
@@ -63,12 +74,21 @@ class CoordinatorRequestOrchestrator(
                 plan.port,
                 source
             )
-            ProtoHttpForwardClient.forwardChunk(
+            val response = ProtoHttpForwardClient.forwardChunk(
                 host = plan.host,
                 port = plan.port,
                 request = request
             )
+            val completedAtMs = System.currentTimeMillis()
+            val metrics = if (response.success && response.terminal) {
+                safeTokenMetrics(request, response)
+            } else {
+                TokenPredictionMetrics(correct = 0, count = 0)
+            }
+            recordMetric(request, response, submittedAtEpochMs, completedAtMs, elapsedMsSince(submittedAtNs), metrics)
+            response
         } catch (t: Throwable) {
+            val completedAtMs = System.currentTimeMillis()
             val message = "Coordinator dispatch to stage 0 failed: ${t.message}"
             logger.error(
                 "Dispatch failed for requestId={} node={} host={}:{}",
@@ -89,7 +109,16 @@ class CoordinatorRequestOrchestrator(
                 message = message,
                 terminal = false
             )
-            failureResponse(request, message)
+            val response = failureResponse(request, message)
+            recordMetric(
+                request,
+                response,
+                submittedAtEpochMs,
+                completedAtMs,
+                elapsedMsSince(submittedAtNs),
+                TokenPredictionMetrics(0, 0)
+            )
+            response
         }
     }
 
@@ -131,5 +160,53 @@ class CoordinatorRequestOrchestrator(
             .addAllShape(reference.shapeList)
             .setDataType(reference.dataType)
             .build()
+    }
+
+    private fun recordMetric(
+        request: Sid.ForwardChunkRequest,
+        response: Sid.ForwardChunkResponse,
+        submittedAtEpochMs: Long,
+        completedAtEpochMs: Long,
+        elapsedMs: Long,
+        tokenMetrics: TokenPredictionMetrics
+    ) {
+        state.recordRequestMetric(
+            PersistedRequestMetric(
+                runId = inferRunId(request.requestId),
+                requestId = request.requestId,
+                requestIndex = inferRequestIndex(request.requestId),
+                batchId = request.batchId,
+                evalOnly = request.evalOnly,
+                submittedEpochMs = submittedAtEpochMs,
+                completedEpochMs = completedAtEpochMs,
+                elapsedMs = elapsedMs,
+                success = response.success,
+                terminal = response.terminal,
+                processedStageId = response.processedStageId,
+                processedChunkIdx = response.processedChunkIdx,
+                outputHiddenBytes = response.outputHiddenStates.data.size(),
+                outputShiftLogPBytes = response.outputShiftLogP.data.size(),
+                localLoss = response.localLoss.takeIf { response.success && response.terminal },
+                tokenCorrect = tokenMetrics.correct,
+                tokenCount = tokenMetrics.count,
+                message = response.message
+            )
+        )
+    }
+
+    private fun elapsedMsSince(startedAtNs: Long): Long {
+        return ((System.nanoTime() - startedAtNs) / 1_000_000L).coerceAtLeast(0L)
+    }
+
+    private fun safeTokenMetrics(
+        request: Sid.ForwardChunkRequest,
+        response: Sid.ForwardChunkResponse
+    ): TokenPredictionMetrics {
+        return try {
+            computeShiftedTokenPredictionMetrics(response.outputShiftLogP, request.labels)
+        } catch (t: Throwable) {
+            logger.warn("Failed to compute token metrics for requestId={}: {}", request.requestId, t.message)
+            TokenPredictionMetrics(correct = 0, count = 0)
+        }
     }
 }

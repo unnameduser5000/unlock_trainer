@@ -26,6 +26,8 @@ data class ShardExecutionResult(
     val inputCount: Int,
     val evalOnly: Boolean,
     val optimizerStepApplied: Boolean,
+    val checkpointSaved: Boolean,
+    val checkpointIntervalSteps: Long,
     val timing: ShardExecutionTiming
 )
 
@@ -61,6 +63,7 @@ object NativeShardRunner {
     private const val DEFAULT_METHOD = "forward"
     private const val TRAINING_METADATA_SCAN_BYTES = 1024 * 1024
     private const val DEFAULT_TRAINING_LEARNING_RATE = 1e-5
+    private const val TRAINING_CHECKPOINT_INTERVAL_STEPS = 16L
 
     private val cacheLock = ReentrantLock()
     private var cachedModelPath: String? = null
@@ -292,6 +295,8 @@ object NativeShardRunner {
             inputCount = inputCount,
             evalOnly = evalOnly,
             optimizerStepApplied = optimizerStepApplied,
+            checkpointSaved = checkpointSaved,
+            checkpointIntervalSteps = checkpointIntervalSteps,
             timing = finalTiming
         )
     }
@@ -317,6 +322,16 @@ object NativeShardRunner {
 
     private fun Sid.TensorData.toExecuTorchTensor(): Tensor {
         val shape = shapeList.map { it.toLong() }.toLongArray()
+        BeliefTopKCodec.decodeToDenseFloatArray(this)?.let { dense ->
+            val tensor = Tensor.fromBlob(dense, shape)
+            Log.i(
+                LOG_TAG,
+                "Decoded top-k belief tensor protoDtype=$dataType shape=${
+                    shape.joinToString(prefix = "[", postfix = "]")
+                } compressedBytes=${data.size()} denseElements=${dense.size}"
+            )
+            return tensor
+        }
         val rawBytes = data.toByteArray()
         val tensor = when (dataType.normalizedDataType()) {
             "float32", "float" -> Tensor.fromBlob(rawBytes.toFloatArray(), shape)
@@ -574,6 +589,8 @@ object NativeShardRunner {
         val outputs: Array<EValue>,
         val evalOnly: Boolean,
         val optimizerStepApplied: Boolean,
+        val checkpointSaved: Boolean,
+        val checkpointIntervalSteps: Long,
         val timing: ShardExecutionTiming
     )
 
@@ -586,6 +603,7 @@ object NativeShardRunner {
         private val module: TrainingModule
     ) : LoadedRuntime {
         private var optimizer: SGD? = null
+        private var optimizerLearningRate: Double? = null
         private var parameters: Map<String, Tensor>? = null
         private var checkpointRestoreAttempted = false
         private var optimizerStepCount = 0L
@@ -620,6 +638,8 @@ object NativeShardRunner {
             var gradientsMs = 0L
             var gradientCount = 0
             var optimizerStepApplied = false
+            var checkpointSaved = false
+            val learningRate = effectiveRequest.trainingLearningRate()
 
             if (!effectiveRequest.evalOnly) {
                 val gradientsStartedAtNs = System.nanoTime()
@@ -631,12 +651,13 @@ object NativeShardRunner {
                 require(gradients.isNotEmpty()) {
                     "TrainingModule.executeForwardBackward() produced no gradients for $modelPath."
                 }
-                val sgd = optimizer ?: run {
+                val sgd = optimizer.takeIf { optimizerLearningRate == learningRate } ?: run {
                     val optimizerStartedAtNs = System.nanoTime()
                     tracedSection("sid_create_sgd") {
-                        createOptimizer()
+                        createOptimizer(learningRate)
                     }.also {
                         optimizer = it
+                        optimizerLearningRate = learningRate
                         optimizerCreateMs = elapsedMsSince(optimizerStartedAtNs)
                     }
                 }
@@ -648,7 +669,7 @@ object NativeShardRunner {
                 optimizerStepApplied = true
                 committedRequestKeys += requestKey
                 optimizerStepCount += 1
-                saveCheckpointAfterStep()
+                checkpointSaved = maybeSaveCheckpointAfterStep()
             } else {
                 Log.i(
                     LOG_TAG,
@@ -660,7 +681,8 @@ object NativeShardRunner {
                 "TrainingModule.executeForwardBackward() succeeded for $modelPath " +
                     "with ${inputs.size} inputs evalOnly=${effectiveRequest.evalOnly} " +
                     "optimizerStepApplied=$optimizerStepApplied gradients=$gradientCount " +
-                    "optimizerStepCount=$optimizerStepCount " +
+                    "optimizerStepCount=$optimizerStepCount lr=$learningRate " +
+                    "checkpointSaved=$checkpointSaved checkpointIntervalSteps=$TRAINING_CHECKPOINT_INTERVAL_STEPS " +
                     "inputBuildMs=$inputBuildMs executeMs=$executeMs gradientsMs=$gradientsMs " +
                     "optimizerCreateMs=$optimizerCreateMs optimizerStepMs=$optimizerStepMs"
             )
@@ -671,6 +693,8 @@ object NativeShardRunner {
                 outputs = outputs,
                 evalOnly = effectiveRequest.evalOnly,
                 optimizerStepApplied = optimizerStepApplied,
+                checkpointSaved = checkpointSaved,
+                checkpointIntervalSteps = TRAINING_CHECKPOINT_INTERVAL_STEPS,
                 timing = ShardExecutionTiming(
                     inputBuildMs = inputBuildMs,
                     executeMs = executeMs,
@@ -712,7 +736,15 @@ object NativeShardRunner {
             return loaded
         }
 
-        private fun saveCheckpointAfterStep() {
+        private fun maybeSaveCheckpointAfterStep(): Boolean {
+            if (!shouldSaveCheckpointAfterStep()) {
+                Log.i(
+                    LOG_TAG,
+                    "Skipping checkpoint for $modelPath at step=$optimizerStepCount " +
+                        "interval=$TRAINING_CHECKPOINT_INTERVAL_STEPS"
+                )
+                return false
+            }
             runCatching {
                 TrainingCheckpointStore.saveLatest(modelPath, optimizerStepCount, parametersForRuntime())
             }.onFailure { error ->
@@ -722,21 +754,37 @@ object NativeShardRunner {
                     error
                 )
             }
+            return true
         }
 
-        private fun createOptimizer(): SGD {
+        private fun shouldSaveCheckpointAfterStep(): Boolean {
+            if (TRAINING_CHECKPOINT_INTERVAL_STEPS <= 1L) {
+                return true
+            }
+            return optimizerStepCount == 1L || optimizerStepCount % TRAINING_CHECKPOINT_INTERVAL_STEPS == 0L
+        }
+
+        private fun createOptimizer(learningRate: Double): SGD {
             val parameters = parametersForRuntime()
             Log.i(
                 LOG_TAG,
                 "Creating ExecuTorch SGD optimizer for $modelPath " +
-                    "parameters=${parameters.size} lr=$DEFAULT_TRAINING_LEARNING_RATE"
+                    "parameters=${parameters.size} lr=$learningRate"
             )
-            return SGD.create(parameters, DEFAULT_TRAINING_LEARNING_RATE)
+            return SGD.create(parameters, learningRate)
         }
 
         private fun Sid.ForwardChunkRequest.commitKey(): String {
             val stableRequestId = requestId.ifBlank { "batch-$batchId" }
             return "$stableRequestId|batch=$batchId|chunk=$chunkIdx"
+        }
+
+        private fun Sid.ForwardChunkRequest.trainingLearningRate(): Double {
+            return if (learningRate > 0f) {
+                learningRate.toDouble()
+            } else {
+                DEFAULT_TRAINING_LEARNING_RATE
+            }
         }
 
         override fun close() {
@@ -775,6 +823,8 @@ object NativeShardRunner {
                         outputs = outputs,
                         evalOnly = request.evalOnly,
                         optimizerStepApplied = false,
+                        checkpointSaved = false,
+                        checkpointIntervalSteps = TRAINING_CHECKPOINT_INTERVAL_STEPS,
                         timing = ShardExecutionTiming(
                             inputBuildMs = inputBuildMs,
                             executeMs = executeMs

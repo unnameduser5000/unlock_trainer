@@ -41,6 +41,14 @@ tasks.register<JavaExec>("runPreparedExperiment") {
     workingDir = rootProject.projectDir
 }
 
+tasks.register<JavaExec>("runPreparedPipelineExperiment") {
+    group = "application"
+    description = "Submit prepared tensor requests with a bounded in-flight window for pipeline-overlap experiments."
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("com.example.sid_coordinator.RunPreparedPipelineExperimentMainKt")
+    workingDir = rootProject.projectDir
+}
+
 sourceSets {
     main {
         proto {

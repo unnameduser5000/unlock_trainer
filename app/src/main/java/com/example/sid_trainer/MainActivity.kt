@@ -42,6 +42,8 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import sid.Sid
 import java.io.File
 import java.io.FileOutputStream
@@ -50,6 +52,7 @@ class MainActivity : ComponentActivity() {
 
     companion object {
         private const val UI_LOG_TAG = "SidWorkerUi"
+        private const val ENABLE_TOPK_BELIEF_TRANSPORT = false
     }
 
     private val logMessages = mutableStateListOf<String>()
@@ -65,6 +68,7 @@ class MainActivity : ComponentActivity() {
     private var acceptsNewChunks = true
     @Volatile
     private var activeModelPath: String? = null
+    private val localExecutionMutex = Mutex()
 
     private var workerJob: Job? = null
     private var activeGrpcManager: GrpcManager? = null
@@ -246,6 +250,7 @@ class MainActivity : ComponentActivity() {
             var grpcManager: GrpcManager? = null
             try {
                 grpcManager = GrpcManager(
+                    appContext = applicationContext,
                     coordinatorHost = coordinatorHost.value,
                     coordinatorPort = parsedCoordinatorPort,
                     requestedLocalServerPort = parsedLocalPort,
@@ -481,13 +486,16 @@ class MainActivity : ComponentActivity() {
             )
         }
 
+        val memoryBefore = WorkerTelemetryReader.read(applicationContext)
         val localStartedAtNs = System.nanoTime()
         val execution = try {
-            Trace.beginSection("sid_worker_local_execute")
-            try {
-                NativeShardRunner.execute(modelPath, request)
-            } finally {
-                Trace.endSection()
+            localExecutionMutex.withLock {
+                Trace.beginSection("sid_worker_local_execute")
+                try {
+                    NativeShardRunner.execute(modelPath, request)
+                } finally {
+                    Trace.endSection()
+                }
             }
         } catch (t: Throwable) {
             appendLog("Native shard execution failed: ${t.message}")
@@ -508,10 +516,14 @@ class MainActivity : ComponentActivity() {
             )
         }
         val localElapsedMs = elapsedMsSince(localStartedAtNs)
+        val memoryAfter = WorkerTelemetryReader.read(applicationContext)
+        val memoryTimingMessage = memoryDeltaMessage(memoryBefore, memoryAfter)
         val localTimingMessage = "runtime=${execution.runtimeName} method=${execution.methodName} " +
             "inputs=${execution.inputCount} localMs=$localElapsedMs " +
             "loss=${execution.localLoss} evalOnly=${execution.evalOnly} " +
-            "optimizerStepApplied=${execution.optimizerStepApplied} ${execution.timing.describeForLog()}"
+            "optimizerStepApplied=${execution.optimizerStepApplied} " +
+            "checkpointSaved=${execution.checkpointSaved} checkpointIntervalSteps=${execution.checkpointIntervalSteps} " +
+            "${execution.timing.describeForLog()} $memoryTimingMessage"
 
         appendLog(
             "Local shard finished stage=${registration.stageId}, bytes=${execution.outputHiddenStates.data.size()} " +
@@ -559,6 +571,17 @@ class MainActivity : ComponentActivity() {
             "Non-terminal stage ${registration.stageId} lost its downstream route after readiness check."
         }
 
+        val transportedBelief = if (ENABLE_TOPK_BELIEF_TRANSPORT) {
+            BeliefTopKCodec.encodeForTransport(execution.outputShiftLogP)
+        } else {
+            execution.outputShiftLogP
+        }
+        val beliefTransportMessage = "beliefTopKEnabled=$ENABLE_TOPK_BELIEF_TRANSPORT " +
+            "beliefTopK=${BeliefTopKCodec.DEFAULT_TOP_K} " +
+            "beliefDenseBytes=${execution.outputShiftLogP.data.size()} " +
+            "beliefTransportBytes=${transportedBelief.data.size()} " +
+            "beliefTransportDtype=${transportedBelief.dataType}"
+
         val nextRequest = Sid.ForwardChunkRequest.newBuilder()
             .setBatchId(request.batchId)
             .setChunkIdx(request.chunkIdx + 1)
@@ -566,7 +589,7 @@ class MainActivity : ComponentActivity() {
             .setAttentionMask(request.attentionMask)
             .setPositionIds(request.positionIds)
             .setLabels(request.labels)
-            .setShiftLogPPrev(execution.outputShiftLogP)
+            .setShiftLogPPrev(transportedBelief)
             .setRequestId(requestId)
             .setEvalOnly(request.evalOnly)
             .build()
@@ -581,7 +604,7 @@ class MainActivity : ComponentActivity() {
             chunkIdx = request.chunkIdx,
             eventType = Sid.RequestEventType.FORWARDING,
             success = true,
-            message = "Forwarding to ${nextHop.host}:${nextHop.port}",
+            message = "Forwarding to ${nextHop.host}:${nextHop.port}; $beliefTransportMessage",
             terminal = false
         )
         val forwardStartedAtNs = System.nanoTime()
@@ -647,6 +670,14 @@ class MainActivity : ComponentActivity() {
             .addAllShape(reference.shapeList)
             .setDataType(reference.dataType)
             .build()
+    }
+
+    private fun memoryDeltaMessage(before: WorkerTelemetry, after: WorkerTelemetry): String {
+        return "pssBeforeKb=${before.appPssKb} pssAfterKb=${after.appPssKb} " +
+            "pssDeltaKb=${after.appPssKb - before.appPssKb} " +
+            "privateDirtyBeforeKb=${before.appPrivateDirtyKb} privateDirtyAfterKb=${after.appPrivateDirtyKb} " +
+            "javaHeapBeforeKb=${before.runtimeUsedMemoryKb} javaHeapAfterKb=${after.runtimeUsedMemoryKb} " +
+            "javaHeapDeltaKb=${after.runtimeUsedMemoryKb - before.runtimeUsedMemoryKb}"
     }
 
     private fun stopWorker() {

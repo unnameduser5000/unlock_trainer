@@ -48,6 +48,17 @@ message HeartbeatRequest {
   int32 node_id = 2;
   float battery_level = 3;
   bool is_active = 4;
+  bool is_charging = 5;
+  string power_source = 6;
+  int32 battery_status = 7;
+  float battery_temp_c = 8;
+  int32 battery_voltage_mv = 9;
+  int64 battery_current_ua = 10;
+  string thermal_status = 11;
+  int64 app_pss_kb = 12;
+  int64 app_private_dirty_kb = 13;
+  int64 runtime_used_memory_kb = 14;
+  string worker_state = 15;
 }
 
 message HeartbeatResponse {
@@ -107,6 +118,7 @@ message ForwardChunkRequest {
   TensorData shift_log_p_prev = 7;
   string request_id = 8;
   bool eval_only = 9;
+  float learning_rate = 10;
 }
 
 message ForwardChunkResponse {

@@ -1,7 +1,7 @@
 {
   "bindPort": 50051,
   "adminBindPort": 18080,
-  "heartbeatLeaseSeconds": 15,
+  "heartbeatLeaseSeconds": 45,
   "cleanupIntervalSeconds": 5,
   "requestStallTimeoutSeconds": 30,
   "resolvedRequestRetentionSeconds": 86400,

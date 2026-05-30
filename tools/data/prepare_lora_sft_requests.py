@@ -50,7 +50,11 @@ def split_config(raw_split: str) -> tuple[str | None, str]:
     return None, raw_split
 
 
-def format_example(example: dict[str, Any], dataset_name: str) -> tuple[str, str]:
+def format_example(
+    example: dict[str, Any],
+    dataset_name: str,
+    response_style: str,
+) -> tuple[str, str]:
     if dataset_name == "toy":
         instruction = str(example.get("instruction", "")).strip()
         response = str(example.get("response", "")).strip()
@@ -61,26 +65,42 @@ def format_example(example: dict[str, Any], dataset_name: str) -> tuple[str, str
         sentence = str(example.get("sentence", "")).strip()
         label = int(example.get("label", 0))
         sentiment = "positive" if label == 1 else "negative"
-        prompt = (
-            "Movie review:\n"
-            f"{sentence}\n\n"
-            "Classify the sentiment as positive or negative.\n\n"
-            "Answer:\n"
-        )
-        response = f"The movie review expresses a {sentiment} sentiment."
+        if response_style == "label":
+            prompt = (
+                "Movie review:\n"
+                f"{sentence}\n\n"
+                "Sentiment (positive or negative):"
+            )
+            response = f" {sentiment}"
+        else:
+            prompt = (
+                "Movie review:\n"
+                f"{sentence}\n\n"
+                "Classify the sentiment as positive or negative.\n\n"
+                "Answer:\n"
+            )
+            response = f"The movie review expresses a {sentiment} sentiment."
         return prompt, response
 
     if "rotten_tomatoes" in dataset_name:
         text = str(example.get("text", "")).strip()
         label = int(example.get("label", 0))
         sentiment = "positive" if label == 1 else "negative"
-        prompt = (
-            "Movie review:\n"
-            f"{text}\n\n"
-            "Classify the sentiment as positive or negative.\n\n"
-            "Answer:\n"
-        )
-        response = f"The movie review expresses a {sentiment} sentiment."
+        if response_style == "label":
+            prompt = (
+                "Movie review:\n"
+                f"{text}\n\n"
+                "Sentiment (positive or negative):"
+            )
+            response = f" {sentiment}"
+        else:
+            prompt = (
+                "Movie review:\n"
+                f"{text}\n\n"
+                "Classify the sentiment as positive or negative.\n\n"
+                "Answer:\n"
+            )
+            response = f"The movie review expresses a {sentiment} sentiment."
         return prompt, response
 
     if "ag_news" in dataset_name:
@@ -93,13 +113,21 @@ def format_example(example: dict[str, Any], dataset_name: str) -> tuple[str, str
             3: "Science and Technology",
         }
         topic = label_names.get(label, str(label))
-        prompt = (
-            "News article:\n"
-            f"{text}\n\n"
-            "Classify the news topic as World, Sports, Business, or Science and Technology.\n\n"
-            "Answer:\n"
-        )
-        response = f"The topic is {topic} news."
+        if response_style == "label":
+            prompt = (
+                "News article:\n"
+                f"{text}\n\n"
+                "Topic (World, Sports, Business, or Science and Technology):"
+            )
+            response = f" {topic}"
+        else:
+            prompt = (
+                "News article:\n"
+                f"{text}\n\n"
+                "Classify the news topic as World, Sports, Business, or Science and Technology.\n\n"
+                "Answer:\n"
+            )
+            response = f"The topic is {topic} news."
         return prompt, response
 
     if "sciq" in dataset_name:
@@ -157,13 +185,14 @@ def build_token_tensors(
     seq_len: int,
     mask_prompt: bool,
     max_prompt_tokens: int,
+    append_eos: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, int]:
     prompt_ids = tokenizer(prompt, add_special_tokens=False)["input_ids"]
     if max_prompt_tokens > 0:
         prompt_ids = prompt_ids[:max_prompt_tokens]
     response_ids = tokenizer(response, add_special_tokens=False)["input_ids"]
     eos_id = tokenizer.eos_token_id
-    if eos_id is not None:
+    if append_eos and eos_id is not None:
         response_ids = response_ids + [eos_id]
 
     input_ids = (prompt_ids + response_ids)[:seq_len]
@@ -255,6 +284,29 @@ def main() -> None:
     parser.add_argument("--attention_mask", choices=["zero", "causal"], default="causal")
     parser.add_argument("--mask_prompt", action="store_true")
     parser.add_argument(
+        "--response_style",
+        choices=["natural", "label"],
+        default="natural",
+        help=(
+            "natural keeps the original instruction-style response. label writes only the class label "
+            "for supported classification datasets, so token accuracy is close to task accuracy."
+        ),
+    )
+    parser.add_argument(
+        "--no_append_eos",
+        action="store_true",
+        help="Do not append EOS to the response. Useful for one-token label-only classification probes.",
+    )
+    parser.add_argument(
+        "--learning_rate",
+        type=float,
+        default=0.0,
+        help=(
+            "Optional per-request SGD learning rate stored in the manifest. "
+            "0 keeps the Android worker default."
+        ),
+    )
+    parser.add_argument(
         "--max_prompt_tokens",
         type=int,
         default=0,
@@ -280,6 +332,8 @@ def main() -> None:
         raise ValueError("max_prompt_tokens must be non-negative.")
     if args.max_prompt_tokens >= args.seq_len:
         raise ValueError("max_prompt_tokens must be smaller than seq_len.")
+    if args.learning_rate < 0:
+        raise ValueError("learning_rate must be non-negative.")
 
     resolved_model = resolve_model_name(args.model_name)
     dataset_name, default_split = resolve_dataset(args.dataset)
@@ -314,7 +368,11 @@ def main() -> None:
         while records_written < args.limit and dataset_index < len(dataset):
             last_dataset_index = dataset_index
             example = dataset[dataset_index]
-            prompt, response = format_example(example, dataset_name)
+            prompt, response = format_example(
+                example=example,
+                dataset_name=dataset_name,
+                response_style=args.response_style,
+            )
             input_ids, labels, prompt_token_count = build_token_tensors(
                 tokenizer=tokenizer,
                 prompt=prompt,
@@ -322,6 +380,7 @@ def main() -> None:
                 seq_len=args.seq_len,
                 mask_prompt=args.mask_prompt,
                 max_prompt_tokens=args.max_prompt_tokens,
+                append_eos=not args.no_append_eos,
             )
             valid_label_count = count_valid_labels(labels)
             if valid_label_count < args.min_valid_labels:
@@ -359,6 +418,7 @@ def main() -> None:
                 "seq_len": args.seq_len,
                 "prompt_token_count": prompt_token_count,
                 "valid_label_count": valid_label_count,
+                "learning_rate": args.learning_rate if args.learning_rate > 0 else None,
                 "tensors": {
                     "hidden_states": tensor_record(args.output_dir, hidden_path, "float32", list(hidden_states.shape)),
                     "attention_mask": tensor_record(args.output_dir, mask_path, "float32", list(attention_mask.shape)),
@@ -393,8 +453,11 @@ def main() -> None:
         "last_dataset_index": last_dataset_index,
         "attention_mask": args.attention_mask,
         "mask_prompt": args.mask_prompt,
+        "response_style": args.response_style,
+        "append_eos": not args.no_append_eos,
         "max_prompt_tokens": args.max_prompt_tokens,
         "min_valid_labels": args.min_valid_labels,
+        "learning_rate": args.learning_rate if args.learning_rate > 0 else None,
         "manifest": manifest_path.name,
     }
     metadata_path.write_text(json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8")

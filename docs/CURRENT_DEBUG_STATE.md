@@ -8,6 +8,79 @@ Last updated: 2026-05-30 Asia/Shanghai
 
 Do not restart from inference smoke or one-request smoke after a context reset. Those paths have already served their purpose.
 
+### 2026-05-30 Label-Only Quality Demo Pivot
+
+Why this pivot exists:
+
+- The seq128 Rotten Tomatoes natural-language template run completed as a systems proof, but the loss did not show a meaningful downward trend.
+- Completed run: `debug_runs/seq128-rotten-tomatoes-20260530-213247/train128-window3`.
+- Result: `128/128` success, `0` failures, average terminal loss about `6.7117`, first 32 loss about `6.6797`, last 32 loss about `6.7000`.
+- This is not a useful quality demo because the 10-token response template mostly measures predictable words such as "The movie review expresses..." rather than the sentiment decision.
+
+Implemented fix:
+
+- `tools/data/prepare_lora_sft_requests.py` now supports `--response_style label`.
+  - For `rotten_tomatoes` and `sst2`, the response becomes only ` positive` or ` negative`.
+  - Use `--no_append_eos` with this mode so the only supervised token is the class label.
+- Prepared request records can now include optional `learning_rate`.
+- `ForwardChunkRequest` now has optional `learning_rate = 10`.
+- `PreparedRequestSupport.kt` copies manifest `learning_rate` into the protobuf request.
+- Android `NativeShardRunner` uses request learning rate when it creates ExecuTorch `SGD`; old manifests still default to `1e-5`.
+
+Recommended quality-demo dataset generation on the Linux export/server environment:
+
+First run a cheap server-side probe before spending Android time:
+
+```bash
+python tools/data/probe_label_task.py \
+  --model_name tinyllama \
+  --dataset rotten_tomatoes \
+  --limit 256 \
+  --max_prompt_tokens 96 \
+  --output_json debug_runs/label_probe_rt128_base.json
+```
+
+Interpretation:
+
+- `choice_accuracy` and `avg_choice_loss` answer the binary question "positive vs negative" only.
+- `full_vocab_accuracy` answers whether the full model's top token is exactly the target label token.
+- If base `choice_accuracy` is already very high, the task is too easy for a learning demo.
+- If base is near chance and server-side LoRA can overfit but Android cannot, debug the mobile BP-free path.
+- If base is near chance and server-side LoRA also cannot overfit, change prompt/labels/LR before using phones.
+
+```bash
+python tools/data/prepare_lora_sft_requests.py \
+  --model_name tinyllama \
+  --dataset rotten_tomatoes \
+  --seq_len 128 \
+  --limit 64 \
+  --attention_mask causal \
+  --mask_prompt \
+  --response_style label \
+  --no_append_eos \
+  --max_prompt_tokens 96 \
+  --min_valid_labels 1 \
+  --learning_rate 3e-4 \
+  --request_prefix rt-label-train \
+  --output_dir data/sft_requests/tinyllama_rotten_tomatoes128_label_train64_lr3e4
+```
+
+Recommended demo protocol:
+
+- Clean `_seq128.latest.sidckpt` checkpoints and restart all three workers.
+- Run `eval-before` on the label-only manifest with `evalOnly=true`.
+- Run one or more short train epochs over the same 64 real examples with unique run/request prefixes.
+- Run `eval-after` on the same manifest with `evalOnly=true`.
+- Report this honestly as a real-data overfit/learning-signal demo, not as a generalization claim.
+- Use the existing `train128-window3` and pipeline-overlap artifacts for systems performance/stability, not for model-quality improvement.
+
+Local status after this pivot:
+
+- Windows local Python cannot generate prepared requests because it lacks `torch`; generate on the server environment and sync `data/sft_requests/...` back.
+- New APK with request-level learning-rate support was built and installed on NX, Lenovo, and Pixel.
+- Coordinator was restarted from the new code.
+- Workers were relaunched and route is live: NX stage 0 -> Lenovo stage 1 -> Pixel stage 2.
+
 ### 2026-05-30 Pipeline-Overlap Scheduler Proof
 
 Current pipeline-overlap evidence directory:

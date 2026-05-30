@@ -201,7 +201,7 @@ class CoordinatorPersistence(
     fun appendRequestEvent(event: PersistedRequestEvent) {
         connection().use { conn ->
             conn.autoCommit = false
-            conn.prepareStatement(
+            val insertedEventId = conn.prepareStatement(
                 """
                 INSERT INTO request_events (
                   request_id,
@@ -215,7 +215,8 @@ class CoordinatorPersistence(
                   event_epoch_ms,
                   terminal
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """.trimIndent()
+                """.trimIndent(),
+                java.sql.Statement.RETURN_GENERATED_KEYS
             ).use { stmt ->
                 stmt.setString(1, event.requestId)
                 stmt.setInt(2, event.batchId)
@@ -228,6 +229,12 @@ class CoordinatorPersistence(
                 stmt.setLong(9, event.eventEpochMs)
                 stmt.setInt(10, if (event.terminal) 1 else 0)
                 stmt.executeUpdate()
+                stmt.generatedKeys.use { keys ->
+                    if (keys.next()) keys.getLong(1) else 0L
+                }
+            }
+            parseStageTimingMetric(event.copy(eventId = insertedEventId))?.let { timing ->
+                insertStageTimingMetric(conn, timing)
             }
             conn.prepareStatement(
                 """
@@ -509,6 +516,308 @@ class CoordinatorPersistence(
         }
     }
 
+    fun appendSchedulerEvent(event: AdminSchedulerEventSnapshot): AdminSchedulerEventSnapshot {
+        connection().use { conn ->
+            conn.prepareStatement(
+                """
+                INSERT INTO scheduler_events (
+                  event_epoch_ms,
+                  action,
+                  stage_id,
+                  node_id,
+                  device_id,
+                  reason,
+                  message
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """.trimIndent(),
+                java.sql.Statement.RETURN_GENERATED_KEYS
+            ).use { stmt ->
+                stmt.setLong(1, event.eventEpochMs)
+                stmt.setString(2, event.action)
+                setNullableInt(stmt, 3, event.stageId)
+                setNullableInt(stmt, 4, event.nodeId)
+                stmt.setString(5, event.deviceId)
+                stmt.setString(6, event.reason)
+                stmt.setString(7, event.message)
+                stmt.executeUpdate()
+                stmt.generatedKeys.use { keys ->
+                    val eventId = if (keys.next()) keys.getLong(1) else 0L
+                    return event.copy(eventId = eventId)
+                }
+            }
+        }
+    }
+
+    fun listRecentSchedulerEvents(limit: Int): List<AdminSchedulerEventSnapshot> {
+        connection().use { conn ->
+            conn.prepareStatement(
+                """
+                SELECT
+                  event_id,
+                  event_epoch_ms,
+                  action,
+                  stage_id,
+                  node_id,
+                  device_id,
+                  reason,
+                  message
+                FROM scheduler_events
+                ORDER BY event_epoch_ms DESC, event_id DESC
+                LIMIT ?
+                """.trimIndent()
+            ).use { stmt ->
+                stmt.setInt(1, limit)
+                stmt.executeQuery().use { rs ->
+                    return buildList {
+                        while (rs.next()) {
+                            add(rs.toAdminSchedulerEventSnapshot())
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fun appendWorkerTelemetry(telemetry: PersistedWorkerTelemetry) {
+        connection().use { conn ->
+            conn.prepareStatement(
+                """
+                INSERT INTO worker_telemetry (
+                  observed_epoch_ms,
+                  device_id,
+                  node_id,
+                  stage_id,
+                  is_active,
+                  battery_level,
+                  is_charging,
+                  power_source,
+                  battery_status,
+                  battery_temp_c,
+                  battery_voltage_mv,
+                  battery_current_ua,
+                  thermal_status,
+                  app_pss_kb,
+                  app_private_dirty_kb,
+                  runtime_used_memory_kb,
+                  worker_state
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """.trimIndent()
+            ).use { stmt ->
+                stmt.setLong(1, telemetry.observedEpochMs)
+                stmt.setString(2, telemetry.deviceId)
+                stmt.setInt(3, telemetry.nodeId)
+                stmt.setInt(4, telemetry.stageId)
+                stmt.setInt(5, if (telemetry.isActive) 1 else 0)
+                stmt.setFloat(6, telemetry.batteryLevel)
+                stmt.setInt(7, if (telemetry.isCharging) 1 else 0)
+                stmt.setString(8, telemetry.powerSource)
+                stmt.setInt(9, telemetry.batteryStatus)
+                setNullableFloat(stmt, 10, telemetry.batteryTempC)
+                setNullableInt(stmt, 11, telemetry.batteryVoltageMv)
+                setNullableLong(stmt, 12, telemetry.batteryCurrentUa)
+                stmt.setString(13, telemetry.thermalStatus)
+                setNullableLong(stmt, 14, telemetry.appPssKb)
+                setNullableLong(stmt, 15, telemetry.appPrivateDirtyKb)
+                setNullableLong(stmt, 16, telemetry.runtimeUsedMemoryKb)
+                stmt.setString(17, telemetry.workerState)
+                stmt.executeUpdate()
+            }
+        }
+    }
+
+    fun listRecentWorkerTelemetry(limit: Int, deviceId: String?): List<PersistedWorkerTelemetry> {
+        connection().use { conn ->
+            val filteredDeviceId = deviceId?.trim()?.takeIf { it.isNotBlank() }
+            val whereClause = if (filteredDeviceId == null) "" else "WHERE device_id = ?"
+            conn.prepareStatement(
+                """
+                SELECT
+                  telemetry_id,
+                  observed_epoch_ms,
+                  device_id,
+                  node_id,
+                  stage_id,
+                  is_active,
+                  battery_level,
+                  is_charging,
+                  power_source,
+                  battery_status,
+                  battery_temp_c,
+                  battery_voltage_mv,
+                  battery_current_ua,
+                  thermal_status,
+                  app_pss_kb,
+                  app_private_dirty_kb,
+                  runtime_used_memory_kb,
+                  worker_state
+                FROM worker_telemetry
+                $whereClause
+                ORDER BY observed_epoch_ms DESC, telemetry_id DESC
+                LIMIT ?
+                """.trimIndent()
+            ).use { stmt ->
+                var index = 1
+                if (filteredDeviceId != null) {
+                    stmt.setString(index++, filteredDeviceId)
+                }
+                stmt.setInt(index, limit)
+                stmt.executeQuery().use { rs ->
+                    return buildList {
+                        while (rs.next()) {
+                            add(rs.toPersistedWorkerTelemetry())
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fun appendRequestMetric(
+        metric: PersistedRequestMetric,
+        pipelineName: String,
+        modelShards: String,
+        configHash: String
+    ) {
+        connection().use { conn ->
+            conn.autoCommit = false
+            val attempt = if (metric.attempt > 0) {
+                metric.attempt
+            } else {
+                nextMetricAttempt(conn, metric.requestId)
+            }
+            conn.prepareStatement(
+                """
+                INSERT INTO runs (
+                  run_id,
+                  pipeline_name,
+                  model_shards,
+                  config_hash,
+                  first_seen_epoch_ms,
+                  last_updated_epoch_ms
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(run_id) DO UPDATE SET
+                  pipeline_name = excluded.pipeline_name,
+                  model_shards = excluded.model_shards,
+                  config_hash = excluded.config_hash,
+                  first_seen_epoch_ms = MIN(runs.first_seen_epoch_ms, excluded.first_seen_epoch_ms),
+                  last_updated_epoch_ms = MAX(runs.last_updated_epoch_ms, excluded.last_updated_epoch_ms)
+                """.trimIndent()
+            ).use { stmt ->
+                stmt.setString(1, metric.runId)
+                stmt.setString(2, pipelineName)
+                stmt.setString(3, modelShards)
+                stmt.setString(4, configHash)
+                stmt.setLong(5, metric.submittedEpochMs)
+                stmt.setLong(6, metric.completedEpochMs)
+                stmt.executeUpdate()
+            }
+            conn.prepareStatement(
+                """
+                INSERT INTO request_metrics (
+                  run_id,
+                  request_id,
+                  request_index,
+                  attempt,
+                  batch_id,
+                  eval_only,
+                  submitted_epoch_ms,
+                  completed_epoch_ms,
+                  elapsed_ms,
+                  success,
+                  terminal,
+                  processed_stage_id,
+                  processed_chunk_idx,
+                  output_hidden_bytes,
+                  output_shift_log_p_bytes,
+                  local_loss,
+                  token_correct,
+                  token_count,
+                  message
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """.trimIndent()
+            ).use { stmt ->
+                stmt.setString(1, metric.runId)
+                stmt.setString(2, metric.requestId)
+                setNullableInt(stmt, 3, metric.requestIndex)
+                stmt.setInt(4, attempt)
+                stmt.setInt(5, metric.batchId)
+                stmt.setInt(6, if (metric.evalOnly) 1 else 0)
+                stmt.setLong(7, metric.submittedEpochMs)
+                stmt.setLong(8, metric.completedEpochMs)
+                stmt.setLong(9, metric.elapsedMs)
+                stmt.setInt(10, if (metric.success) 1 else 0)
+                stmt.setInt(11, if (metric.terminal) 1 else 0)
+                stmt.setInt(12, metric.processedStageId)
+                stmt.setInt(13, metric.processedChunkIdx)
+                stmt.setInt(14, metric.outputHiddenBytes)
+                stmt.setInt(15, metric.outputShiftLogPBytes)
+                if (metric.localLoss == null) {
+                    stmt.setNull(16, java.sql.Types.REAL)
+                } else {
+                    stmt.setFloat(16, metric.localLoss)
+                }
+                stmt.setInt(17, metric.tokenCorrect)
+                stmt.setInt(18, metric.tokenCount)
+                stmt.setString(19, metric.message)
+                stmt.executeUpdate()
+            }
+            conn.commit()
+        }
+    }
+
+    fun listRecentRuns(limit: Int): List<PersistedRunSummary> {
+        connection().use { conn ->
+            conn.prepareStatement(
+                runSummarySelect(
+                    whereClause = "",
+                    orderLimitClause = "ORDER BY r.last_updated_epoch_ms DESC LIMIT ?"
+                )
+            ).use { stmt ->
+                stmt.setInt(1, limit)
+                stmt.executeQuery().use { rs ->
+                    return buildList {
+                        while (rs.next()) {
+                            add(rs.toPersistedRunSummary())
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fun loadRunDetail(runId: String, metricLimit: Int): AdminRunDetailSnapshot {
+        connection().use { conn ->
+            val summary = conn.prepareStatement(
+                runSummarySelect(
+                    whereClause = "WHERE r.run_id = ?",
+                    orderLimitClause = ""
+                )
+            ).use { stmt ->
+                stmt.setString(1, runId)
+                stmt.executeQuery().use { rs ->
+                    if (rs.next()) rs.toPersistedRunSummary().toAdminSnapshot() else null
+                }
+            }
+            val metrics = listRunMetrics(conn, runId, metricLimit)
+                .map { it.toAdminSnapshot() }
+            val stageTimings = listStageTimingMetrics(conn, runId, metricLimit)
+                .map { it.toAdminSnapshot() }
+            return AdminRunDetailSnapshot(summary = summary, metrics = metrics, stageTimings = stageTimings)
+        }
+    }
+
+    fun listRunMetrics(runId: String, metricLimit: Int): List<PersistedRequestMetric> {
+        connection().use { conn ->
+            return listRunMetrics(conn, runId, metricLimit)
+        }
+    }
+
+    fun listStageTimingMetrics(runId: String, metricLimit: Int): List<PersistedStageTimingMetric> {
+        connection().use { conn ->
+            return listStageTimingMetrics(conn, runId, metricLimit)
+        }
+    }
+
     private fun connection(): Connection {
         return DriverManager.getConnection(jdbcUrl)
     }
@@ -594,6 +903,118 @@ class CoordinatorPersistence(
             )
             stmt.execute(
                 """
+                CREATE TABLE IF NOT EXISTS runs (
+                  run_id TEXT PRIMARY KEY,
+                  pipeline_name TEXT NOT NULL,
+                  model_shards TEXT NOT NULL,
+                  config_hash TEXT NOT NULL,
+                  first_seen_epoch_ms INTEGER NOT NULL,
+                  last_updated_epoch_ms INTEGER NOT NULL
+                )
+                """.trimIndent()
+            )
+            stmt.execute(
+                """
+                CREATE TABLE IF NOT EXISTS request_metrics (
+                  metric_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  run_id TEXT NOT NULL,
+                  request_id TEXT NOT NULL,
+                  request_index INTEGER,
+                  attempt INTEGER NOT NULL,
+                  batch_id INTEGER NOT NULL,
+                  eval_only INTEGER NOT NULL,
+                  submitted_epoch_ms INTEGER NOT NULL,
+                  completed_epoch_ms INTEGER NOT NULL,
+                  elapsed_ms INTEGER NOT NULL,
+                  success INTEGER NOT NULL,
+                  terminal INTEGER NOT NULL,
+                  processed_stage_id INTEGER NOT NULL,
+                  processed_chunk_idx INTEGER NOT NULL,
+                  output_hidden_bytes INTEGER NOT NULL,
+                  output_shift_log_p_bytes INTEGER NOT NULL,
+                  local_loss REAL,
+                  token_correct INTEGER NOT NULL,
+                  token_count INTEGER NOT NULL,
+                  message TEXT NOT NULL,
+                  FOREIGN KEY(run_id) REFERENCES runs(run_id)
+                )
+                """.trimIndent()
+            )
+            stmt.execute(
+                """
+                CREATE TABLE IF NOT EXISTS stage_timing_metrics (
+                  stage_metric_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  request_event_id INTEGER NOT NULL,
+                  run_id TEXT NOT NULL,
+                  request_id TEXT NOT NULL,
+                  batch_id INTEGER NOT NULL,
+                  chunk_idx INTEGER NOT NULL,
+                  stage_id INTEGER NOT NULL,
+                  node_id INTEGER NOT NULL,
+                  event_type TEXT NOT NULL,
+                  event_epoch_ms INTEGER NOT NULL,
+                  runtime TEXT,
+                  method TEXT,
+                  input_count INTEGER,
+                  eval_only INTEGER,
+                  optimizer_step_applied INTEGER,
+                  local_loss REAL,
+                  local_ms INTEGER,
+                  input_build_ms INTEGER,
+                  execute_ms INTEGER,
+                  gradients_ms INTEGER,
+                  optimizer_create_ms INTEGER,
+                  optimizer_step_ms INTEGER,
+                  output_convert_ms INTEGER,
+                  total_measured_ms INTEGER,
+                  forward_ms INTEGER,
+                  total_stage_ms INTEGER,
+                  output_bytes INTEGER,
+                  message TEXT NOT NULL,
+                  FOREIGN KEY(request_event_id) REFERENCES request_events(event_id)
+                )
+                """.trimIndent()
+            )
+            stmt.execute(
+                """
+                CREATE TABLE IF NOT EXISTS scheduler_events (
+                  event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  event_epoch_ms INTEGER NOT NULL,
+                  action TEXT NOT NULL,
+                  stage_id INTEGER,
+                  node_id INTEGER,
+                  device_id TEXT,
+                  reason TEXT NOT NULL,
+                  message TEXT NOT NULL
+                )
+                """.trimIndent()
+            )
+            stmt.execute(
+                """
+                CREATE TABLE IF NOT EXISTS worker_telemetry (
+                  telemetry_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  observed_epoch_ms INTEGER NOT NULL,
+                  device_id TEXT NOT NULL,
+                  node_id INTEGER NOT NULL,
+                  stage_id INTEGER NOT NULL,
+                  is_active INTEGER NOT NULL,
+                  battery_level REAL NOT NULL,
+                  is_charging INTEGER NOT NULL,
+                  power_source TEXT NOT NULL,
+                  battery_status INTEGER NOT NULL,
+                  battery_temp_c REAL,
+                  battery_voltage_mv INTEGER,
+                  battery_current_ua INTEGER,
+                  thermal_status TEXT NOT NULL,
+                  app_pss_kb INTEGER,
+                  app_private_dirty_kb INTEGER,
+                  runtime_used_memory_kb INTEGER,
+                  worker_state TEXT NOT NULL
+                )
+                """.trimIndent()
+            )
+            stmt.execute(
+                """
                 CREATE INDEX IF NOT EXISTS idx_request_events_request_id_epoch
                 ON request_events(request_id, event_epoch_ms DESC, event_id DESC)
                 """.trimIndent()
@@ -608,6 +1029,54 @@ class CoordinatorPersistence(
                 """
                 CREATE INDEX IF NOT EXISTS idx_request_payloads_last_submit
                 ON request_payloads(last_submit_epoch_ms DESC)
+                """.trimIndent()
+            )
+            stmt.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_request_metrics_run_id_index
+                ON request_metrics(run_id, request_index, metric_id)
+                """.trimIndent()
+            )
+            stmt.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_request_metrics_request_id_attempt
+                ON request_metrics(request_id, attempt DESC)
+                """.trimIndent()
+            )
+            stmt.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_stage_timing_metrics_run_stage
+                ON stage_timing_metrics(run_id, stage_id, event_epoch_ms)
+                """.trimIndent()
+            )
+            stmt.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_stage_timing_metrics_request
+                ON stage_timing_metrics(request_id, event_epoch_ms, stage_metric_id)
+                """.trimIndent()
+            )
+            stmt.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_runs_last_updated
+                ON runs(last_updated_epoch_ms DESC)
+                """.trimIndent()
+            )
+            stmt.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_scheduler_events_epoch
+                ON scheduler_events(event_epoch_ms DESC, event_id DESC)
+                """.trimIndent()
+            )
+            stmt.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_worker_telemetry_epoch
+                ON worker_telemetry(observed_epoch_ms DESC, telemetry_id DESC)
+                """.trimIndent()
+            )
+            stmt.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_worker_telemetry_device_epoch
+                ON worker_telemetry(device_id, observed_epoch_ms DESC, telemetry_id DESC)
                 """.trimIndent()
             )
         }
@@ -643,6 +1112,303 @@ class CoordinatorPersistence(
                 }
                 return rs.getString("meta_value").toLongOrNull()
             }
+        }
+    }
+
+    private fun nextMetricAttempt(conn: Connection, requestId: String): Int {
+        conn.prepareStatement(
+            "SELECT COALESCE(MAX(attempt), 0) + 1 AS next_attempt FROM request_metrics WHERE request_id = ?"
+        ).use { stmt ->
+            stmt.setString(1, requestId)
+            stmt.executeQuery().use { rs ->
+                return if (rs.next()) rs.getInt("next_attempt") else 1
+            }
+        }
+    }
+
+    private fun listRunMetrics(
+        conn: Connection,
+        runId: String,
+        metricLimit: Int
+    ): List<PersistedRequestMetric> {
+        conn.prepareStatement(
+            """
+            SELECT
+              metric_id,
+              run_id,
+              request_id,
+              request_index,
+              attempt,
+              batch_id,
+              eval_only,
+              submitted_epoch_ms,
+              completed_epoch_ms,
+              elapsed_ms,
+              success,
+              terminal,
+              processed_stage_id,
+              processed_chunk_idx,
+              output_hidden_bytes,
+              output_shift_log_p_bytes,
+              local_loss,
+              token_correct,
+              token_count,
+              message
+            FROM request_metrics
+            WHERE run_id = ?
+            ORDER BY
+              CASE WHEN request_index IS NULL THEN 1 ELSE 0 END,
+              request_index ASC,
+              metric_id ASC
+            LIMIT ?
+            """.trimIndent()
+        ).use { stmt ->
+            stmt.setString(1, runId)
+            stmt.setInt(2, metricLimit)
+            stmt.executeQuery().use { rs ->
+                return buildList {
+                    while (rs.next()) {
+                        add(rs.toPersistedRequestMetric())
+                    }
+                }
+            }
+        }
+    }
+
+    private fun listStageTimingMetrics(
+        conn: Connection,
+        runId: String,
+        metricLimit: Int
+    ): List<PersistedStageTimingMetric> {
+        conn.prepareStatement(
+            """
+            SELECT
+              stage_metric_id,
+              request_event_id,
+              run_id,
+              request_id,
+              batch_id,
+              chunk_idx,
+              stage_id,
+              node_id,
+              event_type,
+              event_epoch_ms,
+              runtime,
+              method,
+              input_count,
+              eval_only,
+              optimizer_step_applied,
+              local_loss,
+              local_ms,
+              input_build_ms,
+              execute_ms,
+              gradients_ms,
+              optimizer_create_ms,
+              optimizer_step_ms,
+              output_convert_ms,
+              total_measured_ms,
+              forward_ms,
+              total_stage_ms,
+              output_bytes,
+              message
+            FROM stage_timing_metrics
+            WHERE run_id = ?
+            ORDER BY event_epoch_ms ASC, stage_metric_id ASC
+            LIMIT ?
+            """.trimIndent()
+        ).use { stmt ->
+            stmt.setString(1, runId)
+            stmt.setInt(2, metricLimit)
+            stmt.executeQuery().use { rs ->
+                return buildList {
+                    while (rs.next()) {
+                        add(rs.toPersistedStageTimingMetric())
+                    }
+                }
+            }
+        }
+    }
+
+    private fun insertStageTimingMetric(conn: Connection, timing: PersistedStageTimingMetric) {
+        conn.prepareStatement(
+            """
+            INSERT INTO stage_timing_metrics (
+              request_event_id,
+              run_id,
+              request_id,
+              batch_id,
+              chunk_idx,
+              stage_id,
+              node_id,
+              event_type,
+              event_epoch_ms,
+              runtime,
+              method,
+              input_count,
+              eval_only,
+              optimizer_step_applied,
+              local_loss,
+              local_ms,
+              input_build_ms,
+              execute_ms,
+              gradients_ms,
+              optimizer_create_ms,
+              optimizer_step_ms,
+              output_convert_ms,
+              total_measured_ms,
+              forward_ms,
+              total_stage_ms,
+              output_bytes,
+              message
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """.trimIndent()
+        ).use { stmt ->
+            stmt.setLong(1, timing.requestEventId)
+            stmt.setString(2, timing.runId)
+            stmt.setString(3, timing.requestId)
+            stmt.setInt(4, timing.batchId)
+            stmt.setInt(5, timing.chunkIdx)
+            stmt.setInt(6, timing.stageId)
+            stmt.setInt(7, timing.nodeId)
+            stmt.setString(8, timing.eventType)
+            stmt.setLong(9, timing.eventEpochMs)
+            stmt.setString(10, timing.runtime)
+            stmt.setString(11, timing.method)
+            setNullableInt(stmt, 12, timing.inputCount)
+            setNullableBoolean(stmt, 13, timing.evalOnly)
+            setNullableBoolean(stmt, 14, timing.optimizerStepApplied)
+            setNullableFloat(stmt, 15, timing.localLoss)
+            setNullableLong(stmt, 16, timing.localMs)
+            setNullableLong(stmt, 17, timing.inputBuildMs)
+            setNullableLong(stmt, 18, timing.executeMs)
+            setNullableLong(stmt, 19, timing.gradientsMs)
+            setNullableLong(stmt, 20, timing.optimizerCreateMs)
+            setNullableLong(stmt, 21, timing.optimizerStepMs)
+            setNullableLong(stmt, 22, timing.outputConvertMs)
+            setNullableLong(stmt, 23, timing.totalMeasuredMs)
+            setNullableLong(stmt, 24, timing.forwardMs)
+            setNullableLong(stmt, 25, timing.totalStageMs)
+            setNullableInt(stmt, 26, timing.outputBytes)
+            stmt.setString(27, timing.message)
+            stmt.executeUpdate()
+        }
+    }
+
+    private fun parseStageTimingMetric(event: PersistedRequestEvent): PersistedStageTimingMetric? {
+        if (event.eventType !in setOf("LOCAL_COMPLETED", "FORWARDING", "COMPLETED")) {
+            return null
+        }
+        val pairs = parseKeyValuePairs(event.message)
+        val hasTiming =
+            pairs.containsKey("localMs") ||
+                pairs.containsKey("executeMs") ||
+                pairs.containsKey("forwardMs") ||
+                pairs.containsKey("totalStageMs")
+        if (!hasTiming) {
+            return null
+        }
+        return PersistedStageTimingMetric(
+            requestEventId = event.eventId,
+            runId = inferRunId(event.requestId),
+            requestId = event.requestId,
+            batchId = event.batchId,
+            chunkIdx = event.chunkIdx,
+            stageId = event.stageId,
+            nodeId = event.nodeId,
+            eventType = event.eventType,
+            eventEpochMs = event.eventEpochMs,
+            runtime = pairs["runtime"],
+            method = pairs["method"],
+            inputCount = pairs["inputs"]?.toIntOrNull(),
+            evalOnly = pairs["evalOnly"]?.toBooleanStrictOrNull(),
+            optimizerStepApplied = pairs["optimizerStepApplied"]?.toBooleanStrictOrNull(),
+            localLoss = pairs["loss"]?.toFloatOrNull(),
+            localMs = pairs["localMs"]?.toLongOrNull(),
+            inputBuildMs = pairs["inputBuildMs"]?.toLongOrNull(),
+            executeMs = pairs["executeMs"]?.toLongOrNull(),
+            gradientsMs = pairs["gradientsMs"]?.toLongOrNull(),
+            optimizerCreateMs = pairs["optimizerCreateMs"]?.toLongOrNull(),
+            optimizerStepMs = pairs["optimizerStepMs"]?.toLongOrNull(),
+            outputConvertMs = pairs["outputConvertMs"]?.toLongOrNull(),
+            totalMeasuredMs = pairs["totalMeasuredMs"]?.toLongOrNull(),
+            forwardMs = pairs["forwardMs"]?.toLongOrNull(),
+            totalStageMs = pairs["totalStageMs"]?.toLongOrNull(),
+            outputBytes = pairs["bytes"]?.toIntOrNull(),
+            message = event.message
+        )
+    }
+
+    private fun parseKeyValuePairs(message: String): Map<String, String> {
+        return KEY_VALUE_PATTERN.findAll(message)
+            .associate { match -> match.groupValues[1] to match.groupValues[2] }
+    }
+
+    private fun runSummarySelect(whereClause: String, orderLimitClause: String): String {
+        return """
+            SELECT
+              r.run_id,
+              r.pipeline_name,
+              r.model_shards,
+              r.config_hash,
+              r.first_seen_epoch_ms,
+              r.last_updated_epoch_ms,
+              COUNT(m.metric_id) AS request_rows,
+              COALESCE(SUM(CASE WHEN m.success = 1 AND m.terminal = 1 THEN 1 ELSE 0 END), 0) AS success_rows,
+              COALESCE(SUM(CASE WHEN m.success = 0 OR m.terminal = 0 THEN 1 ELSE 0 END), 0) AS failed_rows,
+              COALESCE(SUM(CASE WHEN m.eval_only = 1 THEN 1 ELSE 0 END), 0) AS eval_only_rows,
+              COALESCE(SUM(CASE WHEN m.eval_only = 0 THEN 1 ELSE 0 END), 0) AS train_rows,
+              AVG(CASE WHEN m.success = 1 AND m.terminal = 1 THEN m.elapsed_ms END) AS avg_elapsed_ms,
+              AVG(CASE WHEN m.success = 1 AND m.terminal = 1 THEN m.local_loss END) AS avg_loss,
+              COALESCE(SUM(CASE WHEN m.success = 1 AND m.terminal = 1 THEN m.token_correct ELSE 0 END), 0) AS token_correct,
+              COALESCE(SUM(CASE WHEN m.success = 1 AND m.terminal = 1 THEN m.token_count ELSE 0 END), 0) AS token_count
+            FROM runs r
+            LEFT JOIN (
+              SELECT rm.*
+              FROM request_metrics rm
+              INNER JOIN (
+                SELECT run_id, request_id, MAX(metric_id) AS latest_metric_id
+                FROM request_metrics
+                GROUP BY run_id, request_id
+              ) latest
+                ON latest.run_id = rm.run_id
+               AND latest.request_id = rm.request_id
+               AND latest.latest_metric_id = rm.metric_id
+            ) m ON m.run_id = r.run_id
+            $whereClause
+            GROUP BY r.run_id
+            $orderLimitClause
+        """.trimIndent()
+    }
+
+    private fun setNullableInt(stmt: java.sql.PreparedStatement, index: Int, value: Int?) {
+        if (value == null) {
+            stmt.setNull(index, java.sql.Types.INTEGER)
+        } else {
+            stmt.setInt(index, value)
+        }
+    }
+
+    private fun setNullableLong(stmt: java.sql.PreparedStatement, index: Int, value: Long?) {
+        if (value == null) {
+            stmt.setNull(index, java.sql.Types.INTEGER)
+        } else {
+            stmt.setLong(index, value)
+        }
+    }
+
+    private fun setNullableFloat(stmt: java.sql.PreparedStatement, index: Int, value: Float?) {
+        if (value == null) {
+            stmt.setNull(index, java.sql.Types.REAL)
+        } else {
+            stmt.setFloat(index, value)
+        }
+    }
+
+    private fun setNullableBoolean(stmt: java.sql.PreparedStatement, index: Int, value: Boolean?) {
+        if (value == null) {
+            stmt.setNull(index, java.sql.Types.INTEGER)
+        } else {
+            stmt.setInt(index, if (value) 1 else 0)
         }
     }
 
@@ -706,6 +1472,127 @@ class CoordinatorPersistence(
         )
     }
 
+    private fun ResultSet.toAdminSchedulerEventSnapshot(): AdminSchedulerEventSnapshot {
+        val stage = getInt("stage_id").takeIf { !wasNull() }
+        val node = getInt("node_id").takeIf { !wasNull() }
+        val device = getString("device_id").takeIf { !wasNull() }
+        return AdminSchedulerEventSnapshot(
+            eventId = getLong("event_id"),
+            eventEpochMs = getLong("event_epoch_ms"),
+            action = getString("action"),
+            stageId = stage,
+            nodeId = node,
+            deviceId = device,
+            reason = getString("reason"),
+            message = getString("message")
+        )
+    }
+
+    private fun ResultSet.toPersistedRequestMetric(): PersistedRequestMetric {
+        val requestIndex = getInt("request_index").takeIf { !wasNull() }
+        val localLoss = getFloat("local_loss").takeIf { !wasNull() }
+        return PersistedRequestMetric(
+            metricId = getLong("metric_id"),
+            runId = getString("run_id"),
+            requestId = getString("request_id"),
+            requestIndex = requestIndex,
+            attempt = getInt("attempt"),
+            batchId = getInt("batch_id"),
+            evalOnly = getInt("eval_only") != 0,
+            submittedEpochMs = getLong("submitted_epoch_ms"),
+            completedEpochMs = getLong("completed_epoch_ms"),
+            elapsedMs = getLong("elapsed_ms"),
+            success = getInt("success") != 0,
+            terminal = getInt("terminal") != 0,
+            processedStageId = getInt("processed_stage_id"),
+            processedChunkIdx = getInt("processed_chunk_idx"),
+            outputHiddenBytes = getInt("output_hidden_bytes"),
+            outputShiftLogPBytes = getInt("output_shift_log_p_bytes"),
+            localLoss = localLoss,
+            tokenCorrect = getInt("token_correct"),
+            tokenCount = getInt("token_count"),
+            message = getString("message")
+        )
+    }
+
+    private fun ResultSet.toPersistedRunSummary(): PersistedRunSummary {
+        val avgElapsed = getDouble("avg_elapsed_ms").takeIf { !wasNull() }
+        val avgLoss = getDouble("avg_loss").takeIf { !wasNull() }
+        return PersistedRunSummary(
+            runId = getString("run_id"),
+            pipelineName = getString("pipeline_name"),
+            modelShards = getString("model_shards"),
+            configHash = getString("config_hash"),
+            firstSeenEpochMs = getLong("first_seen_epoch_ms"),
+            lastUpdatedEpochMs = getLong("last_updated_epoch_ms"),
+            requestRows = getInt("request_rows"),
+            successRows = getInt("success_rows"),
+            failedRows = getInt("failed_rows"),
+            evalOnlyRows = getInt("eval_only_rows"),
+            trainRows = getInt("train_rows"),
+            avgElapsedMs = avgElapsed,
+            avgLoss = avgLoss,
+            tokenCorrect = getLong("token_correct"),
+            tokenCount = getLong("token_count")
+        )
+    }
+
+    private fun ResultSet.toPersistedStageTimingMetric(): PersistedStageTimingMetric {
+        return PersistedStageTimingMetric(
+            stageMetricId = getLong("stage_metric_id"),
+            requestEventId = getLong("request_event_id"),
+            runId = getString("run_id"),
+            requestId = getString("request_id"),
+            batchId = getInt("batch_id"),
+            chunkIdx = getInt("chunk_idx"),
+            stageId = getInt("stage_id"),
+            nodeId = getInt("node_id"),
+            eventType = getString("event_type"),
+            eventEpochMs = getLong("event_epoch_ms"),
+            runtime = getString("runtime").takeIf { !wasNull() },
+            method = getString("method").takeIf { !wasNull() },
+            inputCount = getInt("input_count").takeIf { !wasNull() },
+            evalOnly = getInt("eval_only").takeIf { !wasNull() }?.let { it != 0 },
+            optimizerStepApplied = getInt("optimizer_step_applied").takeIf { !wasNull() }?.let { it != 0 },
+            localLoss = getFloat("local_loss").takeIf { !wasNull() },
+            localMs = getLong("local_ms").takeIf { !wasNull() },
+            inputBuildMs = getLong("input_build_ms").takeIf { !wasNull() },
+            executeMs = getLong("execute_ms").takeIf { !wasNull() },
+            gradientsMs = getLong("gradients_ms").takeIf { !wasNull() },
+            optimizerCreateMs = getLong("optimizer_create_ms").takeIf { !wasNull() },
+            optimizerStepMs = getLong("optimizer_step_ms").takeIf { !wasNull() },
+            outputConvertMs = getLong("output_convert_ms").takeIf { !wasNull() },
+            totalMeasuredMs = getLong("total_measured_ms").takeIf { !wasNull() },
+            forwardMs = getLong("forward_ms").takeIf { !wasNull() },
+            totalStageMs = getLong("total_stage_ms").takeIf { !wasNull() },
+            outputBytes = getInt("output_bytes").takeIf { !wasNull() },
+            message = getString("message")
+        )
+    }
+
+    private fun ResultSet.toPersistedWorkerTelemetry(): PersistedWorkerTelemetry {
+        return PersistedWorkerTelemetry(
+            telemetryId = getLong("telemetry_id"),
+            observedEpochMs = getLong("observed_epoch_ms"),
+            deviceId = getString("device_id"),
+            nodeId = getInt("node_id"),
+            stageId = getInt("stage_id"),
+            isActive = getInt("is_active") != 0,
+            batteryLevel = getFloat("battery_level"),
+            isCharging = getInt("is_charging") != 0,
+            powerSource = getString("power_source"),
+            batteryStatus = getInt("battery_status"),
+            batteryTempC = getFloat("battery_temp_c").takeIf { !wasNull() },
+            batteryVoltageMv = getInt("battery_voltage_mv").takeIf { !wasNull() },
+            batteryCurrentUa = getLong("battery_current_ua").takeIf { !wasNull() },
+            thermalStatus = getString("thermal_status"),
+            appPssKb = getLong("app_pss_kb").takeIf { !wasNull() },
+            appPrivateDirtyKb = getLong("app_private_dirty_kb").takeIf { !wasNull() },
+            runtimeUsedMemoryKb = getLong("runtime_used_memory_kb").takeIf { !wasNull() },
+            workerState = getString("worker_state")
+        )
+    }
+
     private fun PersistedRequestState.toAdminSnapshot(): AdminRequestStateSnapshot {
         return AdminRequestStateSnapshot(
             requestId = requestId,
@@ -742,5 +1629,89 @@ class CoordinatorPersistence(
             eventEpochMs = eventEpochMs,
             terminal = terminal
         )
+    }
+
+    private fun PersistedRequestMetric.toAdminSnapshot(): AdminRequestMetricSnapshot {
+        return AdminRequestMetricSnapshot(
+            metricId = metricId,
+            runId = runId,
+            requestId = requestId,
+            requestIndex = requestIndex,
+            attempt = attempt,
+            batchId = batchId,
+            evalOnly = evalOnly,
+            submittedEpochMs = submittedEpochMs,
+            completedEpochMs = completedEpochMs,
+            elapsedMs = elapsedMs,
+            success = success,
+            terminal = terminal,
+            processedStageId = processedStageId,
+            processedChunkIdx = processedChunkIdx,
+            outputHiddenBytes = outputHiddenBytes,
+            outputShiftLogPBytes = outputShiftLogPBytes,
+            localLoss = localLoss,
+            tokenCorrect = tokenCorrect,
+            tokenCount = tokenCount,
+            tokenAccuracy = if (tokenCount == 0) 0.0 else tokenCorrect.toDouble() / tokenCount.toDouble(),
+            message = message
+        )
+    }
+
+    private fun PersistedRunSummary.toAdminSnapshot(): AdminRunSummarySnapshot {
+        return AdminRunSummarySnapshot(
+            runId = runId,
+            pipelineName = pipelineName,
+            modelShards = modelShards,
+            configHash = configHash,
+            firstSeenEpochMs = firstSeenEpochMs,
+            lastUpdatedEpochMs = lastUpdatedEpochMs,
+            requestRows = requestRows,
+            successRows = successRows,
+            failedRows = failedRows,
+            evalOnlyRows = evalOnlyRows,
+            trainRows = trainRows,
+            avgElapsedMs = avgElapsedMs,
+            avgLoss = avgLoss,
+            tokenCorrect = tokenCorrect,
+            tokenCount = tokenCount,
+            tokenAccuracy = tokenAccuracy
+        )
+    }
+
+    private fun PersistedStageTimingMetric.toAdminSnapshot(): AdminStageTimingMetricSnapshot {
+        return AdminStageTimingMetricSnapshot(
+            stageMetricId = stageMetricId,
+            requestEventId = requestEventId,
+            runId = runId,
+            requestId = requestId,
+            batchId = batchId,
+            chunkIdx = chunkIdx,
+            stageId = stageId,
+            nodeId = nodeId,
+            eventType = eventType,
+            eventEpochMs = eventEpochMs,
+            runtime = runtime,
+            method = method,
+            inputCount = inputCount,
+            evalOnly = evalOnly,
+            optimizerStepApplied = optimizerStepApplied,
+            localLoss = localLoss,
+            localMs = localMs,
+            inputBuildMs = inputBuildMs,
+            executeMs = executeMs,
+            gradientsMs = gradientsMs,
+            optimizerCreateMs = optimizerCreateMs,
+            optimizerStepMs = optimizerStepMs,
+            outputConvertMs = outputConvertMs,
+            totalMeasuredMs = totalMeasuredMs,
+            forwardMs = forwardMs,
+            totalStageMs = totalStageMs,
+            outputBytes = outputBytes,
+            message = message
+        )
+    }
+
+    private companion object {
+        private val KEY_VALUE_PATTERN = Regex("""([A-Za-z][A-Za-z0-9_]*)=([^,\s]+)""")
     }
 }

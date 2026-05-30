@@ -112,3 +112,104 @@ data class AdminRequestDetailSnapshot(
     val state: AdminRequestStateSnapshot?,
     val events: List<AdminRequestEventSnapshot>
 )
+
+data class AdminRunSummarySnapshot(
+    val runId: String,
+    val pipelineName: String,
+    val modelShards: String,
+    val configHash: String,
+    val firstSeenEpochMs: Long,
+    val lastUpdatedEpochMs: Long,
+    val requestRows: Int,
+    val successRows: Int,
+    val failedRows: Int,
+    val evalOnlyRows: Int,
+    val trainRows: Int,
+    val avgElapsedMs: Double?,
+    val avgLoss: Double?,
+    val tokenCorrect: Long,
+    val tokenCount: Long,
+    val tokenAccuracy: Double
+)
+
+data class AdminRequestMetricSnapshot(
+    val metricId: Long,
+    val runId: String,
+    val requestId: String,
+    val requestIndex: Int?,
+    val attempt: Int,
+    val batchId: Int,
+    val evalOnly: Boolean,
+    val submittedEpochMs: Long,
+    val completedEpochMs: Long,
+    val elapsedMs: Long,
+    val success: Boolean,
+    val terminal: Boolean,
+    val processedStageId: Int,
+    val processedChunkIdx: Int,
+    val outputHiddenBytes: Int,
+    val outputShiftLogPBytes: Int,
+    val localLoss: Float?,
+    val tokenCorrect: Int,
+    val tokenCount: Int,
+    val tokenAccuracy: Double,
+    val message: String
+)
+
+data class AdminStageTimingMetricSnapshot(
+    val stageMetricId: Long,
+    val requestEventId: Long,
+    val runId: String,
+    val requestId: String,
+    val batchId: Int,
+    val chunkIdx: Int,
+    val stageId: Int,
+    val nodeId: Int,
+    val eventType: String,
+    val eventEpochMs: Long,
+    val runtime: String?,
+    val method: String?,
+    val inputCount: Int?,
+    val evalOnly: Boolean?,
+    val optimizerStepApplied: Boolean?,
+    val localLoss: Float?,
+    val localMs: Long?,
+    val inputBuildMs: Long?,
+    val executeMs: Long?,
+    val gradientsMs: Long?,
+    val optimizerCreateMs: Long?,
+    val optimizerStepMs: Long?,
+    val outputConvertMs: Long?,
+    val totalMeasuredMs: Long?,
+    val forwardMs: Long?,
+    val totalStageMs: Long?,
+    val outputBytes: Int?,
+    val message: String
+)
+
+data class AdminRunDetailSnapshot(
+    val summary: AdminRunSummarySnapshot?,
+    val metrics: List<AdminRequestMetricSnapshot>,
+    val stageTimings: List<AdminStageTimingMetricSnapshot>
+)
+
+data class AdminWorkerTelemetrySnapshot(
+    val telemetryId: Long,
+    val observedEpochMs: Long,
+    val deviceId: String,
+    val nodeId: Int,
+    val stageId: Int,
+    val isActive: Boolean,
+    val batteryLevel: Float,
+    val isCharging: Boolean,
+    val powerSource: String,
+    val batteryStatus: Int,
+    val batteryTempC: Float?,
+    val batteryVoltageMv: Int?,
+    val batteryCurrentUa: Long?,
+    val thermalStatus: String,
+    val appPssKb: Long?,
+    val appPrivateDirtyKb: Long?,
+    val runtimeUsedMemoryKb: Long?,
+    val workerState: String
+)

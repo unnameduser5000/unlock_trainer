@@ -2,12 +2,13 @@ package com.example.sid_coordinator
 
 import io.grpc.ManagedChannelBuilder
 import sid.CoordinatingServiceGrpcKt
+import sid.Sid
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.Paths
 import java.time.LocalDateTime
 import java.time.format.DateTimeFormatter
-import kotlin.system.measureTimeMillis
+import java.util.concurrent.TimeUnit
 
 private data class PreparedExperimentArgs(
     val host: String,
@@ -20,7 +21,10 @@ private data class PreparedExperimentArgs(
     val minValidLabels: Int,
     val delayMs: Long,
     val evalOnly: Boolean,
-    val stopOnFailure: Boolean
+    val stopOnFailure: Boolean,
+    val transientRetryCount: Int,
+    val transientRetryDelayMs: Long,
+    val submitRpcDeadlineMs: Long
 )
 
 fun main(args: Array<String>) {
@@ -90,15 +94,19 @@ fun main(args: Array<String>) {
             val requestId = "${parsed.requestPrefix}-${indexed.index.toString().padStart(6, '0')}"
             val request = record.toForwardChunkRequest(manifestDir, requestId, parsed.evalOnly)
             var elapsedMs = 0L
+            val requestStartedAtNs = System.nanoTime()
             val response = try {
-                var received: sid.Sid.ForwardChunkResponse? = null
-                elapsedMs = measureTimeMillis {
-                    received = kotlinx.coroutines.runBlocking {
-                        stub.submitRequest(request)
-                    }
-                }
-                requireNotNull(received)
+                submitWithTransientRetries(
+                    stub = stub,
+                    request = request,
+                    requestId = requestId,
+                    recordIndex = indexed.index,
+                    retryCount = parsed.transientRetryCount,
+                    retryDelayMs = parsed.transientRetryDelayMs,
+                    submitRpcDeadlineMs = parsed.submitRpcDeadlineMs
+                )
             } catch (t: Throwable) {
+                elapsedMs = elapsedMsSince(requestStartedAtNs)
                 failed++
                 val message = "submit failed: ${t.message}"
                 rows += csvRow(
@@ -131,6 +139,7 @@ fun main(args: Array<String>) {
                 }
                 continue
             }
+            elapsedMs = elapsedMsSince(requestStartedAtNs)
 
             if (response.success && response.terminal) {
                 succeeded++
@@ -193,10 +202,13 @@ fun main(args: Array<String>) {
     println("avgLocalLoss=${if (lossRows == 0) 0.0 else totalLoss / lossRows.toDouble()}")
     println("tokenAccuracy=${if (totalTokens == 0) 0.0 else totalCorrect.toDouble() / totalTokens.toDouble()} tokens=$totalTokens")
     println("stopOnFailure=${parsed.stopOnFailure}")
+    println("transientRetryCount=${parsed.transientRetryCount} transientRetryDelayMs=${parsed.transientRetryDelayMs}")
+    println("submitRpcDeadlineMs=${parsed.submitRpcDeadlineMs}")
 }
 
 private fun parseArgs(args: Array<String>): PreparedExperimentArgs {
     val timestamp = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss"))
+    val stopOnFailure = args.getOrNull(10)?.toBooleanLenient() ?: true
     return PreparedExperimentArgs(
         host = args.getOrNull(0) ?: "127.0.0.1",
         port = args.getOrNull(1)?.toIntOrNull() ?: 50051,
@@ -210,8 +222,81 @@ private fun parseArgs(args: Array<String>): PreparedExperimentArgs {
         minValidLabels = args.getOrNull(7)?.toIntOrNull() ?: 1,
         delayMs = args.getOrNull(8)?.toLongOrNull() ?: 0L,
         evalOnly = args.getOrNull(9)?.toBooleanLenient() ?: false,
-        stopOnFailure = args.getOrNull(10)?.toBooleanLenient() ?: true
+        stopOnFailure = stopOnFailure,
+        transientRetryCount = (
+            args.getOrNull(11)?.toIntOrNull()
+                ?: if (stopOnFailure) 0 else DEFAULT_TRANSIENT_RETRY_COUNT
+        ).coerceAtLeast(0),
+        transientRetryDelayMs = (
+            args.getOrNull(12)?.toLongOrNull()
+                ?: DEFAULT_TRANSIENT_RETRY_DELAY_MS
+        ).coerceAtLeast(0L),
+        submitRpcDeadlineMs = (
+            args.getOrNull(13)?.toLongOrNull()
+                ?: DEFAULT_SUBMIT_RPC_DEADLINE_MS
+        ).coerceAtLeast(1L)
     )
+}
+
+private fun submitWithTransientRetries(
+    stub: CoordinatingServiceGrpcKt.CoordinatingServiceCoroutineStub,
+    request: Sid.ForwardChunkRequest,
+    requestId: String,
+    recordIndex: Int,
+    retryCount: Int,
+    retryDelayMs: Long,
+    submitRpcDeadlineMs: Long
+): Sid.ForwardChunkResponse {
+    var attempt = 0
+    var lastFailure: Throwable? = null
+    while (attempt <= retryCount) {
+        val attemptNumber = attempt + 1
+        val startedAtNs = System.nanoTime()
+        try {
+            val response = kotlinx.coroutines.runBlocking {
+                stub.withDeadlineAfter(submitRpcDeadlineMs, TimeUnit.MILLISECONDS)
+                    .submitRequest(request)
+            }
+            val attemptElapsedMs = elapsedMsSince(startedAtNs)
+            if (response.success || !isTransientFailure(response.message) || attempt >= retryCount) {
+                if (!response.success && isTransientFailure(response.message) && attempt >= retryCount) {
+                    println(
+                        "TRANSIENT exhausted requestId=$requestId index=$recordIndex " +
+                            "attempt=$attemptNumber/${
+                                retryCount + 1
+                            } elapsedMs=$attemptElapsedMs message=${response.message}"
+                    )
+                }
+                return response
+            }
+            println(
+                "TRANSIENT retry requestId=$requestId index=$recordIndex " +
+                    "attempt=$attemptNumber/${retryCount + 1} elapsedMs=$attemptElapsedMs " +
+                    "delayMs=$retryDelayMs message=${response.message}"
+            )
+        } catch (t: Throwable) {
+            lastFailure = t
+            val attemptElapsedMs = elapsedMsSince(startedAtNs)
+            if (!isTransientFailure(t.message.orEmpty()) || attempt >= retryCount) {
+                throw t
+            }
+            println(
+                "TRANSIENT retry requestId=$requestId index=$recordIndex " +
+                    "attempt=$attemptNumber/${retryCount + 1} elapsedMs=$attemptElapsedMs " +
+                    "delayMs=$retryDelayMs exception=${t.message}"
+            )
+        }
+        attempt++
+        if (retryDelayMs > 0) {
+            Thread.sleep(retryDelayMs)
+        }
+    }
+    throw lastFailure ?: IllegalStateException("submit failed after transient retries")
+}
+
+private fun isTransientFailure(message: String): Boolean {
+    val normalized = message.lowercase()
+    return TRANSIENT_FAILURE_MARKERS.any { normalized.contains(it) }
 }
 
 private fun csvRow(
@@ -270,3 +355,26 @@ private fun String.toBooleanLenient(): Boolean {
         equals("eval", ignoreCase = true) ||
         equals("eval_only", ignoreCase = true)
 }
+
+private fun elapsedMsSince(startedAtNs: Long): Long {
+    return ((System.nanoTime() - startedAtNs) / 1_000_000L).coerceAtLeast(0L)
+}
+
+private const val DEFAULT_TRANSIENT_RETRY_COUNT = 18
+private const val DEFAULT_TRANSIENT_RETRY_DELAY_MS = 10_000L
+private const val DEFAULT_SUBMIT_RPC_DEADLINE_MS = 420_000L
+
+private val TRANSIENT_FAILURE_MARKERS = listOf(
+    "has no live worker",
+    "downstream route is not ready",
+    "no downstream node connected",
+    "coordinator dispatch to stage 0 failed",
+    "downstream forwarding failed",
+    "connection reset",
+    "connection refused",
+    "broken pipe",
+    "unavailable",
+    "deadline exceeded",
+    "timeout",
+    "timed out"
+)
