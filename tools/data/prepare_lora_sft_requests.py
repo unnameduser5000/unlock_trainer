@@ -178,6 +178,28 @@ def format_example(
     return "", text
 
 
+def label_choice_texts(dataset_name: str, response_style: str) -> list[str]:
+    if response_style != "label":
+        return []
+    if dataset_name == "glue" or "rotten_tomatoes" in dataset_name:
+        return [" positive", " negative"]
+    if "ag_news" in dataset_name:
+        return [" World", " Sports", " Business", " Science and Technology"]
+    return []
+
+
+def build_label_choices(tokenizer, dataset_name: str, response_style: str) -> list[dict[str, Any]]:
+    choices = []
+    for text in label_choice_texts(dataset_name, response_style):
+        choices.append(
+            {
+                "text": text,
+                "token_ids": tokenizer(text, add_special_tokens=False)["input_ids"],
+            }
+        )
+    return choices
+
+
 def build_token_tensors(
     tokenizer,
     prompt: str,
@@ -347,6 +369,7 @@ def main() -> None:
     model = AutoModelForCausalLM.from_pretrained(resolved_model, torch_dtype=torch.float32)
     model.eval()
     embedding = model.get_input_embeddings()
+    label_choices = build_label_choices(tokenizer, dataset_name, args.response_style)
 
     print(f"Loading dataset: {dataset_name} config={dataset_config} split={dataset_split}")
     if dataset_name == "toy":
@@ -419,6 +442,7 @@ def main() -> None:
                 "prompt_token_count": prompt_token_count,
                 "valid_label_count": valid_label_count,
                 "learning_rate": args.learning_rate if args.learning_rate > 0 else None,
+                "label_choices": label_choices or None,
                 "tensors": {
                     "hidden_states": tensor_record(args.output_dir, hidden_path, "float32", list(hidden_states.shape)),
                     "attention_mask": tensor_record(args.output_dir, mask_path, "float32", list(attention_mask.shape)),
@@ -458,6 +482,7 @@ def main() -> None:
         "max_prompt_tokens": args.max_prompt_tokens,
         "min_valid_labels": args.min_valid_labels,
         "learning_rate": args.learning_rate if args.learning_rate > 0 else None,
+        "label_choices": label_choices or None,
         "manifest": manifest_path.name,
     }
     metadata_path.write_text(json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8")

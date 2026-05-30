@@ -30,7 +30,11 @@ fun main(args: Array<String>) {
             stub.submitRequest(request)
         }
         val metrics = if (response.success && response.terminal) {
-            computeShiftedTokenPredictionMetrics(response.outputShiftLogP, request.labels)
+            computeShiftedTokenPredictionMetrics(
+                response.outputShiftLogP,
+                request.labels,
+                record.singleTokenLabelChoices()
+            )
         } else {
             TokenPredictionMetrics(correct = 0, count = 0)
         }
@@ -50,6 +54,9 @@ fun main(args: Array<String>) {
         println("tokenCorrect=${metrics.correct}")
         println("tokenCount=${metrics.count}")
         println("tokenAccuracy=${metrics.accuracy}")
+        println("labelChoiceCorrect=${metrics.labelChoiceCorrect}")
+        println("labelChoiceCount=${metrics.labelChoiceCount}")
+        println("labelChoiceAccuracy=${metrics.labelChoiceAccuracy}")
     } finally {
         channel.shutdownNow()
     }

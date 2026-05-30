@@ -59,10 +59,15 @@ private data class PipelineResult(
     val localLoss: Float,
     val tokenCorrect: Int,
     val tokenCount: Int,
+    val labelChoiceCorrect: Int,
+    val labelChoiceCount: Int,
     val message: String
 ) {
     val tokenAccuracy: Double
         get() = if (tokenCount == 0) 0.0 else tokenCorrect.toDouble() / tokenCount.toDouble()
+
+    val labelChoiceAccuracy: Double
+        get() = if (labelChoiceCount == 0) 0.0 else labelChoiceCorrect.toDouble() / labelChoiceCount.toDouble()
 
     val countedSuccess: Boolean
         get() = success && terminal
@@ -150,7 +155,9 @@ fun main(args: Array<String>) = runBlocking {
                 "requestId=${result.requestId} seq=${result.submissionSeq} index=${result.recordIndex} " +
                     "validLabels=${result.validLabels} evalOnly=${result.evalOnly} success=${result.success} " +
                     "terminal=${result.terminal} elapsedMs=${result.elapsedMs} loss=${result.localLoss} " +
-                    "tokenAccuracy=${result.tokenAccuracy} tokens=${result.tokenCount} message=${result.message}"
+                    "tokenAccuracy=${result.tokenAccuracy} tokens=${result.tokenCount} " +
+                    "labelChoiceAccuracy=${result.labelChoiceAccuracy} labelChoiceTokens=${result.labelChoiceCount} " +
+                    "message=${result.message}"
             )
 
             if ((!result.countedSuccess) && parsed.stopOnFailure) {
@@ -172,6 +179,8 @@ fun main(args: Array<String>) = runBlocking {
     val lossRows = results.count { it.countedSuccess }
     val totalCorrect = results.sumOf { it.tokenCorrect }
     val totalTokens = results.sumOf { it.tokenCount }
+    val totalLabelChoiceCorrect = results.sumOf { it.labelChoiceCorrect }
+    val totalLabelChoiceTokens = results.sumOf { it.labelChoiceCount }
 
     println("manifest=$manifestPath")
     println("outputCsv=$outputPath")
@@ -179,6 +188,11 @@ fun main(args: Array<String>) = runBlocking {
     println("selected=${submissions.size} submitted=$submitted skipped=$skipped succeeded=$succeeded failed=$failed")
     println("avgLocalLoss=${if (lossRows == 0) 0.0 else totalLoss / lossRows.toDouble()}")
     println("tokenAccuracy=${if (totalTokens == 0) 0.0 else totalCorrect.toDouble() / totalTokens.toDouble()} tokens=$totalTokens")
+    println(
+        "labelChoiceAccuracy=${
+            if (totalLabelChoiceTokens == 0) 0.0 else totalLabelChoiceCorrect.toDouble() / totalLabelChoiceTokens.toDouble()
+        } labelChoiceTokens=$totalLabelChoiceTokens"
+    )
     println("stopOnFailure=${parsed.stopOnFailure}")
     println("transientRetryCount=${parsed.transientRetryCount} transientRetryDelayMs=${parsed.transientRetryDelayMs}")
     println("submitRpcDeadlineMs=${parsed.submitRpcDeadlineMs}")
@@ -208,7 +222,11 @@ private suspend fun runPipelineSubmission(
         )
         val completedEpochMs = System.currentTimeMillis()
         val metrics = if (response.success && response.terminal) {
-            computeShiftedTokenPredictionMetrics(response.outputShiftLogP, request.labels)
+            computeShiftedTokenPredictionMetrics(
+                response.outputShiftLogP,
+                request.labels,
+                record.singleTokenLabelChoices()
+            )
         } else {
             TokenPredictionMetrics(correct = 0, count = 0)
         }
@@ -231,6 +249,8 @@ private suspend fun runPipelineSubmission(
             localLoss = response.localLoss,
             tokenCorrect = metrics.correct,
             tokenCount = metrics.count,
+            labelChoiceCorrect = metrics.labelChoiceCorrect,
+            labelChoiceCount = metrics.labelChoiceCount,
             message = response.message
         )
     } catch (t: Throwable) {
@@ -253,6 +273,8 @@ private suspend fun runPipelineSubmission(
             localLoss = 0f,
             tokenCorrect = 0,
             tokenCount = 0,
+            labelChoiceCorrect = 0,
+            labelChoiceCount = 0,
             message = "submit failed: ${t.message}"
         )
     }
@@ -371,6 +393,9 @@ private fun PipelineResult.toCsvRow(): String {
         tokenCorrect.toString(),
         tokenCount.toString(),
         tokenAccuracy.toString(),
+        labelChoiceCorrect.toString(),
+        labelChoiceCount.toString(),
+        labelChoiceAccuracy.toString(),
         message
     ).joinToString(",") { it.csvEscape() }
 }
@@ -426,6 +451,9 @@ private val PIPELINE_CSV_HEADER = listOf(
     "token_correct",
     "token_count",
     "token_accuracy",
+    "label_choice_correct",
+    "label_choice_count",
+    "label_choice_accuracy",
     "message"
 ).joinToString(",")
 

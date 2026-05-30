@@ -15,6 +15,11 @@ data class PreparedTensorRecord(
     val shape: List<Int>
 )
 
+data class PreparedLabelChoice(
+    val text: String? = null,
+    val token_ids: List<Int> = emptyList()
+)
+
 data class PreparedRequestRecord(
     val request_id: String,
     val batch_id: Int = 1,
@@ -26,6 +31,7 @@ data class PreparedRequestRecord(
     val prompt_token_count: Int? = null,
     val valid_label_count: Int? = null,
     val learning_rate: Float? = null,
+    val label_choices: List<PreparedLabelChoice>? = null,
     val tensors: Map<String, PreparedTensorRecord>
 )
 
@@ -36,10 +42,15 @@ data class IndexedPreparedRequestRecord(
 
 data class TokenPredictionMetrics(
     val correct: Int,
-    val count: Int
+    val count: Int,
+    val labelChoiceCorrect: Int = 0,
+    val labelChoiceCount: Int = 0
 ) {
     val accuracy: Double
         get() = if (count == 0) 0.0 else correct.toDouble() / count.toDouble()
+
+    val labelChoiceAccuracy: Double
+        get() = if (labelChoiceCount == 0) 0.0 else labelChoiceCorrect.toDouble() / labelChoiceCount.toDouble()
 }
 
 fun readManifestRecord(path: Path, index: Int): PreparedRequestRecord {
@@ -103,7 +114,8 @@ fun PreparedRequestRecord.countValidLabels(manifestDir: Path): Int {
 
 fun computeShiftedTokenPredictionMetrics(
     logProbs: Sid.TensorData,
-    labels: Sid.TensorData
+    labels: Sid.TensorData,
+    labelChoiceTokenIds: List<Int> = emptyList()
 ): TokenPredictionMetrics {
     if (logProbs.data.isEmpty || labels.data.isEmpty) {
         return TokenPredictionMetrics(correct = 0, count = 0)
@@ -125,6 +137,9 @@ fun computeShiftedTokenPredictionMetrics(
     val labelValues = labels.toLongArray()
     var correct = 0
     var count = 0
+    var labelChoiceCorrect = 0
+    var labelChoiceCount = 0
+    val constrainedChoices = labelChoiceTokenIds.distinct().filter { it in 0 until vocab }
     for (b in 0 until batch) {
         for (labelPos in 1 until seqLen) {
             val label = labelValues[b * seqLen + labelPos]
@@ -136,9 +151,34 @@ fun computeShiftedTokenPredictionMetrics(
                 correct++
             }
             count++
+            if (constrainedChoices.isNotEmpty() && label.toInt() in constrainedChoices) {
+                val constrainedPredicted = logProbs.argmaxAmong(
+                    batchIndex = b,
+                    positionIndex = labelPos - 1,
+                    seqLen = seqLen,
+                    vocab = vocab,
+                    choices = constrainedChoices
+                )
+                if (constrainedPredicted == label.toInt()) {
+                    labelChoiceCorrect++
+                }
+                labelChoiceCount++
+            }
         }
     }
-    return TokenPredictionMetrics(correct = correct, count = count)
+    return TokenPredictionMetrics(
+        correct = correct,
+        count = count,
+        labelChoiceCorrect = labelChoiceCorrect,
+        labelChoiceCount = labelChoiceCount
+    )
+}
+
+fun PreparedRequestRecord.singleTokenLabelChoices(): List<Int> {
+    return label_choices
+        .orEmpty()
+        .mapNotNull { choice -> choice.token_ids.singleOrNull() }
+        .distinct()
 }
 
 private fun emptyPreparedTensor(dataType: String): Sid.TensorData {
@@ -195,6 +235,46 @@ private fun Sid.TensorData.argmaxAt(
         }
 
         else -> error("Unsupported log-probs dtype '$dataType' for token accuracy.")
+    }
+    return bestIndex
+}
+
+private fun Sid.TensorData.argmaxAmong(
+    batchIndex: Int,
+    positionIndex: Int,
+    seqLen: Int,
+    vocab: Int,
+    choices: List<Int>
+): Int {
+    val bytes = data.toByteArray()
+    val base = ((batchIndex * seqLen + positionIndex) * vocab)
+    var bestIndex = choices.first()
+    var bestValue = Float.NEGATIVE_INFINITY
+
+    when (dataType.trim().lowercase()) {
+        "float32", "float" -> {
+            val buffer = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
+            for (choice in choices) {
+                val value = buffer.getFloat((base + choice) * Float.SIZE_BYTES)
+                if (value > bestValue) {
+                    bestValue = value
+                    bestIndex = choice
+                }
+            }
+        }
+
+        "float16", "half" -> {
+            val buffer = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
+            for (choice in choices) {
+                val value = halfToFloat(buffer.getShort((base + choice) * Short.SIZE_BYTES))
+                if (value > bestValue) {
+                    bestValue = value
+                    bestIndex = choice
+                }
+            }
+        }
+
+        else -> error("Unsupported log-probs dtype '$dataType' for label-choice accuracy.")
     }
     return bestIndex
 }

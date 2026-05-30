@@ -48,21 +48,48 @@ Interpretation:
 - If base is near chance and server-side LoRA can overfit but Android cannot, debug the mobile BP-free path.
 - If base is near chance and server-side LoRA also cannot overfit, change prompt/labels/LR before using phones.
 
+Probe results so far:
+
+- Train split with `--max_prompt_tokens 96` was too easy: `choice_accuracy=1.0`, `avg_choice_loss=0.0355`, while `full_vocab_accuracy=0.0`.
+- Validation split with `--max_prompt_tokens 24` is a better demo target: `choice_accuracy=0.71875`, `avg_choice_loss=0.7612`, while `full_vocab_accuracy=0.0`.
+- Therefore, do not judge this label task by full-vocab token accuracy. Use constrained `label_choice_accuracy` over the label tokens ` positive` and ` negative`.
+- Coordinator prepared-request runners now emit `label_choice_correct`, `label_choice_count`, and `label_choice_accuracy` when the JSONL records contain `label_choices`.
+
 ```bash
 python tools/data/prepare_lora_sft_requests.py \
   --model_name tinyllama \
   --dataset rotten_tomatoes \
+  --split train \
   --seq_len 128 \
   --limit 64 \
   --attention_mask causal \
   --mask_prompt \
   --response_style label \
   --no_append_eos \
-  --max_prompt_tokens 96 \
+  --max_prompt_tokens 24 \
   --min_valid_labels 1 \
   --learning_rate 3e-4 \
   --request_prefix rt-label-train \
-  --output_dir data/sft_requests/tinyllama_rotten_tomatoes128_label_train64_lr3e4
+  --output_dir data/sft_requests/tinyllama_rotten_tomatoes128_label_train64_prompt24_lr3e4
+```
+
+Optional validation set:
+
+```bash
+python tools/data/prepare_lora_sft_requests.py \
+  --model_name tinyllama \
+  --dataset rotten_tomatoes \
+  --split validation \
+  --seq_len 128 \
+  --limit 256 \
+  --attention_mask causal \
+  --mask_prompt \
+  --response_style label \
+  --no_append_eos \
+  --max_prompt_tokens 24 \
+  --min_valid_labels 1 \
+  --request_prefix rt-label-val \
+  --output_dir data/sft_requests/tinyllama_rotten_tomatoes128_label_val256_prompt24
 ```
 
 Recommended demo protocol:

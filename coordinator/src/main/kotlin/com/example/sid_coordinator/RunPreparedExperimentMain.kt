@@ -58,6 +58,9 @@ fun main(args: Array<String>) {
         "token_correct",
         "token_count",
         "token_accuracy",
+        "label_choice_correct",
+        "label_choice_count",
+        "label_choice_accuracy",
         "message"
     ).joinToString(",")
 
@@ -67,6 +70,8 @@ fun main(args: Array<String>) {
     var failed = 0
     var totalCorrect = 0
     var totalTokens = 0
+    var totalLabelChoiceCorrect = 0
+    var totalLabelChoiceTokens = 0
     var totalLoss = 0.0
     var lossRows = 0
 
@@ -126,6 +131,9 @@ fun main(args: Array<String>) {
                     0,
                     0,
                     0.0,
+                    0,
+                    0,
+                    0.0,
                     message
                 )
                 println("FAIL requestId=$requestId index=${indexed.index} elapsedMs=$elapsedMs message=$message")
@@ -147,12 +155,18 @@ fun main(args: Array<String>) {
                 failed++
             }
             val metrics = if (response.success && response.terminal) {
-                computeShiftedTokenPredictionMetrics(response.outputShiftLogP, request.labels)
+                computeShiftedTokenPredictionMetrics(
+                    response.outputShiftLogP,
+                    request.labels,
+                    record.singleTokenLabelChoices()
+                )
             } else {
                 TokenPredictionMetrics(correct = 0, count = 0)
             }
             totalCorrect += metrics.correct
             totalTokens += metrics.count
+            totalLabelChoiceCorrect += metrics.labelChoiceCorrect
+            totalLabelChoiceTokens += metrics.labelChoiceCount
             if (response.success && response.terminal) {
                 totalLoss += response.localLoss.toDouble()
                 lossRows++
@@ -175,13 +189,17 @@ fun main(args: Array<String>) {
                 metrics.correct,
                 metrics.count,
                 metrics.accuracy,
+                metrics.labelChoiceCorrect,
+                metrics.labelChoiceCount,
+                metrics.labelChoiceAccuracy,
                 response.message
             )
             println(
                 "requestId=$requestId index=${indexed.index} validLabels=$validLabels " +
                 "evalOnly=${parsed.evalOnly} success=${response.success} terminal=${response.terminal} elapsedMs=$elapsedMs " +
                     "loss=${response.localLoss} tokenAccuracy=${metrics.accuracy} " +
-                "tokens=${metrics.count} message=${response.message}"
+                    "tokens=${metrics.count} labelChoiceAccuracy=${metrics.labelChoiceAccuracy} " +
+                    "labelChoiceTokens=${metrics.labelChoiceCount} message=${response.message}"
             )
             if ((!response.success || !response.terminal) && parsed.stopOnFailure) {
                 println("stopOnFailure=true; stopping after failed requestId=$requestId index=${indexed.index}")
@@ -201,6 +219,11 @@ fun main(args: Array<String>) {
     println("submitted=$submitted skipped=$skipped succeeded=$succeeded failed=$failed")
     println("avgLocalLoss=${if (lossRows == 0) 0.0 else totalLoss / lossRows.toDouble()}")
     println("tokenAccuracy=${if (totalTokens == 0) 0.0 else totalCorrect.toDouble() / totalTokens.toDouble()} tokens=$totalTokens")
+    println(
+        "labelChoiceAccuracy=${
+            if (totalLabelChoiceTokens == 0) 0.0 else totalLabelChoiceCorrect.toDouble() / totalLabelChoiceTokens.toDouble()
+        } labelChoiceTokens=$totalLabelChoiceTokens"
+    )
     println("stopOnFailure=${parsed.stopOnFailure}")
     println("transientRetryCount=${parsed.transientRetryCount} transientRetryDelayMs=${parsed.transientRetryDelayMs}")
     println("submitRpcDeadlineMs=${parsed.submitRpcDeadlineMs}")
@@ -316,6 +339,9 @@ private fun csvRow(
     tokenCorrect: Int,
     tokenCount: Int,
     tokenAccuracy: Double,
+    labelChoiceCorrect: Int,
+    labelChoiceCount: Int,
+    labelChoiceAccuracy: Double,
     message: String
 ): String {
     return listOf(
@@ -335,6 +361,9 @@ private fun csvRow(
         tokenCorrect.toString(),
         tokenCount.toString(),
         tokenAccuracy.toString(),
+        labelChoiceCorrect.toString(),
+        labelChoiceCount.toString(),
+        labelChoiceAccuracy.toString(),
         message
     ).joinToString(",") { it.csvEscape() }
 }
