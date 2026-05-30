@@ -200,6 +200,49 @@ def build_label_choices(tokenizer, dataset_name: str, response_style: str) -> li
     return choices
 
 
+def build_candidate_indices(
+    dataset,
+    offset: int,
+    limit: int,
+    shuffle_seed: int | None,
+    balance_labels: bool,
+) -> list[int]:
+    indices = list(range(offset, len(dataset)))
+    rng = np.random.default_rng(shuffle_seed) if shuffle_seed is not None else None
+
+    if not balance_labels:
+        if rng is not None:
+            rng.shuffle(indices)
+        return indices
+
+    label_to_indices: dict[int, list[int]] = {}
+    for dataset_index in indices:
+        example = dataset[dataset_index]
+        if "label" not in example:
+            raise ValueError("--balance_labels requires dataset examples to contain a 'label' field.")
+        label = int(example["label"])
+        label_to_indices.setdefault(label, []).append(dataset_index)
+
+    if len(label_to_indices) < 2:
+        raise ValueError(f"--balance_labels found only {len(label_to_indices)} label class(es).")
+
+    for group in label_to_indices.values():
+        if rng is not None:
+            rng.shuffle(group)
+
+    labels = sorted(label_to_indices)
+    balanced: list[int] = []
+    cursor = 0
+    while len(balanced) < limit and any(label_to_indices.values()):
+        label = labels[cursor % len(labels)]
+        if label_to_indices[label]:
+            balanced.append(label_to_indices[label].pop(0))
+        cursor += 1
+        if cursor > len(labels) * (limit + len(labels)):
+            break
+    return balanced
+
+
 def build_token_tensors(
     tokenizer,
     prompt: str,
@@ -344,6 +387,17 @@ def main() -> None:
         default=0,
         help="Skip examples with fewer trainable label positions after prompt/pad masking.",
     )
+    parser.add_argument(
+        "--shuffle_seed",
+        type=int,
+        default=None,
+        help="Shuffle candidate dataset indices with this seed before applying limit.",
+    )
+    parser.add_argument(
+        "--balance_labels",
+        action="store_true",
+        help="Round-robin sample examples by integer 'label' field before applying limit.",
+    )
     args = parser.parse_args()
 
     if args.seq_len < 2:
@@ -379,6 +433,14 @@ def main() -> None:
     else:
         dataset = load_dataset(dataset_name, split=dataset_split)
 
+    candidate_indices = build_candidate_indices(
+        dataset=dataset,
+        offset=args.offset,
+        limit=args.limit,
+        shuffle_seed=args.shuffle_seed,
+        balance_labels=args.balance_labels,
+    )
+
     args.output_dir.mkdir(parents=True, exist_ok=True)
     tensor_dir = args.output_dir / "tensors"
     manifest_path = args.output_dir / "requests.jsonl"
@@ -387,8 +449,9 @@ def main() -> None:
     records_written = 0
     last_dataset_index = args.offset - 1
     with manifest_path.open("w", encoding="utf-8") as manifest:
-        dataset_index = args.offset
-        while records_written < args.limit and dataset_index < len(dataset):
+        for dataset_index in candidate_indices:
+            if records_written >= args.limit:
+                break
             last_dataset_index = dataset_index
             example = dataset[dataset_index]
             prompt, response = format_example(
@@ -411,7 +474,6 @@ def main() -> None:
                     f"Skipping dataset_index={dataset_index}: "
                     f"valid_label_count={valid_label_count} < min_valid_labels={args.min_valid_labels}"
                 )
-                dataset_index += 1
                 continue
             with torch.no_grad():
                 hidden_states = embedding(input_ids).float().cpu().numpy().astype("<f4")
@@ -456,7 +518,6 @@ def main() -> None:
             }
             manifest.write(json.dumps(record, ensure_ascii=False) + "\n")
             records_written += 1
-            dataset_index += 1
 
     if records_written < args.limit:
         print(
@@ -481,6 +542,8 @@ def main() -> None:
         "append_eos": not args.no_append_eos,
         "max_prompt_tokens": args.max_prompt_tokens,
         "min_valid_labels": args.min_valid_labels,
+        "shuffle_seed": args.shuffle_seed,
+        "balance_labels": args.balance_labels,
         "learning_rate": args.learning_rate if args.learning_rate > 0 else None,
         "label_choices": label_choices or None,
         "manifest": manifest_path.name,

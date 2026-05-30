@@ -1499,3 +1499,135 @@ The old `toy` preset still exists only as an internal overfit sanity check. Do n
 - Keep `executorch/` untracked and do not push it to the project GitHub.
 - If a phone exits, preserve the request id, coordinator request detail, `logcat`, process status, and tombstone evidence before changing code.
 - Any fix must explain why the crash happens on the observed stage and shape.
+
+## Current Label-Only Rotten Tomatoes Mobile Run
+
+Updated: 2026-05-31 00:20 Asia/Shanghai.
+
+This is the current real-device quality run. Do not reset to old Dolly or smoke tests unless the user explicitly asks.
+
+Run pointer:
+
+```powershell
+Get-Content debug_runs\CURRENT_LABEL_ONLY_RUN.txt
+# debug_runs\label-only-demo-20260531-0010
+```
+
+Coordinator:
+
+- gRPC: `127.0.0.1:50051`
+- admin HTTP: `127.0.0.1:18080`
+- stdout: `debug_runs\label-only-demo-20260531-0010\coordinator.stdout.log`
+- stderr: `debug_runs\label-only-demo-20260531-0010\coordinator.stderr.log`
+
+Active route:
+
+- stage 0: `NX809J`, `192.168.137.211:26052`, shard `tinyllama_lora_chunk_0_seq128`
+- stage 1: `Lenovo_L71091`, `192.168.137.124:26062`, shard `tinyllama_lora_chunk_1_seq128`
+- stage 2: `Pixel_10_Pro_XL`, `192.168.137.139:26052`, shard `tinyllama_lora_chunk_2_seq128`
+
+Prepared data:
+
+- train: `data\sft_requests\tinyllama_rotten_tomatoes128_label_train64_prompt24_lr3e4\requests.jsonl`
+- validation: `data\sft_requests\tinyllama_rotten_tomatoes128_label_val256_prompt24\requests.jsonl`
+- Both manifests must contain `label_choices` with exactly:
+  - `" positive"` token id `6374`
+  - `" negative"` token id `8178`
+
+Current phase:
+
+- The first `eval-before` was intentionally stopped because the prepared Rotten Tomatoes manifests were label-skewed.
+- Result CSV: `debug_runs\label-only-demo-20260531-0010\eval-before-val256-window3\results.csv`
+- At 2026-05-31 00:20 it had reached `16/256` terminal successes, `0` failures, label-choice accuracy `12/16 = 75%`.
+- At stop time it had reached about `78` terminal successes with `0` failures, but both existing manifests were all-positive:
+  - train64: `64/64` positive
+  - val256: `256/256` positive
+- Do not use this aborted all-positive run as the quality result. It only shows that the three-phone seq128 route can keep processing requests.
+- `token_accuracy` is expected to remain mostly `0.0` in this label-only setup because it checks the full-vocabulary target token. Use `label_choice_accuracy` as the meaningful binary-classification metric.
+- `local_loss` is still recorded and should be summarized as mean/std for before/after comparison.
+
+Regenerate balanced data on the server/export environment after pulling the current script update:
+
+```bash
+python tools/data/prepare_lora_sft_requests.py \
+  --model_name tinyllama \
+  --dataset rotten_tomatoes \
+  --split train \
+  --seq_len 128 \
+  --limit 64 \
+  --attention_mask causal \
+  --mask_prompt \
+  --response_style label \
+  --no_append_eos \
+  --max_prompt_tokens 24 \
+  --min_valid_labels 1 \
+  --learning_rate 0.0003 \
+  --shuffle_seed 20260531 \
+  --balance_labels \
+  --request_prefix rt-label-train-balanced \
+  --output_dir data/sft_requests/tinyllama_rotten_tomatoes128_label_train64_prompt24_lr3e4_balanced
+
+python tools/data/prepare_lora_sft_requests.py \
+  --model_name tinyllama \
+  --dataset rotten_tomatoes \
+  --split validation \
+  --seq_len 128 \
+  --limit 256 \
+  --attention_mask causal \
+  --mask_prompt \
+  --response_style label \
+  --no_append_eos \
+  --max_prompt_tokens 24 \
+  --min_valid_labels 1 \
+  --shuffle_seed 20260531 \
+  --balance_labels \
+  --request_prefix rt-label-val-balanced \
+  --output_dir data/sft_requests/tinyllama_rotten_tomatoes128_label_val256_prompt24_balanced
+```
+
+Before running, verify both manifests are balanced:
+
+```powershell
+foreach ($dir in @(
+  'tinyllama_rotten_tomatoes128_label_train64_prompt24_lr3e4_balanced',
+  'tinyllama_rotten_tomatoes128_label_val256_prompt24_balanced'
+)) {
+  $path = "data\sft_requests\$dir\requests.jsonl"
+  $items = Get-Content $path | ForEach-Object {
+    $o = $_ | ConvertFrom-Json
+    $o.text.response.Trim()
+  }
+  $items | Group-Object
+}
+```
+
+Eval-before command:
+
+```powershell
+.\gradlew.bat :coordinator:runPreparedPipelineExperiment --offline --no-daemon --args="127.0.0.1 50051 data/sft_requests/tinyllama_rotten_tomatoes128_label_val256_prompt24/requests.jsonl 0 256 debug_runs\label-only-demo-20260531-0010\eval-before-val256-window3\results.csv rt-label-eval-before-20260531-0014 1 0 true true 18 10000 420000 3"
+```
+
+After eval-before completes, run train64:
+
+```powershell
+.\gradlew.bat :coordinator:runPreparedPipelineExperiment --offline --no-daemon --args="127.0.0.1 50051 data/sft_requests/tinyllama_rotten_tomatoes128_label_train64_prompt24_lr3e4/requests.jsonl 0 64 debug_runs\label-only-demo-20260531-0010\train64-window3\results.csv rt-label-train64-window3-20260531 1 0 false true 18 10000 420000 3"
+```
+
+Then rerun the same validation manifest as `eval-after`:
+
+```powershell
+.\gradlew.bat :coordinator:runPreparedPipelineExperiment --offline --no-daemon --args="127.0.0.1 50051 data/sft_requests/tinyllama_rotten_tomatoes128_label_val256_prompt24/requests.jsonl 0 256 debug_runs\label-only-demo-20260531-0010\eval-after-val256-window3\results.csv rt-label-eval-after-20260531 1 0 true true 18 10000 420000 3"
+```
+
+Useful live checks:
+
+```powershell
+$run = Get-Content debug_runs\CURRENT_LABEL_ONLY_RUN.txt
+$evalDir = Join-Path $run 'eval-before-val256-window3'
+$rows = Import-Csv (Join-Path $evalDir 'results.csv')
+$correct = ($rows | Measure-Object -Property label_choice_correct -Sum).Sum
+$count = ($rows | Measure-Object -Property label_choice_count -Sum).Sum
+"rows=$($rows.Count) success=$(($rows | ? { $_.success -eq 'true' }).Count) failed=$(($rows | ? { $_.success -ne 'true' }).Count) label_choice=$correct/$count"
+Invoke-RestMethod http://127.0.0.1:18080/api/v1/status
+Invoke-RestMethod 'http://127.0.0.1:18080/api/v1/worker-telemetry.csv?limit=20'
+```
