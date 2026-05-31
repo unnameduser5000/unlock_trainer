@@ -2,11 +2,105 @@
 
 This file is the first file to read after any context reset.
 
-Last updated: 2026-05-30 Asia/Shanghai
+Last updated: 2026-05-31 Asia/Shanghai
 
 ## Current Mainline Position
 
 Do not restart from inference smoke or one-request smoke after a context reset. Those paths have already served their purpose.
+
+### 2026-05-31 Server-Side Label Quality Sweep
+
+Why this stage exists:
+
+- The Android phone demo has already proved the real distributed ExecuTorch training path can run, but the label-quality result is still fragile.
+- The previous `train64` choice was a phone-runtime demo budget, not an algorithmic limit. It was intentionally small so eval-before/train/eval-after could finish on phones.
+- Before spending more phone time, use the server simulation to sweep learning rate, training steps, and epochs on the same prepared request tensors.
+
+Current server sweep result supplied from `data/debug_runs/server_label_sweeps/20260531-110827`:
+
+- `lr=1e-5`: eval-after label-choice acc `0.6055`, total loss `10.5164`.
+- `lr=3e-5`: eval-after label-choice acc `0.6172`, total loss `10.2685`.
+- `lr=1e-4`: eval-after label-choice acc `0.6250`, total loss `7.9067`.
+- `lr=3e-4`: eval-after label-choice acc `0.6367`, total loss `1.8972`, but check class balance before trusting it because the Android `3e-4` run collapsed toward positive.
+
+Important interpretation:
+
+- The simulator summary `avg_loss` is the BP-free local objective, not pure binary label loss.
+- Report quality with `label_choice_accuracy`, constrained `choice_loss`, per-class accuracy, and prediction bias. Do not claim success only from a large total-loss drop.
+- The target is a quality-preserving mobile-training point: eval-after accuracy does not collapse, constrained choice loss improves, per-class accuracy remains balanced, and the number of phone steps is feasible.
+
+Implemented server sweep improvement:
+
+- `tools/sim/run_bpfree_lora_label_experiment.py` supports `--train_epochs`.
+- `tools/sim/run_bpfree_lora_label_sweep.sh` supports `TRAIN_EPOCHS=...`.
+- The summary now records `train_epochs`, `unique_train_records`, and `train_steps`.
+
+Recommended next server sweeps:
+
+```bash
+cd ~/sg-exe-trainer
+git pull --ff-only origin main
+
+DEVICE=cuda DTYPE=float32 \
+TRAIN_LIMIT=64 \
+TRAIN_EPOCHS=1 \
+LRS="1e-5 3e-5 1e-4 3e-4" \
+bash tools/sim/run_bpfree_lora_label_sweep.sh
+```
+
+Then test whether the issue is simply too few train steps:
+
+```bash
+DEVICE=cuda DTYPE=float32 \
+TRAIN_LIMIT=64 \
+TRAIN_EPOCHS=2 \
+LRS="1e-5 3e-5 1e-4" \
+OUTPUT_ROOT=debug_runs/server_label_sweeps/train64_epochs2 \
+bash tools/sim/run_bpfree_lora_label_sweep.sh
+
+DEVICE=cuda DTYPE=float32 \
+TRAIN_LIMIT=64 \
+TRAIN_EPOCHS=4 \
+LRS="1e-5 3e-5 1e-4" \
+OUTPUT_ROOT=debug_runs/server_label_sweeps/train64_epochs4 \
+bash tools/sim/run_bpfree_lora_label_sweep.sh
+```
+
+If the multi-epoch `train64` sweep overfits or becomes class-biased, generate a larger balanced train set and run one epoch:
+
+```bash
+python tools/data/prepare_lora_sft_requests.py \
+  --model_name tinyllama \
+  --dataset rotten_tomatoes \
+  --split train \
+  --seq_len 128 \
+  --limit 512 \
+  --attention_mask causal \
+  --mask_prompt \
+  --response_style label \
+  --no_append_eos \
+  --max_prompt_tokens 24 \
+  --min_valid_labels 1 \
+  --learning_rate 0.0001 \
+  --shuffle_seed 20260531 \
+  --balance_labels \
+  --request_prefix rt-label-train512-balanced \
+  --output_dir data/sft_requests/tinyllama_rotten_tomatoes128_label_train512_prompt24_lr1e4_balanced
+
+TRAIN_MANIFEST=data/sft_requests/tinyllama_rotten_tomatoes128_label_train512_prompt24_lr1e4_balanced/requests.jsonl \
+TRAIN_LIMIT=512 \
+TRAIN_EPOCHS=1 \
+LRS="1e-5 3e-5 1e-4" \
+DEVICE=cuda DTYPE=float32 \
+OUTPUT_ROOT=debug_runs/server_label_sweeps/train512 \
+bash tools/sim/run_bpfree_lora_label_sweep.sh
+```
+
+Decision rule before returning to Android:
+
+- Prefer `lr=3e-5` or `lr=1e-4` unless `3e-4` shows stable per-class validation accuracy.
+- Pick the smallest training budget that improves constrained choice loss without obvious class collapse.
+- Once chosen, export/prep the same request manifest and run the phone eval-before/train/eval-after protocol.
 
 ### 2026-05-30 Label-Only Quality Demo Pivot
 

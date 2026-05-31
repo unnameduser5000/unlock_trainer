@@ -8,6 +8,7 @@ MODEL_NAME="${MODEL_NAME:-tinyllama}"
 NUM_CHUNKS="${NUM_CHUNKS:-3}"
 TRAIN_CHUNKS="${TRAIN_CHUNKS:-all}"
 TRAIN_LIMIT="${TRAIN_LIMIT:-64}"
+TRAIN_EPOCHS="${TRAIN_EPOCHS:-1}"
 EVAL_LIMIT="${EVAL_LIMIT:-256}"
 DEVICE="${DEVICE:-auto}"
 DTYPE="${DTYPE:-float32}"
@@ -33,6 +34,7 @@ for lr in ${LRS}; do
     --num_chunks "${NUM_CHUNKS}" \
     --train_chunks "${TRAIN_CHUNKS}" \
     --train_limit "${TRAIN_LIMIT}" \
+    --train_epochs "${TRAIN_EPOCHS}" \
     --eval_limit "${EVAL_LIMIT}" \
     --learning_rate "${lr}" \
     --device "${DEVICE}" \

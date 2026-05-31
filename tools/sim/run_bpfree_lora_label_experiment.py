@@ -493,6 +493,12 @@ def main() -> None:
     parser.add_argument("--num_chunks", type=int, default=3)
     parser.add_argument("--train_chunks", default="all")
     parser.add_argument("--train_limit", type=int, default=None)
+    parser.add_argument(
+        "--train_epochs",
+        type=int,
+        default=1,
+        help="Repeat the selected training manifest records this many times.",
+    )
     parser.add_argument("--eval_limit", type=int, default=None)
     parser.add_argument("--learning_rate", type=float, default=None)
     parser.add_argument("--grad_clip", type=float, default=1.0)
@@ -509,6 +515,8 @@ def main() -> None:
 
     if args.num_chunks <= 0:
         raise ValueError("--num_chunks must be positive.")
+    if args.train_epochs <= 0:
+        raise ValueError("--train_epochs must be positive.")
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -544,7 +552,8 @@ def main() -> None:
         for idx in train_chunks
     }
 
-    train_records = read_manifest(args.train_manifest, args.train_limit)
+    base_train_records = read_manifest(args.train_manifest, args.train_limit)
+    train_records = base_train_records * args.train_epochs
     eval_records = read_manifest(args.eval_manifest, args.eval_limit)
     train_dir = args.train_manifest.parent
     eval_dir = args.eval_manifest.parent
@@ -595,6 +604,9 @@ def main() -> None:
         "resolved_model": resolved_model,
         "num_chunks": args.num_chunks,
         "train_chunks": sorted(train_chunks),
+        "train_epochs": args.train_epochs,
+        "unique_train_records": len(base_train_records),
+        "train_steps": len(train_records),
         "lora": {
             "rank": args.lora_rank,
             "alpha": args.lora_alpha,
