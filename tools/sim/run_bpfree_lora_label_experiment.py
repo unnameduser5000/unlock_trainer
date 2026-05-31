@@ -234,6 +234,8 @@ def build_chunks(
 
 
 def read_manifest(path: Path, limit: int | None = None) -> list[dict[str, Any]]:
+    if not path.is_file():
+        raise FileNotFoundError(f"Manifest does not exist: {path}")
     rows = []
     with path.open("r", encoding="utf-8") as f:
         for line in f:
@@ -525,6 +527,12 @@ def main() -> None:
     resolved_model = resolve_model_name(args.model_name)
     train_chunks = parse_train_chunks(args.train_chunks, args.num_chunks)
 
+    base_train_records = read_manifest(args.train_manifest, args.train_limit)
+    train_records = base_train_records * args.train_epochs
+    eval_records = read_manifest(args.eval_manifest, args.eval_limit)
+    train_dir = args.train_manifest.parent
+    eval_dir = args.eval_manifest.parent
+
     print(f"Loading model: {resolved_model} dtype={dtype} device={device}")
     model = AutoModelForCausalLM.from_pretrained(resolved_model, torch_dtype=dtype)
     injected = inject_lora_adapters(
@@ -552,11 +560,6 @@ def main() -> None:
         for idx in train_chunks
     }
 
-    base_train_records = read_manifest(args.train_manifest, args.train_limit)
-    train_records = base_train_records * args.train_epochs
-    eval_records = read_manifest(args.eval_manifest, args.eval_limit)
-    train_dir = args.train_manifest.parent
-    eval_dir = args.eval_manifest.parent
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     eval_before = run_phase(
