@@ -206,14 +206,20 @@ def build_candidate_indices(
     limit: int,
     shuffle_seed: int | None,
     balance_labels: bool,
+    shuffle_before_offset: bool,
 ) -> list[int]:
-    indices = list(range(offset, len(dataset)))
+    indices = list(range(0 if shuffle_before_offset else offset, len(dataset)))
     rng = np.random.default_rng(shuffle_seed) if shuffle_seed is not None else None
 
     if not balance_labels:
         if rng is not None:
             rng.shuffle(indices)
+        if shuffle_before_offset:
+            indices = indices[offset:]
         return indices
+
+    if shuffle_before_offset:
+        indices = indices[offset:]
 
     label_to_indices: dict[int, list[int]] = {}
     for dataset_index in indices:
@@ -394,6 +400,14 @@ def main() -> None:
         help="Shuffle candidate dataset indices with this seed before applying limit.",
     )
     parser.add_argument(
+        "--shuffle_before_offset",
+        action="store_true",
+        help=(
+            "Shuffle the full dataset first, then apply offset. Use this to create deterministic "
+            "disjoint train/eval slices from datasets that only provide one split, such as Dolly."
+        ),
+    )
+    parser.add_argument(
         "--balance_labels",
         action="store_true",
         help="Round-robin sample examples by integer 'label' field before applying limit.",
@@ -439,6 +453,7 @@ def main() -> None:
         limit=args.limit,
         shuffle_seed=args.shuffle_seed,
         balance_labels=args.balance_labels,
+        shuffle_before_offset=args.shuffle_before_offset,
     )
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -543,6 +558,7 @@ def main() -> None:
         "max_prompt_tokens": args.max_prompt_tokens,
         "min_valid_labels": args.min_valid_labels,
         "shuffle_seed": args.shuffle_seed,
+        "shuffle_before_offset": args.shuffle_before_offset,
         "balance_labels": args.balance_labels,
         "learning_rate": args.learning_rate if args.learning_rate > 0 else None,
         "label_choices": label_choices or None,

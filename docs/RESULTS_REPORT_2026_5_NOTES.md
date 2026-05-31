@@ -158,3 +158,85 @@ Interpretation:
 - Full-LoRA good but BP-free weak means the detached-boundary local objective is the bottleneck.
 - CE-only good but belief/KL weak means belief is hurting this task.
 - Server good but Android weak means check export/PTE/runtime/optimizer/checkpoint mismatch.
+
+## Dolly Data Prep Plan
+
+The older LLM sanity experiment used Dolly-15k. The mobile prototype should therefore keep Dolly as the main LLM SFT dataset and treat Rotten Tomatoes as a debugging probe, not the primary paper-quality dataset.
+
+Dolly only has a `train` split in the Hugging Face preset used here, so use deterministic shuffled slices:
+
+- train: shuffled offset `0`, limit `12000` for server-scale sanity.
+- eval: same shuffled order, offset `12000`, limit `2000`.
+- mobile demo subset: same recipe but smaller limits, such as train `512` and eval `128`.
+
+The data prep script supports `--shuffle_before_offset` so these slices are disjoint after global shuffling.
+
+Server-scale TinyLlama Dolly128 train/eval:
+
+```bash
+python tools/data/prepare_lora_sft_requests.py \
+  --model_name tinyllama \
+  --dataset dolly \
+  --seq_len 128 \
+  --offset 0 \
+  --limit 12000 \
+  --shuffle_seed 20260531 \
+  --shuffle_before_offset \
+  --attention_mask causal \
+  --mask_prompt \
+  --max_prompt_tokens 96 \
+  --min_valid_labels 8 \
+  --request_prefix dolly128-train \
+  --output_dir data/sft_requests/tinyllama_dolly128_train12000_seed20260531
+
+python tools/data/prepare_lora_sft_requests.py \
+  --model_name tinyllama \
+  --dataset dolly \
+  --seq_len 128 \
+  --offset 12000 \
+  --limit 2000 \
+  --shuffle_seed 20260531 \
+  --shuffle_before_offset \
+  --attention_mask causal \
+  --mask_prompt \
+  --max_prompt_tokens 96 \
+  --min_valid_labels 8 \
+  --request_prefix dolly128-eval \
+  --output_dir data/sft_requests/tinyllama_dolly128_eval2000_seed20260531
+```
+
+Phone-sized Dolly128 subset:
+
+```bash
+python tools/data/prepare_lora_sft_requests.py \
+  --model_name tinyllama \
+  --dataset dolly \
+  --seq_len 128 \
+  --offset 0 \
+  --limit 512 \
+  --shuffle_seed 20260531 \
+  --shuffle_before_offset \
+  --attention_mask causal \
+  --mask_prompt \
+  --max_prompt_tokens 96 \
+  --min_valid_labels 8 \
+  --request_prefix dolly128-train512 \
+  --output_dir data/sft_requests/tinyllama_dolly128_train512_seed20260531
+
+python tools/data/prepare_lora_sft_requests.py \
+  --model_name tinyllama \
+  --dataset dolly \
+  --seq_len 128 \
+  --offset 12000 \
+  --limit 128 \
+  --shuffle_seed 20260531 \
+  --shuffle_before_offset \
+  --attention_mask causal \
+  --mask_prompt \
+  --max_prompt_tokens 96 \
+  --min_valid_labels 8 \
+  --request_prefix dolly128-eval128 \
+  --output_dir data/sft_requests/tinyllama_dolly128_eval128_seed20260531
+```
+
+Use seq64 only as a phone-stability fallback. For seq64, reduce `--max_prompt_tokens` to about `40` and `--min_valid_labels` to about `4`.
