@@ -110,21 +110,21 @@ def format_example(
             0: "World",
             1: "Sports",
             2: "Business",
-            3: "Tech",
+            3: "Science",
         }
         topic = label_names.get(label, str(label))
         if response_style == "label":
             prompt = (
                 "News article:\n"
                 f"{text}\n\n"
-                "Topic (World, Sports, Business, or Tech):"
+                "Topic (World, Sports, Business, or Science):"
             )
             response = f" {topic}"
         else:
             prompt = (
                 "News article:\n"
                 f"{text}\n\n"
-                "Classify the news topic as World, Sports, Business, or Tech.\n\n"
+                "Classify the news topic as World, Sports, Business, or Science.\n\n"
                 "Answer:\n"
             )
             response = f"The topic is {topic} news."
@@ -184,7 +184,7 @@ def label_choice_texts(dataset_name: str, response_style: str) -> list[str]:
     if dataset_name == "glue" or "rotten_tomatoes" in dataset_name:
         return [" positive", " negative"]
     if "ag_news" in dataset_name:
-        return [" World", " Sports", " Business", " Tech"]
+        return [" World", " Sports", " Business", " Science"]
     return []
 
 

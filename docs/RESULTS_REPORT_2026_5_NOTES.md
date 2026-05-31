@@ -183,7 +183,7 @@ Recommended first task:
 
 - AG News 4-class label-only classification.
 - It is less toy than synthetic labels and easier to evaluate than Dolly generation.
-- It has a clean accuracy metric: constrained choice among `World`, `Sports`, `Business`, `Tech`.
+- It has a clean accuracy metric: constrained choice among `World`, `Sports`, `Business`, `Science`.
 - It should be tried before returning to Dolly natural SFT, because Dolly already showed weak visible movement in short mobile runs.
 
 Probe base model first:
@@ -195,7 +195,7 @@ python tools/data/probe_label_task.py \
   --split test \
   --limit 512 \
   --max_prompt_tokens 96 \
-  --choices "World,Sports,Business,Tech" \
+  --choices "World,Sports,Business,Science" \
   --output_json debug_runs/label_probe_agnews_test512_prompt96.json
 ```
 

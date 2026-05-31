@@ -126,6 +126,12 @@ def main() -> None:
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    choice_texts = [args.label_prefix + item.strip() for item in args.choices.split(",") if item.strip()]
+    choice_token_ids = [
+        encode_one_token(tokenizer, text, f"choice {text!r}")
+        for text in choice_texts
+    ]
+
     device = torch.device(
         "cuda"
         if args.device == "auto" and torch.cuda.is_available()
@@ -135,12 +141,6 @@ def main() -> None:
     model = AutoModelForCausalLM.from_pretrained(resolved_model, torch_dtype=dtype)
     model.to(device)
     model.eval()
-
-    choice_texts = [args.label_prefix + item.strip() for item in args.choices.split(",") if item.strip()]
-    choice_token_ids = [
-        encode_one_token(tokenizer, text, f"choice {text!r}")
-        for text in choice_texts
-    ]
 
     dataset = load_examples(dataset_name, split_raw)
     rows = []
