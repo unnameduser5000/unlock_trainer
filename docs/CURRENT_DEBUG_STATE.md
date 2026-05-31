@@ -4,6 +4,10 @@ This file is the first file to read after any context reset.
 
 Last updated: 2026-05-31 Asia/Shanghai
 
+Related algorithm-history note:
+
+- Read `docs/RESULTS_REPORT_2026_5_NOTES.md` before rewriting the paper story from scratch. It summarizes the older ViT/LLM belief report and explains why the current mobile prototype should be framed as systems-first BP-free chunk-local LoRA, with belief as optional rather than the main quality claim.
+
 ## Current Mainline Position
 
 Do not restart from inference smoke or one-request smoke after a context reset. Those paths have already served their purpose.
