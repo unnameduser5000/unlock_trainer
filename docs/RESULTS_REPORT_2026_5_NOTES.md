@@ -141,9 +141,9 @@ The mobile report should include:
   - memory/battery/temperature telemetry,
   - operator-level explanation of why boundary-gradient elision matters.
 
-## Immediate Diagnostic Rule For Current Rotten-Tomatoes Label Experiments
+## Immediate Diagnostic Rule For Current Label Experiments
 
-If mobile/server label quality is weak, do not blindly keep tuning LR.
+If mobile/server label quality is weak, do not blindly keep tuning LR or alpha.
 
 Run controls:
 
@@ -158,6 +158,106 @@ Interpretation:
 - Full-LoRA good but BP-free weak means the detached-boundary local objective is the bottleneck.
 - CE-only good but belief/KL weak means belief is hurting this task.
 - Server good but Android weak means check export/PTE/runtime/optimizer/checkpoint mismatch.
+
+Use:
+
+```bash
+TRAIN_MANIFEST=<train requests.jsonl> \
+EVAL_MANIFEST=<eval requests.jsonl> \
+TRAIN_LIMIT=512 \
+TRAIN_EPOCHS=1 \
+EVAL_LIMIT=256 \
+LRS="3e-5 1e-4 3e-4" \
+DEVICE=cuda DTYPE=float32 \
+OUTPUT_ROOT=debug_runs/server_label_controls/<task-name> \
+bash tools/sim/run_label_control_suite.sh
+```
+
+This runs exactly the three controls above. It does not run a broad alpha sweep. Set `RUN_CURRENT=1` only when comparing against the current `ALPHA=0.5` belief/KL objective.
+
+## Display-Task Data Prep Plan
+
+The immediate display goal is not to reproduce the older report's Llama-2/Dolly setup. It is to find one TinyLlama-compatible task where the same mobile-oriented training stack shows visible loss reduction and label-choice accuracy improvement.
+
+Recommended first task:
+
+- AG News 4-class label-only classification.
+- It is less toy than synthetic labels and easier to evaluate than Dolly generation.
+- It has a clean accuracy metric: constrained choice among `World`, `Sports`, `Business`, `Tech`.
+- It should be tried before returning to Dolly natural SFT, because Dolly already showed weak visible movement in short mobile runs.
+
+Probe base model first:
+
+```bash
+python tools/data/probe_label_task.py \
+  --model_name tinyllama \
+  --dataset ag_news \
+  --split test \
+  --limit 512 \
+  --max_prompt_tokens 96 \
+  --choices "World,Sports,Business,Tech" \
+  --output_json debug_runs/label_probe_agnews_test512_prompt96.json
+```
+
+Prepare AG News train/eval:
+
+```bash
+python tools/data/prepare_lora_sft_requests.py \
+  --model_name tinyllama \
+  --dataset ag_news \
+  --split train \
+  --seq_len 128 \
+  --limit 512 \
+  --shuffle_seed 20260531 \
+  --balance_labels \
+  --attention_mask causal \
+  --mask_prompt \
+  --response_style label \
+  --no_append_eos \
+  --max_prompt_tokens 96 \
+  --min_valid_labels 1 \
+  --learning_rate 0.0001 \
+  --request_prefix agnews128-train512 \
+  --output_dir data/sft_requests/tinyllama_agnews128_label_train512_seed20260531
+
+python tools/data/prepare_lora_sft_requests.py \
+  --model_name tinyllama \
+  --dataset ag_news \
+  --split test \
+  --seq_len 128 \
+  --limit 256 \
+  --shuffle_seed 20260531 \
+  --balance_labels \
+  --attention_mask causal \
+  --mask_prompt \
+  --response_style label \
+  --no_append_eos \
+  --max_prompt_tokens 96 \
+  --min_valid_labels 1 \
+  --request_prefix agnews128-eval256 \
+  --output_dir data/sft_requests/tinyllama_agnews128_label_eval256_seed20260531
+```
+
+Then run the control suite:
+
+```bash
+TRAIN_MANIFEST=data/sft_requests/tinyllama_agnews128_label_train512_seed20260531/requests.jsonl \
+EVAL_MANIFEST=data/sft_requests/tinyllama_agnews128_label_eval256_seed20260531/requests.jsonl \
+TRAIN_LIMIT=512 \
+TRAIN_EPOCHS=1 \
+EVAL_LIMIT=256 \
+LRS="3e-5 1e-4 3e-4" \
+DEVICE=cuda DTYPE=float32 \
+OUTPUT_ROOT=debug_runs/server_label_controls/agnews128_train512 \
+bash tools/sim/run_label_control_suite.sh
+```
+
+Decision:
+
+- If full-LoRA upper bound does not improve AG News, change task/prompt before using phones.
+- If full-LoRA improves and BP-free CE-only also improves, use AG News for the mobile demo.
+- If only terminal-chunk CE improves, the task is learnable but the all-chunk local objective is the problem.
+- If AG News works, run phone eval-before/train/eval-after on the same train/eval manifests.
 
 ## Dolly Data Prep Plan
 
