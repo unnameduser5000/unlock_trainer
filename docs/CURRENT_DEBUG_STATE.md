@@ -102,6 +102,64 @@ Decision rule before returning to Android:
 - Pick the smallest training budget that improves constrained choice loss without obvious class collapse.
 - Once chosen, export/prep the same request manifest and run the phone eval-before/train/eval-after protocol.
 
+If `train512` still looks weak, do not continue blind LR tuning. Run controls that isolate the failure mode:
+
+1. Full-LoRA upper bound on the same prepared data:
+
+```bash
+TRAIN_MANIFEST=data/sft_requests/tinyllama_rotten_tomatoes128_label_train512_prompt24_lr1e4_balanced/requests.jsonl \
+EVAL_MANIFEST=data/sft_requests/tinyllama_rotten_tomatoes128_label_val256_prompt24_balanced/requests.jsonl \
+NUM_CHUNKS=1 \
+TRAIN_LIMIT=512 \
+TRAIN_EPOCHS=1 \
+LRS="3e-5 1e-4 3e-4" \
+ALPHA=1.0 \
+DEVICE=cuda DTYPE=float32 \
+OUTPUT_ROOT=debug_runs/server_label_sweeps/full_lora_train512 \
+bash tools/sim/run_bpfree_lora_label_sweep.sh
+```
+
+`NUM_CHUNKS=1` is a server-only full-backprop LoRA control because there is no cross-chunk detach boundary.
+
+2. Terminal-chunk-only control:
+
+```bash
+TRAIN_MANIFEST=data/sft_requests/tinyllama_rotten_tomatoes128_label_train512_prompt24_lr1e4_balanced/requests.jsonl \
+EVAL_MANIFEST=data/sft_requests/tinyllama_rotten_tomatoes128_label_val256_prompt24_balanced/requests.jsonl \
+NUM_CHUNKS=3 \
+TRAIN_CHUNKS=2 \
+TRAIN_LIMIT=512 \
+TRAIN_EPOCHS=1 \
+LRS="3e-5 1e-4 3e-4" \
+ALPHA=1.0 \
+DEVICE=cuda DTYPE=float32 \
+OUTPUT_ROOT=debug_runs/server_label_sweeps/terminal_chunk_ce_train512 \
+bash tools/sim/run_bpfree_lora_label_sweep.sh
+```
+
+3. BP-free CE-only control:
+
+```bash
+TRAIN_MANIFEST=data/sft_requests/tinyllama_rotten_tomatoes128_label_train512_prompt24_lr1e4_balanced/requests.jsonl \
+EVAL_MANIFEST=data/sft_requests/tinyllama_rotten_tomatoes128_label_val256_prompt24_balanced/requests.jsonl \
+NUM_CHUNKS=3 \
+TRAIN_CHUNKS=all \
+TRAIN_LIMIT=512 \
+TRAIN_EPOCHS=1 \
+LRS="3e-5 1e-4 3e-4" \
+ALPHA=1.0 \
+DEVICE=cuda DTYPE=float32 \
+OUTPUT_ROOT=debug_runs/server_label_sweeps/bpfree_ce_only_train512 \
+bash tools/sim/run_bpfree_lora_label_sweep.sh
+```
+
+Interpretation:
+
+- If `NUM_CHUNKS=1` is also weak, the task/prompt/data/LoRA capacity is the problem.
+- If `NUM_CHUNKS=1` works but terminal-only is weak, the trainable location is the problem.
+- If CE-only works but `ALPHA=0.5` is weak, the belief/KL term is hurting this label task.
+- If server works but Android is weak, suspect PTE/export/runtime or optimizer/checkpoint mismatch.
+
 ### 2026-05-30 Label-Only Quality Demo Pivot
 
 Why this pivot exists:
