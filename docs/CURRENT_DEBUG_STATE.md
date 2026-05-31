@@ -1631,3 +1631,48 @@ $count = ($rows | Measure-Object -Property label_choice_count -Sum).Sum
 Invoke-RestMethod http://127.0.0.1:18080/api/v1/status
 Invoke-RestMethod 'http://127.0.0.1:18080/api/v1/worker-telemetry.csv?limit=20'
 ```
+
+## Latest Balanced Label-Only Result
+
+Updated: 2026-05-31 03:50 Asia/Shanghai.
+
+Run:
+
+```text
+debug_runs\label-balanced-demo-20260531-0102
+```
+
+Summary file:
+
+```text
+debug_runs\label-balanced-demo-20260531-0102\SUMMARY.md
+```
+
+Data:
+
+- train: `data/sft_requests/tinyllama_rotten_tomatoes128_label_train64_prompt24_lr3e4_balanced/requests.jsonl`
+- validation: `data/sft_requests/tinyllama_rotten_tomatoes128_label_val256_prompt24_balanced/requests.jsonl`
+- validation label split: `128 negative / 128 positive`
+
+Completed phases:
+
+| phase | rows | failures | label-choice acc | avg local loss | notes |
+|---|---:|---:|---:|---:|---|
+| eval-before | 256 | 0 | 153/256 = 0.5977 | 10.5673 | baseline before mobile training |
+| train64 | 64 | 0 | 34/64 = 0.5312 | 10.2236 | `eval_only=false`; mobile training path exercised |
+| eval-after | 256 | 0 | 123/256 = 0.4805 | 7.7905 | after train64 |
+
+Per-class validation:
+
+| phase | negative acc | positive acc |
+|---|---:|---:|
+| eval-before | 63/128 = 0.4922 | 90/128 = 0.7031 |
+| eval-after | 2/128 = 0.0156 | 121/128 = 0.9453 |
+
+Interpretation:
+
+- System result is good: three-phone seq128 eval-before, train64, and eval-after all completed with `0` terminal failures.
+- Training path is real: train64 used `eval_only=false`, and worker events showed optimizer steps.
+- Quality result is not good for this hyperparameter setting: label-choice accuracy dropped by `0.1172`, while avg local loss dropped by `2.7768`.
+- The after model became strongly positive-biased. This means the current `train64/lr=3e-4` setup is useful as an end-to-end system demo, but not yet a good quality-preserving training recipe.
+- Useful fault-tolerance evidence: request `rt-label-balanced-train64-20260531-0214-000057` had a coordinator dispatch read timeout/retry and still ended as CSV success with `elapsed_ms=413879`.
