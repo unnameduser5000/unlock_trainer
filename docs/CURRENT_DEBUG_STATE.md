@@ -106,6 +106,44 @@ Decision rule before returning to Android:
 - Pick the smallest training budget that improves constrained choice loss without obvious class collapse.
 - Once chosen, export/prep the same request manifest and run the phone eval-before/train/eval-after protocol.
 
+### 2026-05-31 AG News Label Control Result
+
+User synced server outputs locally under:
+
+- `data/debug_runs/server_label_controls/agnews128_train512`
+
+Task:
+
+- TinyLlama AG News 4-class label-only classification.
+- Labels are `World`, `Sports`, `Business`, `Science`.
+- Eval set has 256 rows, balanced 64/class.
+- Train budget: 512 steps, one epoch.
+- Metric: constrained label-choice accuracy plus BP-free local objective loss.
+
+Result summary:
+
+| control | lr | eval-before acc | eval-after acc | delta acc | eval-before loss | eval-after loss | delta loss |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| full LoRA upper bound (`NUM_CHUNKS=1`) | `1e-4` | 0.3359 | 0.8359 | +0.5000 | 7.4003 | 2.2775 | -5.1228 |
+| BP-free CE-only (`NUM_CHUNKS=3`, all chunks) | `1e-4` | 0.3359 | 0.8320 | +0.4961 | 7.4003 | 2.0444 | -5.3559 |
+| BP-free CE-only (`NUM_CHUNKS=3`, all chunks) | `3e-4` | 0.3359 | 0.8359 | +0.5000 | 7.4003 | 2.0286 | -5.3717 |
+| terminal chunk only (`NUM_CHUNKS=3`, chunk 2) | `3e-4` | 0.3359 | 0.8047 | +0.4688 | 7.4003 | 2.0343 | -5.3660 |
+
+Per-class for the best BP-free CE-only `3e-4` run:
+
+- Business: `11/64 -> 49/64`, `0.172 -> 0.766`.
+- Science: `9/64 -> 55/64`, `0.141 -> 0.859`.
+- Sports: `55/64 -> 62/64`, `0.859 -> 0.969`.
+- World: `11/64 -> 48/64`, `0.172 -> 0.750`.
+
+Interpretation:
+
+- This is a successful quality-control result: the task is learnable by TinyLlama LoRA and the metric is visible.
+- BP-free CE-only is not "obviously broken" on this task. It nearly matches the full-LoRA `NUM_CHUNKS=1` upper-bound accuracy and has slightly lower reported local objective loss.
+- Terminal-only also improves, but all-chunk BP-free CE-only is better, so the deployable all-stage training path is worth taking to phones.
+- Do not use Dolly short-run quality as the main demonstration target; Dolly remains useful for SFT/system realism, while AG News is better for visible accuracy/loss movement.
+- Next phone demo target should be AG News label-only, preferably BP-free CE-only/all chunks with `lr=1e-4` first for stability. `3e-4` has the best/lower loss in server control, but `1e-4` reaches nearly identical accuracy and may be safer on Android.
+
 If `train512` still looks weak, do not continue blind LR tuning. Run controls that isolate the failure mode:
 
 1. Full-LoRA upper bound on the same prepared data:
