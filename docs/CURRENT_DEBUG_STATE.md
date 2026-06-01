@@ -144,6 +144,86 @@ Interpretation:
 - Do not use Dolly short-run quality as the main demonstration target; Dolly remains useful for SFT/system realism, while AG News is better for visible accuracy/loss movement.
 - Next phone demo target should be AG News label-only, preferably BP-free CE-only/all chunks with `lr=1e-4` first for stability. `3e-4` has the best/lower loss in server control, but `1e-4` reaches nearly identical accuracy and may be safer on Android.
 
+### 2026-05-31 AG News Phone Mainline Run
+
+Current run pointer:
+
+```text
+debug_runs/CURRENT_AGNEWS_RUN.txt -> debug_runs\agnews-phone-mainline-20260531-141409
+```
+
+Active phone mapping:
+
+- stage 0: `NX809J`, shard `tinyllama_lora_chunk_0_seq128`
+- stage 1: `Lenovo_L71091`, shard `tinyllama_lora_chunk_1_seq128`
+- stage 2: `Pixel_10_Pro_XL`, shard `tinyllama_lora_chunk_2_seq128`
+
+Prepared data:
+
+- train: `data/sft_requests/tinyllama_agnews128_label_train512_seed20260531/requests.jsonl`
+- eval: `data/sft_requests/tinyllama_agnews128_label_eval256_seed20260531/requests.jsonl`
+
+Final status as of `2026-05-31 23:58 Asia/Shanghai`:
+
+| phase | rows | failures | label-choice acc | avg local loss | notes |
+|---|---:|---:|---:|---:|---|
+| `eval-before256-window3` | 256 | 0 | 86/256 = 0.3359 | 7.6778 | three-phone seq128 baseline before mobile training |
+| stitched `train512` mobile training | 512 covered | 9 transient failed rows recovered | train rows are not the held-out metric | see recovery notes | completed through documented continuations, not one clean uninterrupted run |
+| `eval-after256-window3` | 256 | 0 | 80/256 = 0.3125 | 5.6342 | completed after mobile training; Gradle runner reported `BUILD SUCCESSFUL in 2h 5m 43s` |
+
+Quality interpretation:
+
+- Held-out avg local loss improved by `-2.0436` (`7.6778 -> 5.6342`).
+- Held-out label-choice accuracy did not improve: `0.3359 -> 0.3125`, delta `-0.0234`.
+- Use this as a successful real-device distributed training/system run with visible loss movement, but do not claim AG News accuracy improvement from this phone run.
+- The `check-ag-news-run` heartbeat is no longer needed after this completion.
+
+Failure/recovery note, `2026-05-31 16:1x Asia/Shanghai`:
+
+- `train512-window3` stopped early with `191` rows: `188` terminal successes and `3` failures.
+- The three failed requests are `000188`, `000189`, and `000190`; all report `Stage 2 has no live worker.`
+- Coordinator status after failure: `liveNodeCount=2`, `offlineStageCount=1`; stage 2 / `Pixel_10_Pro_XL` was evicted with `reason=lease-expired`.
+- ADB still sees Pixel and `pidof com.example.sid_trainer` returned a live process, so this is not an obvious Android process death.
+- Pixel battery/power state was healthy: 100%, powered, `mWakefulness=Awake`, `mStayOn=true`.
+- Pixel logcat root-cause evidence: repeated `GrpcManager` heartbeat failures to coordinator `192.168.137.1:50051` with `ENETUNREACH (Network is unreachable)`.
+- Pixel Wi-Fi status at diagnosis: `Wifi is not connected`; `wlan0` had no IPv4 address and no route. The hotspot SSID `dwellerLAPTOP 5740` was visible in scan results, but CLI reconnect requires the hotspot passphrase.
+- Do not treat this as a clean 512-row quality run. After reconnecting Pixel to the hotspot, relaunch/re-register stage 2 and either run a documented continuation from record index `191` or restart a fresh clean train512, depending on how strict the demo needs to be.
+
+Recovery action:
+
+- Pixel was manually reconnected to `dwellerLAPTOP 5740` and received `192.168.137.81`.
+- Pixel worker was force-stopped/relaunched; coordinator returned to `liveNodeCount=3`, `offlineStageCount=0`.
+- New stage 2 node: `129`, `Pixel_10_Pro_XL`, `192.168.137.81:26052`.
+- Started documented continuation:
+
+```text
+debug_runs\agnews-phone-mainline-20260531-141409\train512-cont-from191-window3
+```
+
+- Continuation args:
+
+```text
+127.0.0.1 50051 data/sft_requests/tinyllama_agnews128_label_train512_seed20260531/requests.jsonl 191 321 debug_runs\agnews-phone-mainline-20260531-141409\train512-cont-from191-window3/results.csv agnews-train512-cont191-20260531 1 0 false true 18 10000 420000 3
+```
+
+- Initial continuation check: first `3/321` requests succeeded with `0` failures.
+- Heartbeat automation `check-ag-news-run` now monitors `train512-cont-from191-window3`; when it reaches `321` terminal successes and `0` failures, it should launch `eval-after256-window3`.
+
+Second interruption:
+
+- `train512-cont-from191-window3` also stopped early with `111` rows: `108` terminal successes and `3` failures.
+- Failed records are `299`, `300`, and `301`; all report `Stage 2 has no live worker.`
+- Coordinator again showed `liveNodeCount=2`, `offlineStageCount=1`.
+- Pixel app process was still alive, but Pixel Wi-Fi was disconnected again; `wlan0` had no IPv4 address and no route.
+- Pixel logcat again showed `GrpcManager` heartbeat failures to `192.168.137.1:50051` with `ENETUNREACH`.
+- Applied Pixel-side settings to reduce network-quality-triggered Wi-Fi drops:
+  - `cmd wifi set-ipreach-disconnect disabled`
+  - `settings put global captive_portal_mode 0`
+  - `settings put global captive_portal_detection_enabled 0`
+  - `settings put global wifi_watchdog_poor_network_test_enabled 0`
+- ADB Wi-Fi toggle did not automatically reconnect to `dwellerLAPTOP 5740`; manual reconnection or the hotspot passphrase is needed.
+- Recommendation after this repeated network loss: use the interrupted runs as fault-tolerance evidence, but for a clean quality result, stabilize the Wi-Fi first and then run a fresh train512. Further continuations are possible but become increasingly messy as a quality demo.
+
 If `train512` still looks weak, do not continue blind LR tuning. Run controls that isolate the failure mode:
 
 1. Full-LoRA upper bound on the same prepared data:
@@ -1870,3 +1950,298 @@ Interpretation:
 - Quality result is not good for this hyperparameter setting: label-choice accuracy dropped by `0.1172`, while avg local loss dropped by `2.7768`.
 - The after model became strongly positive-biased. This means the current `train64/lr=3e-4` setup is useful as an end-to-end system demo, but not yet a good quality-preserving training recipe.
 - Useful fault-tolerance evidence: request `rt-label-balanced-train64-20260531-0214-000057` had a coordinator dispatch read timeout/retry and still ended as CSV success with `elapsed_ms=413879`.
+
+## AG News Mainline Recovery Checkpoint
+
+Updated: 2026-05-31 19:47 Asia/Shanghai.
+
+Current run pointer:
+
+```text
+debug_runs\agnews-phone-mainline-20260531-141409
+```
+
+Three-phone AG News run status:
+
+- `eval-before256-window3`: completed, `256/256` success, `0` failures.
+- `train512-window3`: stopped early at record `190`; records `188..190` failed after Pixel/stage 2 lost Wi-Fi and coordinator evicted the stage.
+- `train512-cont-from191-window3`: stopped early at record `301`; records `299..301` failed for the same Pixel/stage 2 Wi-Fi / route loss.
+- `train512-cont-from299-window3`: active recovery continuation from record index `299`, limit `213`.
+
+Important detail: `train512-cont-from299-window3` intentionally overlaps records `299..301` because those rows failed in `train512-cont-from191-window3`. As of this checkpoint it has written `11` terminal rows, all successful, through record `309`.
+
+Live network status at this checkpoint:
+
+- Coordinator `/api/v1/status`: `3` live nodes, `0` offline stages.
+- Stage 0: `NX809J`, `192.168.137.211:26052`.
+- Stage 1: `Lenovo_L71091`, `192.168.137.124:26052`.
+- Stage 2: `Pixel_10_Pro_XL`, `192.168.137.139:26052`.
+- Lenovo -> Pixel data-plane probe to `192.168.137.139:26052` succeeds and returns worker HTTP `404 Unsupported path`, which is expected for a raw HTTP probe against the worker port.
+
+Current active command:
+
+```powershell
+.\gradlew.bat :coordinator:runPreparedPipelineExperiment --offline --no-daemon --args="127.0.0.1 50051 data/sft_requests/tinyllama_agnews128_label_train512_seed20260531/requests.jsonl 299 213 debug_runs\agnews-phone-mainline-20260531-141409\train512-cont-from299-window3\results.csv agnews-train512-cont299-20260531 1 0 false true 18 10000 420000 3"
+```
+
+If this continuation completes cleanly, it should reach `213` successful rows and last record index `511`. Then run `eval-after256-window3` on:
+
+```text
+data/sft_requests/tinyllama_agnews128_label_eval256_seed20260531/requests.jsonl
+```
+
+with offset `0`, limit `256`, `evalOnly=true`, `includeLabels=true`, retry count `18`, retry delay `10000 ms`, submit deadline `420000 ms`, and window `3`.
+
+Update: 2026-05-31 20:51 Asia/Shanghai.
+
+`train512-cont-from299-window3` stopped early after Pixel/stage 2 dropped and re-registered with a new IP:
+
+- rows: `51`
+- successes: `48`
+- failures: `3`
+- failed original record indices: `340`, `348`, `349`
+- final summary: `selected=213 submitted=51 skipped=0 succeeded=48 failed=3`
+- failure message: `Stage 2 has no live worker.`
+- Pixel reappeared as `192.168.137.180`; coordinator again reported `3` live nodes and `0` offline stages.
+- Lenovo -> Pixel `192.168.137.180:26052` probe succeeded with expected worker HTTP `404 Unsupported path`.
+
+Because record `340` failed while later in-flight records `341..347` succeeded, a gap-only recovery manifest was generated to avoid duplicate training:
+
+```text
+data\sft_requests\tinyllama_agnews128_label_train512_seed20260531\requests_recovery_340_348_511.jsonl
+```
+
+This manifest contains exactly `165` rows: original record `340` followed by original records `348..511`.
+
+Active recovery phase:
+
+```text
+debug_runs\agnews-phone-mainline-20260531-141409\train512-recovery-340-348to511-window3
+```
+
+Start command:
+
+```powershell
+.\gradlew.bat :coordinator:runPreparedPipelineExperiment --offline --no-daemon --args="127.0.0.1 50051 data/sft_requests/tinyllama_agnews128_label_train512_seed20260531/requests_recovery_340_348_511.jsonl 0 165 debug_runs\agnews-phone-mainline-20260531-141409\train512-recovery-340-348to511-window3\results.csv agnews-train512-recovery340-20260531 1 0 false true 18 10000 420000 3"
+```
+
+Note: in this recovery phase, CSV `record_index` is relative to the recovery manifest. Use `dataset_index` or the recovery manifest definition above to map back to original train512 records.
+
+Update: 2026-05-31 20:57 Asia/Shanghai.
+
+Immediately after starting `train512-recovery-340-348to511-window3`, Pixel/stage 2 again stopped heartbeating even though Android Wi-Fi still showed it connected to `dwellerLAPTOP 5740` with IP `192.168.137.180` and strong RSSI. Coordinator status dropped to `2` live nodes and `1` offline stage. The Pixel app process `com.example.sid_trainer` was still present, so the recovery action was to restart only the Pixel worker app:
+
+```powershell
+adb -s 58151FDCQ006A8 shell am force-stop com.example.sid_trainer
+adb -s 58151FDCQ006A8 shell am start -n com.example.sid_trainer/.MainActivity
+```
+
+This restored coordinator status to `3` live nodes and `0` offline stages. The in-flight recovery runner was still within its retry window and successfully recovered:
+
+- recovery rows: `3`
+- successes: `3`
+- failures: `0`
+- covered original failed dataset indices: `38427`, `96958`, `94424`
+- avg local loss over the first 3 recovery rows: `6.3168`
+
+The first three rows correspond to original train512 record `340`, `348`, and `349`. Their high elapsed times (`~270-296 s`) are recovery/retry latency, not normal steady-state throughput.
+
+## Pixel Stage-2 Drop Root-Cause Diagnosis
+
+Updated: 2026-05-31 21:00 Asia/Shanghai.
+
+The recurring Pixel/stage-2 failures are not model/OOM failures. The immediate coordinator-visible failure mode is:
+
+```text
+Stage 2 has no live worker.
+```
+
+Evidence:
+
+- Coordinator repeatedly evicts Pixel/stage 2 by lease expiry, then later registers the same device again.
+- Pixel often has good RSSI and link speed when checked, so this is not simple weak signal.
+- Earlier Pixel Wi-Fi logs showed `CMD_IP_REACHABILITY_FAILURE`, `LOST_PROVISIONING`, `192.168.137.1 NUD_FAILED`, `CMD_IP_CONFIGURATION_LOST`, and association timeout/rejection events against the Windows hotspot.
+- In the latest recovery attempt, Android Wi-Fi still showed connected with IP `192.168.137.180`, but coordinator had already expired stage 2. The app process still existed, but restarting only `com.example.sid_trainer` immediately re-registered Pixel and allowed the in-flight runner retries to recover.
+- After restart, ExecuTorch training on Pixel succeeded again, including `TrainingModule.executeForwardBackward()` and optimizer steps, so the failure was outside the model execution path.
+
+Interpretation:
+
+1. Pixel is unusually sensitive to the Windows Mobile Hotspot path. Disabling captive portal, poor-network tests, and ipreach disconnect avoids some Android policy disconnects, but it does not fix Windows hotspot peer routing/ARP/NUD behavior, DHCP/IP churn, or driver-level association quirks.
+2. The current Android worker is an Activity-driven app, not a foreground service with explicit wake/network recovery policy. When the network path changes or the process becomes cached/backgrounded, the gRPC heartbeat can stop long enough for the coordinator lease to expire.
+3. Therefore the robust fix is not another one-off phone setting. The system should add worker-side auto recovery: foreground service, wake/Wi-Fi lock during runs, connectivity callback, heartbeat failure detection, channel rebuild, local server restart if needed, and explicit re-registration. Coordinator/runner retry logic already helps when the worker returns inside the retry window.
+
+Current run status at this diagnosis checkpoint:
+
+- `train512-recovery-340-348to511-window3`: `15/15` success, `0` failures.
+- Coordinator: `3` live nodes, `0` offline stages.
+
+Update: 2026-05-31 21:52 Asia/Shanghai.
+
+The gap-only recovery phase finished successfully:
+
+- phase: `train512-recovery-340-348to511-window3`
+- rows: `165`
+- successes: `165`
+- failures: `0`
+- avg local loss: `5.9178`
+- label-choice: `57/165 = 0.3455`
+
+Together with previous completed/partial phases, this covers the intended train512 set:
+
+- `train512-window3`: original records `0..187` succeeded; `188..190` failed.
+- `train512-cont-from191-window3`: original records `191..298` succeeded; `299..301` failed.
+- `train512-cont-from299-window3`: original records `299..339` succeeded except `340`, and `341..347` succeeded; `348..349` failed; stopped before `350..511`.
+- `train512-recovery-340-348to511-window3`: recovered original record `340` and original records `348..511`, all successful.
+
+Started eval-after:
+
+```text
+debug_runs\agnews-phone-mainline-20260531-141409\eval-after256-window3
+```
+
+Command:
+
+```powershell
+.\gradlew.bat :coordinator:runPreparedPipelineExperiment --offline --no-daemon --args="127.0.0.1 50051 data/sft_requests/tinyllama_agnews128_label_eval256_seed20260531/requests.jsonl 0 256 debug_runs\agnews-phone-mainline-20260531-141409\eval-after256-window3\results.csv agnews-eval-after-20260531 1 0 true true 18 10000 420000 3"
+```
+
+At eval-after start, coordinator status was `3` live nodes and `0` offline stages.
+
+Update: 2026-05-31 22:33 Asia/Shanghai.
+
+`eval-after256-window3` is currently stalled at row `60` during transient retry, not because of model execution:
+
+- rows written: `60`
+- successes: `60`
+- failures: `0`
+- avg local loss so far: `5.5456`
+- label-choice so far: `16/60 = 0.2667`
+- runner is still alive and retrying request indices around `60..61`
+- failure message in Gradle log: `Downstream forwarding failed: failed to connect to /192.168.137.139 (port 26052) from /192.168.137.124 ... after 15000ms`
+
+Important network finding:
+
+- Pixel/stage 2 Wi-Fi is connected to `dwellerLAPTOP 5740` with IP `192.168.137.139`, strong RSSI, and Pixel is listening on `*:26052`.
+- Coordinator and the Windows host can connect to Pixel `192.168.137.139:26052`.
+- NX and Lenovo can reach each other in both directions, including `26052`.
+- Lenovo -> Pixel and Pixel -> Lenovo fail at the peer path: ping loses all packets and `nc` to `26052` times out.
+- Restarting the Pixel app restored coordinator live status but did not restore the Lenovo <-> Pixel data path.
+
+Interpretation: this checkpoint is a Windows hotspot / Pixel peer-to-peer data-plane failure. Coordinator heartbeats can be live while inter-stage forwarding is broken. This is separate from AG News label accuracy and separate from ExecuTorch OOM/model correctness.
+
+Metric interpretation note:
+
+- `label_choice_accuracy` in train CSV rows is useful only as a rough online sanity signal. It is computed after each training request on that same request, after the request may already have updated local LoRA weights, and the train stream distribution/order is not the held-out metric.
+- The meaningful task-quality comparison is held-out `eval-before256-window3` versus completed `eval-after256-window3`.
+- Server probe/control numbers are cleaner because they run in one process with a consistent model state and no phone network/retry/data-plane effects.
+
+Update: 2026-05-31 22:41 Asia/Shanghai.
+
+Recovery attempt details:
+
+- Restarting Pixel app did not restore Lenovo -> Pixel reachability.
+- Toggling Pixel Wi-Fi did not restore Lenovo -> Pixel reachability.
+- Toggling Lenovo Wi-Fi restored Lenovo -> Pixel `26052`; the probe returned the expected `HTTP/1.1 404 Error` / `Unsupported path`.
+- Coordinator then showed `3` live nodes and `0` offline stages again.
+- The in-flight eval-after runner recovered within its retry window and wrote record index `61`, with elapsed time `760015 ms`; that high latency is retry recovery time, not steady-state runtime.
+
+At this checkpoint:
+
+- `eval-after256-window3`: rows `61`, successes `61`, failures `0`
+- avg local loss so far: `5.5633`
+- label-choice so far: `16/61 = 0.2623`
+
+Note: after the Lenovo Wi-Fi refresh, Lenovo re-registered on gRPC port `26062` rather than `26052`. Coordinator routing updated to use `192.168.137.124:26062`.
+
+Update: 2026-05-31 23:58 Asia/Shanghai.
+
+`eval-after256-window3` completed successfully:
+
+- rows: `256`
+- successes: `256`
+- failures: `0`
+- avg local loss: `5.6342`
+- label-choice: `80/256 = 0.3125`
+- Gradle summary: `selected=256 submitted=256 skipped=0 succeeded=256 failed=0`
+- runner duration: `BUILD SUCCESSFUL in 2h 5m 43s`
+
+Final held-out comparison for this phone mainline:
+
+| phase | success | failures | label-choice acc | avg local loss |
+|---|---:|---:|---:|---:|
+| `eval-before256-window3` | 256/256 | 0 | 86/256 = 0.3359 | 7.6778 |
+| `eval-after256-window3` | 256/256 | 0 | 80/256 = 0.3125 | 5.6342 |
+
+Conclusion:
+
+- The system path is proven end-to-end on three phones with seq128 TinyLlama LoRA shards, bounded in-flight scheduling, transient retry, and documented recovery over Pixel/stage-2 network drops.
+- The quality result is mixed: local loss drops clearly, but held-out constrained label-choice accuracy drops by `0.0234`. Do not present this as an accuracy-improving AG News run.
+- The major systems issue observed during the run was Windows hotspot peer data-plane instability, especially Lenovo -> Pixel, not ExecuTorch OOM or model execution failure.
+
+Update: 2026-06-01 00:38 Asia/Shanghai.
+
+Started a new clean AG News phone run after Pixel/phones were moved to stable/device-MAC behavior and seq128 LoRA checkpoints were cleared.
+
+- Run pointer: debug_runs\CURRENT_AGNEWS_RUN.txt -> debug_runs\agnews-clean-device-mac-20260601-0038
+- Network at start: NX 192.168.137.98, Lenovo 192.168.137.251, Pixel 192.168.137.60 on dwellerLAPTOP 5740.
+- Peer probes passed after worker restart: NX -> Lenovo, Lenovo -> Pixel, Pixel -> Lenovo, PC -> all worker ports.
+- Deleted only tinyllama_lora_chunk_*_seq128.latest.sidckpt on the three devices so the run starts from clean seq128 adapters.
+- Active phase: eval-before256-window3; early progress 16/16 successes, 0 failures.
+- Monitor should start train512-window3 only after eval-before reaches 256 successes and 0 failures.
+
+Update: 2026-06-01 00:53 Asia/Shanghai.
+
+Clean run health check:
+
+- Active phase: eval-before256-window3.
+- Progress: 32 rows, 32 successes, 0 failures.
+- Coordinator: 3 live nodes, 0 offline stages.
+- Current route: NX 192.168.137.98:26052 -> Lenovo 192.168.137.251:26052 -> Pixel 192.168.137.5:26052.
+- Peer probes passed with the current route: NX -> Lenovo and Lenovo -> Pixel returned worker 404 / Unsupported path.
+- Pixel has already re-registered once from the start IP to 192.168.137.5, so future checks should read the live route from coordinator status rather than assuming the initial Pixel IP.
+- monitor-ag-news-clean-run is ACTIVE every 10 minutes and should advance eval-before -> train512 -> eval-after without returning to smoke tests.
+
+Update: 2026-06-01 01:10 Asia/Shanghai.
+
+Clean run transient recovery during eval-before:
+
+- `eval-before256-window3` reached 84 successes and 0 failures, then the runner entered transient retries for request indices around 84..87.
+- Coordinator showed `liveNodeCount=2`, `offlineStageCount=1`; Gradle retry messages included `Stage 2 has no live worker` and `Downstream route is not ready`.
+- Pixel still had ADB, `wlan0` IP 192.168.137.5, and the app process/server port existed, but coordinator had a stale/expired stage-2 route pointing at 192.168.137.139.
+- Recovery action: force-stopped and relaunched only the Pixel worker app during eval-before. This is acceptable for eval-before because it is eval-only and no trained LoRA state exists yet.
+- After relaunch, coordinator returned to 3 live nodes, 0 offline stages, route stage1 -> Pixel 192.168.137.5:26052, and Lenovo -> Pixel peer probe returned the expected worker 404 / Unsupported path.
+- The in-flight runner recovered inside the retry window and advanced to 86 successes, 0 failures. Do not use this kind of single-stage relaunch during the train phase unless checkpoint/restore has been explicitly validated.
+
+Update: 2026-06-01 02:09:48 Asia/Shanghai.
+
+Clean run automation advanced phase: eval-before completed with 256 successes and 0 failures; started train512-window3 manually after PowerShell alias issue, pid 30860.
+
+
+Update: 2026-06-01 02:11:26 Asia/Shanghai.
+
+Clean run automation phase-start correction: the first train512 launch failed because Start-Process argument quoting split --args and Gradle treated 50051 as a task. Wrote train512-window3/start.ps1 with eval-before-style quoted args and relaunched train512-window3, pid 8016.
+
+
+Update: 2026-06-01 04:41:17 Asia/Shanghai.
+
+Clean run automation advanced phase: train512 completed with 512 successes and 0 failures; started eval-after256-window3 via start-eval-after.ps1, pid 34720.
+
+
+Update: 2026-06-01 05:25:10 Asia/Shanghai.
+
+Clean run eval-after recovery: eval-after256-window3 stopped at 115 successes and 3 failed in-flight rows (record_index 115..117) after Pixel DHCP changed from 192.168.137.5 to 192.168.137.135. Pixel worker was relaunched during eval-only recovery; coordinator route updated to stage1 -> 192.168.137.135:26052 and Lenovo -> Pixel probe passed. Started eval-after256-recovery-from115-window3 with offset 115, limit 141, pid 30316. This preserves the trained LoRA state only if checkpoints were restored on relaunch; label-quality comparison should note this recovery caveat.
+
+
+Update: 2026-06-01 05:59:31 Asia/Shanghai.
+
+Clean AG News device-MAC run final stitched result:
+
+| phase | success | failures | label-choice acc | avg local loss |
+|---|---:|---:|---:|---:|
+| eval-before256-window3 | 256/256 | 0 | 86/256 = 0.3359 | 7.6778 |
+| train512-window3 | 512/512 | 0 | 228/512 = 0.4453 | 6.3527 |
+| eval-after stitched | 256/256 | 0 used rows, 3 interrupted rows ignored | 80/256 = 0.3125 | 5.6238 |
+
+Held-out delta after train512: label-choice accuracy -0.0234, avg local loss -2.0540.
+
+Recovery caveat: eval-after256-window3 stopped after 115 successful rows plus 3 failed in-flight rows when Pixel/stage 2 changed IP from 192.168.137.5 to 192.168.137.135. Pixel was relaunched and eval-after256-recovery-from115-window3 completed the remaining 141 rows. Treat the stitched quality result as valid only if checkpoint restore preserved the trained LoRA state across that Pixel relaunch; system-wise, this is a successful documented recovery from data-plane/IP churn.

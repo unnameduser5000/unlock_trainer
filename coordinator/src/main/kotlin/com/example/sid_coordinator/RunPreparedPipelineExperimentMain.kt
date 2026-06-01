@@ -1,5 +1,6 @@
 package com.example.sid_coordinator
 
+import com.google.gson.Gson
 import io.grpc.ManagedChannelBuilder
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
@@ -61,6 +62,7 @@ private data class PipelineResult(
     val tokenCount: Int,
     val labelChoiceCorrect: Int,
     val labelChoiceCount: Int,
+    val stageMetrics: List<Sid.StageExecutionMetrics>,
     val message: String
 ) {
     val tokenAccuracy: Double
@@ -71,6 +73,60 @@ private data class PipelineResult(
 
     val countedSuccess: Boolean
         get() = success && terminal
+
+    val firstStageTotalMs: Long
+        get() = stageMetrics.firstOrNull()?.stageTotalMs ?: 0L
+
+    val coordinatorOverheadMs: Long
+        get() = (elapsedMs - firstStageTotalMs).coerceAtLeast(0L)
+
+    val sumRuntimeAcquireMs: Long
+        get() = stageMetrics.sumOf { it.runtimeAcquireMs }
+
+    val sumCheckpointRestoreMs: Long
+        get() = stageMetrics.sumOf { it.checkpointRestoreMs }
+
+    val sumLocalQueueWaitMs: Long
+        get() = stageMetrics.sumOf { it.localQueueWaitMs }
+
+    val sumLocalElapsedMs: Long
+        get() = stageMetrics.sumOf { it.localElapsedMs }
+
+    val sumInputBuildMs: Long
+        get() = stageMetrics.sumOf { it.inputBuildMs }
+
+    val sumModelExecuteMs: Long
+        get() = stageMetrics.sumOf { it.executeMs }
+
+    val sumGradientsMs: Long
+        get() = stageMetrics.sumOf { it.gradientsMs }
+
+    val sumOptimizerCreateMs: Long
+        get() = stageMetrics.sumOf { it.optimizerCreateMs }
+
+    val sumOptimizerStepMs: Long
+        get() = stageMetrics.sumOf { it.optimizerStepMs }
+
+    val sumOptimizerMs: Long
+        get() = sumOptimizerCreateMs + sumOptimizerStepMs
+
+    val sumLocalTrainMs: Long
+        get() = sumModelExecuteMs + sumGradientsMs + sumOptimizerMs
+
+    val sumOutputConvertMs: Long
+        get() = stageMetrics.sumOf { it.outputConvertMs }
+
+    val sumBeliefEncodeMs: Long
+        get() = stageMetrics.sumOf { it.beliefEncodeMs }
+
+    val sumForwardWaitMs: Long
+        get() = stageMetrics.sumOf { it.forwardMs }
+
+    val endToEndOtherMs: Long
+        get() = (elapsedMs - sumLocalTrainMs).coerceAtLeast(0L)
+
+    val stageLearningRates: String
+        get() = stageMetrics.joinToString(";") { "${it.stageId}:${it.learningRate}" }
 }
 
 fun main(args: Array<String>) = runBlocking {
@@ -157,6 +213,8 @@ fun main(args: Array<String>) = runBlocking {
                     "terminal=${result.terminal} elapsedMs=${result.elapsedMs} loss=${result.localLoss} " +
                     "tokenAccuracy=${result.tokenAccuracy} tokens=${result.tokenCount} " +
                     "labelChoiceAccuracy=${result.labelChoiceAccuracy} labelChoiceTokens=${result.labelChoiceCount} " +
+                    "stages=${result.stageMetrics.size} localTrainMs=${result.sumLocalTrainMs} " +
+                    "otherMs=${result.endToEndOtherMs} lrs=${result.stageLearningRates} " +
                     "message=${result.message}"
             )
 
@@ -251,6 +309,7 @@ private suspend fun runPipelineSubmission(
             tokenCount = metrics.count,
             labelChoiceCorrect = metrics.labelChoiceCorrect,
             labelChoiceCount = metrics.labelChoiceCount,
+            stageMetrics = response.stageMetricsList,
             message = response.message
         )
     } catch (t: Throwable) {
@@ -275,6 +334,7 @@ private suspend fun runPipelineSubmission(
             tokenCount = 0,
             labelChoiceCorrect = 0,
             labelChoiceCount = 0,
+            stageMetrics = emptyList(),
             message = "submit failed: ${t.message}"
         )
     }
@@ -396,8 +456,72 @@ private fun PipelineResult.toCsvRow(): String {
         labelChoiceCorrect.toString(),
         labelChoiceCount.toString(),
         labelChoiceAccuracy.toString(),
+        stageMetrics.size.toString(),
+        firstStageTotalMs.toString(),
+        coordinatorOverheadMs.toString(),
+        sumRuntimeAcquireMs.toString(),
+        sumCheckpointRestoreMs.toString(),
+        sumLocalQueueWaitMs.toString(),
+        sumLocalElapsedMs.toString(),
+        sumLocalTrainMs.toString(),
+        sumModelExecuteMs.toString(),
+        sumGradientsMs.toString(),
+        sumOptimizerCreateMs.toString(),
+        sumOptimizerStepMs.toString(),
+        sumOptimizerMs.toString(),
+        sumInputBuildMs.toString(),
+        sumOutputConvertMs.toString(),
+        sumBeliefEncodeMs.toString(),
+        sumForwardWaitMs.toString(),
+        endToEndOtherMs.toString(),
+        stageLearningRates,
+        stageTimingsJson(),
         message
     ).joinToString(",") { it.csvEscape() }
+}
+
+private fun PipelineResult.stageTimingsJson(): String {
+    if (stageMetrics.isEmpty()) {
+        return "[]"
+    }
+    return TIMING_GSON.toJson(
+        stageMetrics.map { metric ->
+            linkedMapOf<String, Any>(
+                "stage_id" to metric.stageId,
+                "chunk_idx" to metric.chunkIdx,
+                "node_id" to metric.nodeId,
+                "terminal" to metric.terminal,
+                "eval_only" to metric.evalOnly,
+                "optimizer_step_applied" to metric.optimizerStepApplied,
+                "checkpoint_saved" to metric.checkpointSaved,
+                "checkpoint_interval_steps" to metric.checkpointIntervalSteps,
+                "runtime_name" to metric.runtimeName,
+                "method_name" to metric.methodName,
+                "input_count" to metric.inputCount,
+                "learning_rate" to metric.learningRate,
+                "local_loss" to metric.localLoss,
+                "local_queue_wait_ms" to metric.localQueueWaitMs,
+                "local_elapsed_ms" to metric.localElapsedMs,
+                "runtime_acquire_ms" to metric.runtimeAcquireMs,
+                "checkpoint_restore_ms" to metric.checkpointRestoreMs,
+                "input_build_ms" to metric.inputBuildMs,
+                "execute_ms" to metric.executeMs,
+                "gradients_ms" to metric.gradientsMs,
+                "optimizer_create_ms" to metric.optimizerCreateMs,
+                "optimizer_step_ms" to metric.optimizerStepMs,
+                "output_convert_ms" to metric.outputConvertMs,
+                "output_hidden_bytes" to metric.outputHiddenBytes,
+                "output_shift_log_p_bytes" to metric.outputShiftLogPBytes,
+                "belief_encode_ms" to metric.beliefEncodeMs,
+                "belief_dense_bytes" to metric.beliefDenseBytes,
+                "belief_transport_bytes" to metric.beliefTransportBytes,
+                "belief_transport_dtype" to metric.beliefTransportDtype,
+                "forward_ms" to metric.forwardMs,
+                "stage_total_ms" to metric.stageTotalMs,
+                "request_received_epoch_ms" to metric.requestReceivedEpochMs
+            )
+        }
+    )
 }
 
 private fun isTransientFailure(message: String): Boolean {
@@ -454,8 +578,30 @@ private val PIPELINE_CSV_HEADER = listOf(
     "label_choice_correct",
     "label_choice_count",
     "label_choice_accuracy",
+    "stage_metrics_count",
+    "first_stage_total_ms",
+    "coordinator_overhead_ms",
+    "sum_runtime_acquire_ms",
+    "sum_checkpoint_restore_ms",
+    "sum_local_queue_wait_ms",
+    "sum_local_elapsed_ms",
+    "sum_local_train_ms",
+    "sum_model_execute_ms",
+    "sum_gradients_ms",
+    "sum_optimizer_create_ms",
+    "sum_optimizer_step_ms",
+    "sum_optimizer_ms",
+    "sum_input_build_ms",
+    "sum_output_convert_ms",
+    "sum_belief_encode_ms",
+    "sum_forward_wait_ms",
+    "end_to_end_other_ms",
+    "stage_learning_rates",
+    "stage_timings_json",
     "message"
 ).joinToString(",")
+
+private val TIMING_GSON = Gson()
 
 private val PIPELINE_TRANSIENT_FAILURE_MARKERS = listOf(
     "has no live worker",

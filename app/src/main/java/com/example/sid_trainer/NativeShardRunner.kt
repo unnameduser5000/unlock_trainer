@@ -25,6 +25,7 @@ data class ShardExecutionResult(
     val methodName: String,
     val inputCount: Int,
     val evalOnly: Boolean,
+    val learningRate: Double,
     val optimizerStepApplied: Boolean,
     val checkpointSaved: Boolean,
     val checkpointIntervalSteps: Long,
@@ -32,6 +33,8 @@ data class ShardExecutionResult(
 )
 
 data class ShardExecutionTiming(
+    val runtimeAcquireMs: Long = 0,
+    val checkpointRestoreMs: Long = 0,
     val inputBuildMs: Long = 0,
     val executeMs: Long = 0,
     val gradientsMs: Long = 0,
@@ -40,10 +43,12 @@ data class ShardExecutionTiming(
     val outputConvertMs: Long = 0
 ) {
     val totalMeasuredMs: Long
-        get() = inputBuildMs + executeMs + gradientsMs + optimizerCreateMs + optimizerStepMs + outputConvertMs
+        get() = runtimeAcquireMs + checkpointRestoreMs + inputBuildMs + executeMs +
+            gradientsMs + optimizerCreateMs + optimizerStepMs + outputConvertMs
 
     fun describeForLog(): String {
-        return "inputBuildMs=$inputBuildMs executeMs=$executeMs gradientsMs=$gradientsMs " +
+        return "runtimeAcquireMs=$runtimeAcquireMs checkpointRestoreMs=$checkpointRestoreMs " +
+            "inputBuildMs=$inputBuildMs executeMs=$executeMs gradientsMs=$gradientsMs " +
             "optimizerCreateMs=$optimizerCreateMs optimizerStepMs=$optimizerStepMs " +
             "outputConvertMs=$outputConvertMs totalMeasuredMs=$totalMeasuredMs"
     }
@@ -70,9 +75,11 @@ object NativeShardRunner {
     private var cachedRuntime: LoadedRuntime? = null
 
     fun execute(modelPath: String, request: Sid.ForwardChunkRequest): ShardExecutionResult {
+        val runtimeAcquireStartedAtNs = System.nanoTime()
         val runtime = acquireRuntime(modelPath)
+        val runtimeAcquireMs = elapsedMsSince(runtimeAcquireStartedAtNs)
         val invocation = runtime.execute(request)
-        return invocation.toExecutionResult(request)
+        return invocation.toExecutionResult(request, runtimeAcquireMs)
     }
 
     private fun acquireRuntime(modelPath: String): LoadedRuntime = cacheLock.withLock {
@@ -229,7 +236,10 @@ object NativeShardRunner {
         return inputs
     }
 
-    private fun InvocationResult.toExecutionResult(request: Sid.ForwardChunkRequest): ShardExecutionResult {
+    private fun InvocationResult.toExecutionResult(
+        request: Sid.ForwardChunkRequest,
+        runtimeAcquireMs: Long
+    ): ShardExecutionResult {
         val startedAtNs = System.nanoTime()
         var localLoss = 0f
         val tensors = mutableListOf<Tensor>()
@@ -278,7 +288,10 @@ object NativeShardRunner {
         val shiftLogP = remainingTensors.getOrNull(1)?.toSidTensor()
             ?: copyTensorWithData(request.shiftLogPPrev, request.shiftLogPPrev.data.toByteArray())
         val outputConvertMs = elapsedMsSince(startedAtNs)
-        val finalTiming = timing.copy(outputConvertMs = outputConvertMs)
+        val finalTiming = timing.copy(
+            runtimeAcquireMs = runtimeAcquireMs,
+            outputConvertMs = outputConvertMs
+        )
 
         Log.i(
             LOG_TAG,
@@ -294,6 +307,7 @@ object NativeShardRunner {
             methodName = methodName,
             inputCount = inputCount,
             evalOnly = evalOnly,
+            learningRate = learningRate,
             optimizerStepApplied = optimizerStepApplied,
             checkpointSaved = checkpointSaved,
             checkpointIntervalSteps = checkpointIntervalSteps,
@@ -588,6 +602,7 @@ object NativeShardRunner {
         val inputCount: Int,
         val outputs: Array<EValue>,
         val evalOnly: Boolean,
+        val learningRate: Double,
         val optimizerStepApplied: Boolean,
         val checkpointSaved: Boolean,
         val checkpointIntervalSteps: Long,
@@ -610,7 +625,9 @@ object NativeShardRunner {
         private val committedRequestKeys = LinkedHashSet<String>()
 
         override fun execute(request: Sid.ForwardChunkRequest): InvocationResult {
+            val checkpointRestoreStartedAtNs = System.nanoTime()
             ensureCheckpointRestored()
+            val checkpointRestoreMs = elapsedMsSince(checkpointRestoreStartedAtNs)
             val requestKey = request.commitKey()
             val effectiveRequest = if (!request.evalOnly && committedRequestKeys.contains(requestKey)) {
                 Log.w(
@@ -692,10 +709,12 @@ object NativeShardRunner {
                 inputCount = inputs.size,
                 outputs = outputs,
                 evalOnly = effectiveRequest.evalOnly,
+                learningRate = learningRate,
                 optimizerStepApplied = optimizerStepApplied,
                 checkpointSaved = checkpointSaved,
                 checkpointIntervalSteps = TRAINING_CHECKPOINT_INTERVAL_STEPS,
                 timing = ShardExecutionTiming(
+                    checkpointRestoreMs = checkpointRestoreMs,
                     inputBuildMs = inputBuildMs,
                     executeMs = executeMs,
                     gradientsMs = gradientsMs,
@@ -822,6 +841,7 @@ object NativeShardRunner {
                         inputCount = inputs.size,
                         outputs = outputs,
                         evalOnly = request.evalOnly,
+                        learningRate = 0.0,
                         optimizerStepApplied = false,
                         checkpointSaved = false,
                         checkpointIntervalSteps = TRAINING_CHECKPOINT_INTERVAL_STEPS,

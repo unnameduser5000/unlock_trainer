@@ -433,6 +433,7 @@ class MainActivity : ComponentActivity() {
         request: Sid.ForwardChunkRequest
     ): Sid.ForwardChunkResponse {
         val requestId = request.requestId.ifBlank { "batch-${request.batchId}" }
+        val requestReceivedEpochMs = System.currentTimeMillis()
         val chunkStartedAtNs = System.nanoTime()
         appendLog("Chunk received request=$requestId chunk=${request.chunkIdx} evalOnly=${request.evalOnly}")
         grpcManager.reportRequestEvent(
@@ -487,9 +488,11 @@ class MainActivity : ComponentActivity() {
         }
 
         val memoryBefore = WorkerTelemetryReader.read(applicationContext)
-        val localStartedAtNs = System.nanoTime()
+        val localQueueStartedAtNs = System.nanoTime()
+        var localQueueWaitMs = 0L
         val execution = try {
             localExecutionMutex.withLock {
+                localQueueWaitMs = elapsedMsSince(localQueueStartedAtNs)
                 Trace.beginSection("sid_worker_local_execute")
                 try {
                     NativeShardRunner.execute(modelPath, request)
@@ -515,11 +518,12 @@ class MainActivity : ComponentActivity() {
                 message = "Native shard execution failed: ${t.message}"
             )
         }
-        val localElapsedMs = elapsedMsSince(localStartedAtNs)
+        val localElapsedMs = elapsedMsSince(localQueueStartedAtNs)
         val memoryAfter = WorkerTelemetryReader.read(applicationContext)
         val memoryTimingMessage = memoryDeltaMessage(memoryBefore, memoryAfter)
         val localTimingMessage = "runtime=${execution.runtimeName} method=${execution.methodName} " +
-            "inputs=${execution.inputCount} localMs=$localElapsedMs " +
+            "inputs=${execution.inputCount} lr=${execution.learningRate} " +
+            "localQueueWaitMs=$localQueueWaitMs localMs=$localElapsedMs " +
             "loss=${execution.localLoss} evalOnly=${execution.evalOnly} " +
             "optimizerStepApplied=${execution.optimizerStepApplied} " +
             "checkpointSaved=${execution.checkpointSaved} checkpointIntervalSteps=${execution.checkpointIntervalSteps} " +
@@ -540,7 +544,35 @@ class MainActivity : ComponentActivity() {
             terminal = registration.isTerminal
         )
 
-        val localResponse = Sid.ForwardChunkResponse.newBuilder()
+        val stageMetricBuilder = Sid.StageExecutionMetrics.newBuilder()
+            .setStageId(registration.stageId)
+            .setChunkIdx(request.chunkIdx)
+            .setNodeId(registration.nodeId)
+            .setTerminal(registration.isTerminal)
+            .setEvalOnly(execution.evalOnly)
+            .setOptimizerStepApplied(execution.optimizerStepApplied)
+            .setCheckpointSaved(execution.checkpointSaved)
+            .setCheckpointIntervalSteps(execution.checkpointIntervalSteps)
+            .setRuntimeName(execution.runtimeName)
+            .setMethodName(execution.methodName)
+            .setInputCount(execution.inputCount)
+            .setLearningRate(execution.learningRate)
+            .setLocalLoss(execution.localLoss)
+            .setLocalQueueWaitMs(localQueueWaitMs)
+            .setLocalElapsedMs(localElapsedMs)
+            .setRuntimeAcquireMs(execution.timing.runtimeAcquireMs)
+            .setCheckpointRestoreMs(execution.timing.checkpointRestoreMs)
+            .setInputBuildMs(execution.timing.inputBuildMs)
+            .setExecuteMs(execution.timing.executeMs)
+            .setGradientsMs(execution.timing.gradientsMs)
+            .setOptimizerCreateMs(execution.timing.optimizerCreateMs)
+            .setOptimizerStepMs(execution.timing.optimizerStepMs)
+            .setOutputConvertMs(execution.timing.outputConvertMs)
+            .setOutputHiddenBytes(execution.outputHiddenStates.data.size().toLong())
+            .setOutputShiftLogPBytes(execution.outputShiftLogP.data.size().toLong())
+            .setRequestReceivedEpochMs(requestReceivedEpochMs)
+
+        val localResponseBuilder = Sid.ForwardChunkResponse.newBuilder()
             .setSuccess(true)
             .setMessage("Stage ${registration.stageId} finished request $requestId")
             .setLocalLoss(execution.localLoss)
@@ -549,10 +581,16 @@ class MainActivity : ComponentActivity() {
             .setProcessedChunkIdx(request.chunkIdx)
             .setProcessedStageId(registration.stageId)
             .setTerminal(registration.isTerminal)
-            .build()
 
         if (registration.isTerminal) {
             val totalStageMs = elapsedMsSince(chunkStartedAtNs)
+            val localResponse = localResponseBuilder
+                .addStageMetrics(
+                    stageMetricBuilder
+                        .setStageTotalMs(totalStageMs)
+                        .build()
+                )
+                .build()
             appendLog("Terminal response returned for request=$requestId totalStageMs=$totalStageMs")
             grpcManager.reportRequestEvent(
                 registration = registration,
@@ -571,11 +609,13 @@ class MainActivity : ComponentActivity() {
             "Non-terminal stage ${registration.stageId} lost its downstream route after readiness check."
         }
 
+        val beliefEncodeStartedAtNs = System.nanoTime()
         val transportedBelief = if (ENABLE_TOPK_BELIEF_TRANSPORT) {
             BeliefTopKCodec.encodeForTransport(execution.outputShiftLogP)
         } else {
             execution.outputShiftLogP
         }
+        val beliefEncodeMs = elapsedMsSince(beliefEncodeStartedAtNs)
         val beliefTransportMessage = "beliefTopKEnabled=$ENABLE_TOPK_BELIEF_TRANSPORT " +
             "beliefTopK=${BeliefTopKCodec.DEFAULT_TOP_K} " +
             "beliefDenseBytes=${execution.outputShiftLogP.data.size()} " +
@@ -592,6 +632,7 @@ class MainActivity : ComponentActivity() {
             .setShiftLogPPrev(transportedBelief)
             .setRequestId(requestId)
             .setEvalOnly(request.evalOnly)
+            .setLearningRate(request.learningRate)
             .build()
 
         appendLog(
@@ -616,6 +657,20 @@ class MainActivity : ComponentActivity() {
         }
         val forwardMs = elapsedMsSince(forwardStartedAtNs)
         val totalStageMs = elapsedMsSince(chunkStartedAtNs)
+        val stageMetric = stageMetricBuilder
+            .setBeliefEncodeMs(beliefEncodeMs)
+            .setBeliefDenseBytes(execution.outputShiftLogP.data.size().toLong())
+            .setBeliefTransportBytes(transportedBelief.data.size().toLong())
+            .setBeliefTransportDtype(transportedBelief.dataType)
+            .setForwardMs(forwardMs)
+            .setStageTotalMs(totalStageMs)
+            .build()
+        val responseWithMetrics = downstreamResponse.toBuilder()
+            .clearStageMetrics()
+            .addStageMetrics(stageMetric)
+            .addAllStageMetrics(downstreamResponse.stageMetricsList)
+            .setMessage("${downstreamResponse.message}; forwardMs=$forwardMs totalStageMs=$totalStageMs")
+            .build()
         appendLog(
             "Forward completed request=$requestId success=${downstreamResponse.success} " +
                 "forwardMs=$forwardMs totalStageMs=$totalStageMs"
@@ -632,6 +687,7 @@ class MainActivity : ComponentActivity() {
                 message = "${downstreamResponse.message}; forwardMs=$forwardMs totalStageMs=$totalStageMs",
                 terminal = downstreamResponse.terminal
             )
+            return responseWithMetrics
         } else {
             grpcManager.reportRequestEvent(
                 registration = registration,
@@ -644,7 +700,7 @@ class MainActivity : ComponentActivity() {
                 terminal = downstreamResponse.terminal
             )
         }
-        return downstreamResponse
+        return responseWithMetrics
     }
 
     private fun buildFailureResponse(

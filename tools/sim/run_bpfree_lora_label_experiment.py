@@ -686,6 +686,21 @@ def main() -> None:
     parser.add_argument("--learning_rate", type=float, default=None)
     parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument(
+        "--optimizer",
+        default="adamw",
+        choices=["adamw", "sgd"],
+        help=(
+            "Optimizer for trainable LoRA parameters. adamw is the historical "
+            "server default; sgd approximates the current ExecuTorch phone runner."
+        ),
+    )
+    parser.add_argument(
+        "--sgd_momentum",
+        type=float,
+        default=0.0,
+        help="Momentum used when --optimizer=sgd.",
+    )
+    parser.add_argument(
         "--train_schedule",
         default="fifo",
         choices=["fifo", "stage_window"],
@@ -753,11 +768,16 @@ def main() -> None:
         alpha=args.alpha,
         label_smoothing=args.label_smoothing,
     )
+    def build_optimizer(params: list[nn.Parameter]) -> torch.optim.Optimizer:
+        learning_rate = args.learning_rate or 3e-4
+        if args.optimizer == "adamw":
+            return torch.optim.AdamW(params, lr=learning_rate)
+        if args.optimizer == "sgd":
+            return torch.optim.SGD(params, lr=learning_rate, momentum=args.sgd_momentum)
+        raise ValueError(f"Unsupported optimizer: {args.optimizer}")
+
     optimizers = {
-        idx: torch.optim.AdamW(
-            [param for param in chunks[idx].parameters() if param.requires_grad],
-            lr=args.learning_rate or 3e-4,
-        )
+        idx: build_optimizer([param for param in chunks[idx].parameters() if param.requires_grad])
         for idx in train_chunks
     }
 
@@ -826,6 +846,9 @@ def main() -> None:
             "trainable_params": trainable,
         },
         "learning_rate": args.learning_rate,
+        "optimizer": args.optimizer,
+        "sgd_momentum": args.sgd_momentum,
+        "grad_clip": args.grad_clip,
         "train_schedule": args.train_schedule,
         "pipeline_window": args.pipeline_window,
         "alpha": args.alpha,

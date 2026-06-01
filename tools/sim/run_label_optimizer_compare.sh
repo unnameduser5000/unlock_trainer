@@ -3,7 +3,7 @@ set -euo pipefail
 
 TRAIN_MANIFEST="${TRAIN_MANIFEST:-data/sft_requests/tinyllama_agnews128_label_train512_seed20260531/requests.jsonl}"
 EVAL_MANIFEST="${EVAL_MANIFEST:-data/sft_requests/tinyllama_agnews128_label_eval256_seed20260531/requests.jsonl}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-debug_runs/server_window_compare/$(date +%Y%m%d-%H%M%S)}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-debug_runs/server_optimizer_compare/$(date +%Y%m%d-%H%M%S)}"
 
 MODEL_NAME="${MODEL_NAME:-tinyllama}"
 NUM_CHUNKS="${NUM_CHUNKS:-3}"
@@ -13,33 +13,28 @@ TRAIN_EPOCHS="${TRAIN_EPOCHS:-1}"
 EVAL_LIMIT="${EVAL_LIMIT:-256}"
 DEVICE="${DEVICE:-auto}"
 DTYPE="${DTYPE:-float32}"
-GRAD_CLIP="${GRAD_CLIP:-1.0}"
+GRAD_CLIP="${GRAD_CLIP:-0.0}"
 LORA_RANK="${LORA_RANK:-4}"
 LORA_ALPHA="${LORA_ALPHA:-16}"
 LORA_TARGETS="${LORA_TARGETS:-q_proj,v_proj}"
 ALPHA="${ALPHA:-0.5}"
 LABEL_SMOOTHING="${LABEL_SMOOTHING:-0.1}"
-OPTIMIZER="${OPTIMIZER:-adamw}"
-SGD_MOMENTUM="${SGD_MOMENTUM:-0.0}"
+TRAIN_SCHEDULE="${TRAIN_SCHEDULE:-stage_window}"
+PIPELINE_WINDOW="${PIPELINE_WINDOW:-3}"
 SEED="${SEED:-20260531}"
 LRS="${LRS:-1e-4}"
-PIPELINE_WINDOWS="${PIPELINE_WINDOWS:-1 3}"
+OPTIMIZERS="${OPTIMIZERS:-adamw sgd}"
+SGD_MOMENTUM="${SGD_MOMENTUM:-0.0}"
 
 mkdir -p "${OUTPUT_ROOT}"
 
-for window in ${PIPELINE_WINDOWS}; do
-  if [[ "${window}" == "1" ]]; then
-    schedule="fifo"
-    case_name="fifo_window1"
-  else
-    schedule="stage_window"
-    case_name="stage_window${window}"
-  fi
+for optimizer in ${OPTIMIZERS}; do
+  case_name="${optimizer}_${TRAIN_SCHEDULE}${PIPELINE_WINDOW}"
   case_root="${OUTPUT_ROOT}/${case_name}"
 
   echo "========================================================================"
-  echo "Window case: ${case_name}"
-  echo "  schedule=${schedule} pipeline_window=${window}"
+  echo "Optimizer case: ${case_name}"
+  echo "  optimizer=${optimizer} schedule=${TRAIN_SCHEDULE} pipeline_window=${PIPELINE_WINDOW}"
   echo "  output=${case_root}"
 
   TRAIN_MANIFEST="${TRAIN_MANIFEST}" \
@@ -59,9 +54,9 @@ for window in ${PIPELINE_WINDOWS}; do
   LORA_TARGETS="${LORA_TARGETS}" \
   ALPHA="${ALPHA}" \
   LABEL_SMOOTHING="${LABEL_SMOOTHING}" \
-  TRAIN_SCHEDULE="${schedule}" \
-  PIPELINE_WINDOW="${window}" \
-  OPTIMIZER="${OPTIMIZER}" \
+  TRAIN_SCHEDULE="${TRAIN_SCHEDULE}" \
+  PIPELINE_WINDOW="${PIPELINE_WINDOW}" \
+  OPTIMIZER="${optimizer}" \
   SGD_MOMENTUM="${SGD_MOMENTUM}" \
   SEED="${SEED}" \
   LRS="${LRS}" \
@@ -73,5 +68,5 @@ python tools/report/summarize_label_controls.py \
   "${OUTPUT_ROOT}" \
   --output_csv "${OUTPUT_ROOT}/summary_table.csv"
 echo "========================================================================"
-echo "Window compare finished: ${OUTPUT_ROOT}"
+echo "Optimizer compare finished: ${OUTPUT_ROOT}"
 echo "Summary table: ${OUTPUT_ROOT}/summary_table.csv"

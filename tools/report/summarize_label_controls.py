@@ -38,6 +38,9 @@ def main() -> None:
         row = {
             "case": case,
             "learning_rate": summary.get("learning_rate"),
+            "optimizer": summary.get("optimizer", "adamw"),
+            "sgd_momentum": summary.get("sgd_momentum", 0.0),
+            "grad_clip": summary.get("grad_clip", 1.0),
             "num_chunks": summary.get("num_chunks"),
             "train_chunks": ",".join(str(x) for x in summary.get("train_chunks", [])),
             "train_schedule": summary.get("train_schedule", "fifo"),

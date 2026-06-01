@@ -12,6 +12,7 @@ TRAIN_EPOCHS="${TRAIN_EPOCHS:-1}"
 EVAL_LIMIT="${EVAL_LIMIT:-256}"
 DEVICE="${DEVICE:-auto}"
 DTYPE="${DTYPE:-float32}"
+GRAD_CLIP="${GRAD_CLIP:-1.0}"
 LORA_RANK="${LORA_RANK:-4}"
 LORA_ALPHA="${LORA_ALPHA:-16}"
 LORA_TARGETS="${LORA_TARGETS:-q_proj,v_proj}"
@@ -19,6 +20,8 @@ ALPHA="${ALPHA:-0.5}"
 LABEL_SMOOTHING="${LABEL_SMOOTHING:-0.1}"
 TRAIN_SCHEDULE="${TRAIN_SCHEDULE:-fifo}"
 PIPELINE_WINDOW="${PIPELINE_WINDOW:-1}"
+OPTIMIZER="${OPTIMIZER:-adamw}"
+SGD_MOMENTUM="${SGD_MOMENTUM:-0.0}"
 SEED="${SEED:-20260531}"
 LRS="${LRS:-1e-5 3e-5 1e-4 3e-4}"
 
@@ -39,6 +42,7 @@ for lr in ${LRS}; do
     --train_epochs "${TRAIN_EPOCHS}" \
     --eval_limit "${EVAL_LIMIT}" \
     --learning_rate "${lr}" \
+    --grad_clip "${GRAD_CLIP}" \
     --device "${DEVICE}" \
     --dtype "${DTYPE}" \
     --lora_rank "${LORA_RANK}" \
@@ -46,6 +50,8 @@ for lr in ${LRS}; do
     --lora_targets "${LORA_TARGETS}" \
     --train_schedule "${TRAIN_SCHEDULE}" \
     --pipeline_window "${PIPELINE_WINDOW}" \
+    --optimizer "${OPTIMIZER}" \
+    --sgd_momentum "${SGD_MOMENTUM}" \
     --alpha "${ALPHA}" \
     --label_smoothing "${LABEL_SMOOTHING}" \
     --seed "${SEED}"
