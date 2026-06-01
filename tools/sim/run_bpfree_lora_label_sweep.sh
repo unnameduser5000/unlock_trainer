@@ -22,6 +22,9 @@ TRAIN_SCHEDULE="${TRAIN_SCHEDULE:-fifo}"
 PIPELINE_WINDOW="${PIPELINE_WINDOW:-1}"
 OPTIMIZER="${OPTIMIZER:-adamw}"
 SGD_MOMENTUM="${SGD_MOMENTUM:-0.0}"
+SGD_DAMPENING="${SGD_DAMPENING:-0.0}"
+SGD_WEIGHT_DECAY="${SGD_WEIGHT_DECAY:-0.0}"
+SGD_NESTEROV="${SGD_NESTEROV:-false}"
 SEED="${SEED:-20260531}"
 LRS="${LRS:-1e-5 3e-5 1e-4 3e-4}"
 
@@ -31,6 +34,11 @@ for lr in ${LRS}; do
   run_dir="${OUTPUT_ROOT}/lr_${lr}"
   echo "========================================================================"
   echo "Running lr=${lr} -> ${run_dir}"
+  extra_args=()
+  if [[ "${SGD_NESTEROV}" == "true" || "${SGD_NESTEROV}" == "1" ]]; then
+    extra_args+=(--sgd_nesterov)
+  fi
+
   python tools/sim/run_bpfree_lora_label_experiment.py \
     --model_name "${MODEL_NAME}" \
     --train_manifest "${TRAIN_MANIFEST}" \
@@ -52,9 +60,12 @@ for lr in ${LRS}; do
     --pipeline_window "${PIPELINE_WINDOW}" \
     --optimizer "${OPTIMIZER}" \
     --sgd_momentum "${SGD_MOMENTUM}" \
+    --sgd_dampening "${SGD_DAMPENING}" \
+    --sgd_weight_decay "${SGD_WEIGHT_DECAY}" \
     --alpha "${ALPHA}" \
     --label_smoothing "${LABEL_SMOOTHING}" \
-    --seed "${SEED}"
+    --seed "${SEED}" \
+    "${extra_args[@]}"
 done
 
 echo "========================================================================"

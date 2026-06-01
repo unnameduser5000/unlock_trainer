@@ -25,6 +25,9 @@ SEED="${SEED:-20260531}"
 LRS="${LRS:-1e-4}"
 OPTIMIZERS="${OPTIMIZERS:-adamw sgd}"
 SGD_MOMENTUM="${SGD_MOMENTUM:-0.0}"
+SGD_DAMPENING="${SGD_DAMPENING:-0.0}"
+SGD_WEIGHT_DECAY="${SGD_WEIGHT_DECAY:-0.0}"
+SGD_NESTEROV="${SGD_NESTEROV:-false}"
 
 mkdir -p "${OUTPUT_ROOT}"
 
@@ -58,6 +61,9 @@ for optimizer in ${OPTIMIZERS}; do
   PIPELINE_WINDOW="${PIPELINE_WINDOW}" \
   OPTIMIZER="${optimizer}" \
   SGD_MOMENTUM="${SGD_MOMENTUM}" \
+  SGD_DAMPENING="${SGD_DAMPENING}" \
+  SGD_WEIGHT_DECAY="${SGD_WEIGHT_DECAY}" \
+  SGD_NESTEROV="${SGD_NESTEROV}" \
   SEED="${SEED}" \
   LRS="${LRS}" \
   bash tools/sim/run_bpfree_lora_label_sweep.sh

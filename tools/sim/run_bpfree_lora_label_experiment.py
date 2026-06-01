@@ -701,6 +701,23 @@ def main() -> None:
         help="Momentum used when --optimizer=sgd.",
     )
     parser.add_argument(
+        "--sgd_dampening",
+        type=float,
+        default=0.0,
+        help="Dampening used when --optimizer=sgd.",
+    )
+    parser.add_argument(
+        "--sgd_weight_decay",
+        type=float,
+        default=0.0,
+        help="Weight decay used when --optimizer=sgd.",
+    )
+    parser.add_argument(
+        "--sgd_nesterov",
+        action="store_true",
+        help="Enable Nesterov momentum when --optimizer=sgd.",
+    )
+    parser.add_argument(
         "--train_schedule",
         default="fifo",
         choices=["fifo", "stage_window"],
@@ -773,7 +790,14 @@ def main() -> None:
         if args.optimizer == "adamw":
             return torch.optim.AdamW(params, lr=learning_rate)
         if args.optimizer == "sgd":
-            return torch.optim.SGD(params, lr=learning_rate, momentum=args.sgd_momentum)
+            return torch.optim.SGD(
+                params,
+                lr=learning_rate,
+                momentum=args.sgd_momentum,
+                dampening=args.sgd_dampening,
+                weight_decay=args.sgd_weight_decay,
+                nesterov=args.sgd_nesterov,
+            )
         raise ValueError(f"Unsupported optimizer: {args.optimizer}")
 
     optimizers = {
@@ -848,6 +872,9 @@ def main() -> None:
         "learning_rate": args.learning_rate,
         "optimizer": args.optimizer,
         "sgd_momentum": args.sgd_momentum,
+        "sgd_dampening": args.sgd_dampening,
+        "sgd_weight_decay": args.sgd_weight_decay,
+        "sgd_nesterov": args.sgd_nesterov,
         "grad_clip": args.grad_clip,
         "train_schedule": args.train_schedule,
         "pipeline_window": args.pipeline_window,
