@@ -17,6 +17,8 @@ LORA_ALPHA="${LORA_ALPHA:-16}"
 LORA_TARGETS="${LORA_TARGETS:-q_proj,v_proj}"
 ALPHA="${ALPHA:-0.5}"
 LABEL_SMOOTHING="${LABEL_SMOOTHING:-0.1}"
+TRAIN_SCHEDULE="${TRAIN_SCHEDULE:-fifo}"
+PIPELINE_WINDOW="${PIPELINE_WINDOW:-1}"
 SEED="${SEED:-20260531}"
 LRS="${LRS:-1e-5 3e-5 1e-4 3e-4}"
 
@@ -42,6 +44,8 @@ for lr in ${LRS}; do
     --lora_rank "${LORA_RANK}" \
     --lora_alpha "${LORA_ALPHA}" \
     --lora_targets "${LORA_TARGETS}" \
+    --train_schedule "${TRAIN_SCHEDULE}" \
+    --pipeline_window "${PIPELINE_WINDOW}" \
     --alpha "${ALPHA}" \
     --label_smoothing "${LABEL_SMOOTHING}" \
     --seed "${SEED}"

@@ -313,57 +313,71 @@ def label_choice_metrics(
     return correct, count, avg_loss
 
 
-def run_record(
+def load_record_state(
     record: dict[str, Any],
     manifest_dir: Path,
-    chunks: list[BpfreeChunk],
+    device: torch.device,
+) -> dict[str, Any]:
+    tensors = record["tensors"]
+    return {
+        "hidden": load_tensor(manifest_dir, tensors["hidden_states"]).to(device),
+        "attention_mask": load_tensor(manifest_dir, tensors["attention_mask"]).to(device),
+        "position_ids": load_tensor(manifest_dir, tensors["position_ids"]).to(device),
+        "labels": load_tensor(manifest_dir, tensors["labels"]).to(device),
+        "prev_log_probs": None,
+        "losses": [],
+    }
+
+
+def run_chunk_for_state(
+    *,
+    record: dict[str, Any],
+    state: dict[str, Any],
+    chunk_idx: int,
+    chunk: BpfreeChunk,
     optimizers: dict[int, torch.optim.Optimizer],
     train_chunks: set[int],
-    device: torch.device,
     mode: str,
     learning_rate_override: float | None,
     grad_clip: float,
-) -> dict[str, Any]:
-    tensors = record["tensors"]
-    hidden = load_tensor(manifest_dir, tensors["hidden_states"]).to(device)
-    attention_mask = load_tensor(manifest_dir, tensors["attention_mask"]).to(device)
-    position_ids = load_tensor(manifest_dir, tensors["position_ids"]).to(device)
-    labels = load_tensor(manifest_dir, tensors["labels"]).to(device)
-    prev_log_probs = None
-    losses = []
+) -> None:
+    train_this_chunk = mode == "train" and chunk_idx in train_chunks
+    chunk.train(train_this_chunk)
+    if train_this_chunk:
+        optimizer = optimizers[chunk_idx]
+        lr = learning_rate_override
+        if lr is None:
+            lr = record.get("learning_rate")
+        if lr is not None:
+            for group in optimizer.param_groups:
+                group["lr"] = float(lr)
+        optimizer.zero_grad(set_to_none=True)
 
-    for chunk_idx, chunk in enumerate(chunks):
-        train_this_chunk = mode == "train" and chunk_idx in train_chunks
-        chunk.train(train_this_chunk)
+    with torch.set_grad_enabled(train_this_chunk):
+        loss, next_hidden, next_log_probs = chunk(
+            hidden_states=state["hidden"],
+            attention_mask=state["attention_mask"],
+            position_ids=state["position_ids"],
+            labels=state["labels"],
+            prev_log_probs=state["prev_log_probs"],
+        )
         if train_this_chunk:
-            optimizer = optimizers[chunk_idx]
-            lr = learning_rate_override
-            if lr is None:
-                lr = record.get("learning_rate")
-            if lr is not None:
-                for group in optimizer.param_groups:
-                    group["lr"] = float(lr)
-            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            if grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(chunk.parameters(), grad_clip)
+            optimizers[chunk_idx].step()
 
-        with torch.set_grad_enabled(train_this_chunk):
-            loss, next_hidden, next_log_probs = chunk(
-                hidden_states=hidden,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                labels=labels,
-                prev_log_probs=prev_log_probs,
-            )
-            if train_this_chunk:
-                loss.backward()
-                if grad_clip > 0:
-                    torch.nn.utils.clip_grad_norm_(chunk.parameters(), grad_clip)
-                optimizers[chunk_idx].step()
+    state["losses"].append(float(loss.detach().cpu().item()))
+    state["hidden"] = next_hidden.detach()
+    state["prev_log_probs"] = next_log_probs.detach()
 
-        losses.append(float(loss.detach().cpu().item()))
-        hidden = next_hidden.detach()
-        prev_log_probs = next_log_probs.detach()
 
-    assert prev_log_probs is not None
+def finish_record_result(record: dict[str, Any], state: dict[str, Any], mode: str) -> dict[str, Any]:
+    prev_log_probs = state["prev_log_probs"]
+    if prev_log_probs is None:
+        raise RuntimeError("Record finished without final log probabilities.")
+    labels = state["labels"]
+    losses = state["losses"]
     choice_ids = one_token_choice_ids(record)
     choice_correct, choice_count, choice_loss = label_choice_metrics(prev_log_probs, labels, choice_ids)
     response = (record.get("text") or {}).get("response", "").strip()
@@ -381,10 +395,8 @@ def run_record(
     }
 
 
-def run_phase(
-    *,
-    name: str,
-    records: list[dict[str, Any]],
+def run_record(
+    record: dict[str, Any],
     manifest_dir: Path,
     chunks: list[BpfreeChunk],
     optimizers: dict[int, torch.optim.Optimizer],
@@ -393,69 +405,72 @@ def run_phase(
     mode: str,
     learning_rate_override: float | None,
     grad_clip: float,
-    output_csv: Path,
 ) -> dict[str, Any]:
-    output_csv.parent.mkdir(parents=True, exist_ok=True)
-    fieldnames = [
-        "seq",
-        "request_id",
-        "dataset_index",
-        "response",
-        "mode",
-        "loss",
-        "choice_correct",
-        "choice_count",
-        "choice_accuracy",
-        "choice_loss",
-        "chunk_losses_json",
-    ]
-    correct = 0
-    count = 0
-    losses = []
-    per_class: dict[str, dict[str, float]] = {}
-    with output_csv.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        for seq, record in enumerate(records):
-            result = run_record(
-                record=record,
-                manifest_dir=manifest_dir,
-                chunks=chunks,
-                optimizers=optimizers,
-                train_chunks=train_chunks,
-                device=device,
-                mode=mode,
-                learning_rate_override=learning_rate_override,
-                grad_clip=grad_clip,
-            )
-            correct += result["choice_correct"]
-            count += result["choice_count"]
-            losses.append(result["loss"])
-            label = result["response"] or "unknown"
-            stats = per_class.setdefault(label, {"correct": 0.0, "count": 0.0, "loss_sum": 0.0})
-            stats["correct"] += result["choice_correct"]
-            stats["count"] += result["choice_count"]
-            stats["loss_sum"] += result["loss"]
-            writer.writerow(
-                {
-                    "seq": seq,
-                    "request_id": result["request_id"],
-                    "dataset_index": result["dataset_index"],
-                    "response": result["response"],
-                    "mode": result["mode"],
-                    "loss": result["loss"],
-                    "choice_correct": result["choice_correct"],
-                    "choice_count": result["choice_count"],
-                    "choice_accuracy": result["choice_accuracy"],
-                    "choice_loss": result["choice_loss"],
-                    "chunk_losses_json": json.dumps(result["chunk_losses"]),
-                }
-            )
-            if (seq + 1) % 16 == 0 or seq + 1 == len(records):
-                acc = correct / count if count else 0.0
-                avg_loss = sum(losses) / len(losses)
-                print(f"{name}: {seq + 1}/{len(records)} acc={acc:.4f} loss={avg_loss:.4f}")
+    state = load_record_state(record, manifest_dir, device)
+    for chunk_idx, chunk in enumerate(chunks):
+        run_chunk_for_state(
+            record=record,
+            state=state,
+            chunk_idx=chunk_idx,
+            chunk=chunk,
+            optimizers=optimizers,
+            train_chunks=train_chunks,
+            mode=mode,
+            learning_rate_override=learning_rate_override,
+            grad_clip=grad_clip,
+        )
+    return finish_record_result(record, state, mode)
 
+
+def accumulate_result(
+    *,
+    result: dict[str, Any],
+    correct: int,
+    count: int,
+    losses: list[float],
+    per_class: dict[str, dict[str, float]],
+) -> tuple[int, int]:
+    correct += result["choice_correct"]
+    count += result["choice_count"]
+    losses.append(result["loss"])
+    label = result["response"] or "unknown"
+    stats = per_class.setdefault(label, {"correct": 0.0, "count": 0.0, "loss_sum": 0.0})
+    stats["correct"] += result["choice_correct"]
+    stats["count"] += result["choice_count"]
+    stats["loss_sum"] += result["loss"]
+    return correct, count
+
+
+def write_result_row(writer: csv.DictWriter, seq: int, result: dict[str, Any]) -> None:
+    writer.writerow(
+        {
+            "seq": seq,
+            "request_id": result["request_id"],
+            "dataset_index": result["dataset_index"],
+            "response": result["response"],
+            "mode": result["mode"],
+            "loss": result["loss"],
+            "choice_correct": result["choice_correct"],
+            "choice_count": result["choice_count"],
+            "choice_accuracy": result["choice_accuracy"],
+            "choice_loss": result["choice_loss"],
+            "chunk_losses_json": json.dumps(result["chunk_losses"]),
+        }
+    )
+
+
+def summarize_phase(
+    *,
+    name: str,
+    records_len: int,
+    correct: int,
+    count: int,
+    losses: list[float],
+    per_class: dict[str, dict[str, float]],
+    output_csv: Path,
+    train_schedule: str,
+    pipeline_window: int,
+) -> dict[str, Any]:
     class_rows = []
     for label, stats in sorted(per_class.items()):
         class_count = int(stats["count"])
@@ -470,14 +485,180 @@ def run_phase(
         )
     return {
         "phase": name,
-        "rows": len(records),
+        "rows": records_len,
         "choice_correct": int(correct),
         "choice_count": int(count),
         "choice_accuracy": (correct / count) if count else 0.0,
         "avg_loss": sum(losses) / len(losses),
         "per_class": class_rows,
         "csv": str(output_csv),
+        "train_schedule": train_schedule,
+        "pipeline_window": pipeline_window,
     }
+
+
+def result_fieldnames() -> list[str]:
+    return [
+        "seq",
+        "request_id",
+        "dataset_index",
+        "response",
+        "mode",
+        "loss",
+        "choice_correct",
+        "choice_count",
+        "choice_accuracy",
+        "choice_loss",
+        "chunk_losses_json",
+    ]
+
+
+def run_phase_stage_window(
+    *,
+    name: str,
+    records: list[dict[str, Any]],
+    manifest_dir: Path,
+    chunks: list[BpfreeChunk],
+    optimizers: dict[int, torch.optim.Optimizer],
+    train_chunks: set[int],
+    device: torch.device,
+    learning_rate_override: float | None,
+    grad_clip: float,
+    output_csv: Path,
+    pipeline_window: int,
+) -> dict[str, Any]:
+    if pipeline_window <= 1:
+        raise ValueError("stage_window schedule requires pipeline_window > 1.")
+
+    output_csv.parent.mkdir(parents=True, exist_ok=True)
+    correct = 0
+    count = 0
+    losses: list[float] = []
+    per_class: dict[str, dict[str, float]] = {}
+    with output_csv.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=result_fieldnames())
+        writer.writeheader()
+        seq = 0
+        for start in range(0, len(records), pipeline_window):
+            batch_records = records[start : start + pipeline_window]
+            states = [load_record_state(record, manifest_dir, device) for record in batch_records]
+            for chunk_idx, chunk in enumerate(chunks):
+                for record, state in zip(batch_records, states, strict=False):
+                    run_chunk_for_state(
+                        record=record,
+                        state=state,
+                        chunk_idx=chunk_idx,
+                        chunk=chunk,
+                        optimizers=optimizers,
+                        train_chunks=train_chunks,
+                        mode="train",
+                        learning_rate_override=learning_rate_override,
+                        grad_clip=grad_clip,
+                    )
+            for record, state in zip(batch_records, states, strict=False):
+                result = finish_record_result(record, state, "train")
+                correct, count = accumulate_result(
+                    result=result,
+                    correct=correct,
+                    count=count,
+                    losses=losses,
+                    per_class=per_class,
+                )
+                write_result_row(writer, seq, result)
+                seq += 1
+                if seq % 16 == 0 or seq == len(records):
+                    acc = correct / count if count else 0.0
+                    avg_loss = sum(losses) / len(losses)
+                    print(f"{name}: {seq}/{len(records)} acc={acc:.4f} loss={avg_loss:.4f}")
+
+    return summarize_phase(
+        name=name,
+        records_len=len(records),
+        correct=correct,
+        count=count,
+        losses=losses,
+        per_class=per_class,
+        output_csv=output_csv,
+        train_schedule="stage_window",
+        pipeline_window=pipeline_window,
+    )
+
+
+def run_phase(
+    *,
+    name: str,
+    records: list[dict[str, Any]],
+    manifest_dir: Path,
+    chunks: list[BpfreeChunk],
+    optimizers: dict[int, torch.optim.Optimizer],
+    train_chunks: set[int],
+    device: torch.device,
+    mode: str,
+    learning_rate_override: float | None,
+    grad_clip: float,
+    output_csv: Path,
+    train_schedule: str,
+    pipeline_window: int,
+) -> dict[str, Any]:
+    if mode == "train" and train_schedule == "stage_window" and pipeline_window > 1:
+        return run_phase_stage_window(
+            name=name,
+            records=records,
+            manifest_dir=manifest_dir,
+            chunks=chunks,
+            optimizers=optimizers,
+            train_chunks=train_chunks,
+            device=device,
+            learning_rate_override=learning_rate_override,
+            grad_clip=grad_clip,
+            output_csv=output_csv,
+            pipeline_window=pipeline_window,
+        )
+
+    output_csv.parent.mkdir(parents=True, exist_ok=True)
+    correct = 0
+    count = 0
+    losses: list[float] = []
+    per_class: dict[str, dict[str, float]] = {}
+    with output_csv.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=result_fieldnames())
+        writer.writeheader()
+        for seq, record in enumerate(records):
+            result = run_record(
+                record=record,
+                manifest_dir=manifest_dir,
+                chunks=chunks,
+                optimizers=optimizers,
+                train_chunks=train_chunks,
+                device=device,
+                mode=mode,
+                learning_rate_override=learning_rate_override,
+                grad_clip=grad_clip,
+            )
+            correct, count = accumulate_result(
+                result=result,
+                correct=correct,
+                count=count,
+                losses=losses,
+                per_class=per_class,
+            )
+            write_result_row(writer, seq, result)
+            if (seq + 1) % 16 == 0 or seq + 1 == len(records):
+                acc = correct / count if count else 0.0
+                avg_loss = sum(losses) / len(losses)
+                print(f"{name}: {seq + 1}/{len(records)} acc={acc:.4f} loss={avg_loss:.4f}")
+
+    return summarize_phase(
+        name=name,
+        records_len=len(records),
+        correct=correct,
+        count=count,
+        losses=losses,
+        per_class=per_class,
+        output_csv=output_csv,
+        train_schedule=train_schedule if mode == "train" else "eval",
+        pipeline_window=pipeline_window if mode == "train" else 1,
+    )
 
 
 def main() -> None:
@@ -504,6 +685,22 @@ def main() -> None:
     parser.add_argument("--eval_limit", type=int, default=None)
     parser.add_argument("--learning_rate", type=float, default=None)
     parser.add_argument("--grad_clip", type=float, default=1.0)
+    parser.add_argument(
+        "--train_schedule",
+        default="fifo",
+        choices=["fifo", "stage_window"],
+        help=(
+            "Training request schedule. fifo is strict record-by-record order. "
+            "stage_window processes a small window chunk-by-chunk to approximate "
+            "bounded in-flight mobile pipeline scheduling."
+        ),
+    )
+    parser.add_argument(
+        "--pipeline_window",
+        type=int,
+        default=1,
+        help="Window size for --train_schedule=stage_window; use 3 to mimic phone maxWindow=3.",
+    )
     parser.add_argument("--alpha", type=float, default=0.5)
     parser.add_argument("--label_smoothing", type=float, default=0.1)
     parser.add_argument("--lora_rank", type=int, default=4)
@@ -519,6 +716,10 @@ def main() -> None:
         raise ValueError("--num_chunks must be positive.")
     if args.train_epochs <= 0:
         raise ValueError("--train_epochs must be positive.")
+    if args.pipeline_window <= 0:
+        raise ValueError("--pipeline_window must be positive.")
+    if args.train_schedule == "stage_window" and args.pipeline_window <= 1:
+        raise ValueError("--train_schedule=stage_window requires --pipeline_window > 1.")
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -574,6 +775,8 @@ def main() -> None:
         learning_rate_override=args.learning_rate,
         grad_clip=args.grad_clip,
         output_csv=args.output_dir / "eval_before.csv",
+        train_schedule=args.train_schedule,
+        pipeline_window=args.pipeline_window,
     )
     train = run_phase(
         name="train",
@@ -587,6 +790,8 @@ def main() -> None:
         learning_rate_override=args.learning_rate,
         grad_clip=args.grad_clip,
         output_csv=args.output_dir / "train.csv",
+        train_schedule=args.train_schedule,
+        pipeline_window=args.pipeline_window,
     )
     eval_after = run_phase(
         name="eval_after",
@@ -600,6 +805,8 @@ def main() -> None:
         learning_rate_override=args.learning_rate,
         grad_clip=args.grad_clip,
         output_csv=args.output_dir / "eval_after.csv",
+        train_schedule=args.train_schedule,
+        pipeline_window=args.pipeline_window,
     )
 
     summary = {
@@ -619,6 +826,8 @@ def main() -> None:
             "trainable_params": trainable,
         },
         "learning_rate": args.learning_rate,
+        "train_schedule": args.train_schedule,
+        "pipeline_window": args.pipeline_window,
         "alpha": args.alpha,
         "label_smoothing": args.label_smoothing,
         "seed": args.seed,
