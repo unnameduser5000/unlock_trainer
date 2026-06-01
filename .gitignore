@@ -33,7 +33,7 @@ coordinator/data/
 # Model artifacts and generated exports
 model/*.pte
 exported_pte/
-executorch/
+/executorch/
 data/sft_requests/
 
 # Python caches and virtual environments

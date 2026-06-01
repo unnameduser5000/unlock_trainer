@@ -27,20 +27,30 @@ data class TrainingCheckpointRestoreResult(
 
 object TrainingCheckpointStore {
     private const val LOG_TAG = "TrainingCheckpoint"
-    private const val MAGIC = "SID_TRAINING_CHECKPOINT_V1"
+    private const val MAGIC_V1 = "SID_TRAINING_CHECKPOINT_V1"
+    private const val MAGIC_V2 = "SID_TRAINING_CHECKPOINT_V2"
 
     private val rawBufferMethod by lazy {
         Tensor::class.java.getDeclaredMethod("getRawDataBuffer").also { it.isAccessible = true }
     }
 
     fun saveLatest(modelPath: String, step: Long, parameters: Map<String, Tensor>): File {
+        return saveLatest(modelPath, step, parameters, optimizerSnapshot = null)
+    }
+
+    fun saveLatest(
+        modelPath: String,
+        step: Long,
+        parameters: Map<String, Tensor>,
+        optimizerSnapshot: MobileAdamW.Snapshot?
+    ): File {
         require(parameters.isNotEmpty()) { "Cannot checkpoint an empty parameter map." }
         val checkpointFile = checkpointFileFor(modelPath)
         checkpointFile.parentFile?.mkdirs()
         val tmpFile = File(checkpointFile.parentFile, "${checkpointFile.name}.tmp")
 
         DataOutputStream(BufferedOutputStream(tmpFile.outputStream())).use { output ->
-            output.writeUTF(MAGIC)
+            output.writeUTF(MAGIC_V2)
             output.writeUTF(File(modelPath).name)
             output.writeLong(System.currentTimeMillis())
             output.writeLong(step)
@@ -56,6 +66,20 @@ object TrainingCheckpointStore {
                 output.writeInt(data.size)
                 output.write(data)
             }
+            output.writeBoolean(optimizerSnapshot != null)
+            if (optimizerSnapshot != null) {
+                output.writeUTF("adamw")
+                output.writeLong(optimizerSnapshot.stepCount)
+                val sortedStates = optimizerSnapshot.parameterStates.toSortedMap()
+                output.writeInt(sortedStates.size)
+                for ((name, state) in sortedStates) {
+                    output.writeUTF(name)
+                    output.writeInt(state.expAvg.size)
+                    output.write(state.expAvg.toByteArray())
+                    output.writeInt(state.expAvgSq.size)
+                    output.write(state.expAvgSq.toByteArray())
+                }
+            }
         }
 
         if (checkpointFile.exists() && !checkpointFile.delete()) {
@@ -66,12 +90,29 @@ object TrainingCheckpointStore {
         }
         Log.i(
             LOG_TAG,
-            "Saved training checkpoint path=${checkpointFile.absolutePath} step=$step parameters=${parameters.size}"
+            "Saved training checkpoint path=${checkpointFile.absolutePath} step=$step " +
+                "parameters=${parameters.size} optimizerState=${optimizerSnapshot != null}"
         )
         return checkpointFile
     }
 
+    fun restoreLatest(
+        modelPath: String,
+        parameters: Map<String, Tensor>,
+        restoreOptimizer: (MobileAdamW.Snapshot) -> Unit
+    ): TrainingCheckpointRestoreResult {
+        return restoreLatestInternal(modelPath, parameters, restoreOptimizer)
+    }
+
     fun restoreLatest(modelPath: String, parameters: Map<String, Tensor>): TrainingCheckpointRestoreResult {
+        return restoreLatestInternal(modelPath, parameters, restoreOptimizer = null)
+    }
+
+    private fun restoreLatestInternal(
+        modelPath: String,
+        parameters: Map<String, Tensor>,
+        restoreOptimizer: ((MobileAdamW.Snapshot) -> Unit)?
+    ): TrainingCheckpointRestoreResult {
         val checkpointFile = checkpointFileFor(modelPath)
         if (!checkpointFile.exists()) {
             return TrainingCheckpointRestoreResult(
@@ -103,9 +144,13 @@ object TrainingCheckpointStore {
                 target.writeRawDataBytes(record.data)
                 restoredCount++
             }
+            if (checkpoint.optimizerSnapshot != null && restoreOptimizer != null) {
+                restoreOptimizer(checkpoint.optimizerSnapshot)
+            }
             Log.i(
                 LOG_TAG,
-                "Restored training checkpoint path=${checkpointFile.absolutePath} step=${checkpoint.step} parameters=$restoredCount"
+                "Restored training checkpoint path=${checkpointFile.absolutePath} step=${checkpoint.step} " +
+                    "parameters=$restoredCount optimizerState=${checkpoint.optimizerSnapshot != null}"
             )
             TrainingCheckpointRestoreResult(
                 restored = true,
@@ -134,7 +179,7 @@ object TrainingCheckpointStore {
     private fun readCheckpoint(file: File): TrainingCheckpoint {
         DataInputStream(BufferedInputStream(file.inputStream())).use { input ->
             val magic = input.readUTF()
-            require(magic == MAGIC) { "Unsupported checkpoint magic '$magic'." }
+            require(magic == MAGIC_V1 || magic == MAGIC_V2) { "Unsupported checkpoint magic '$magic'." }
             input.readUTF()
             input.readLong()
             val step = input.readLong()
@@ -153,7 +198,33 @@ object TrainingCheckpointStore {
                 input.readFully(data)
                 records += TrainingCheckpointParameter(name, dtypeName, shape, data)
             }
-            return TrainingCheckpoint(step, records)
+            val optimizerSnapshot = if (magic == MAGIC_V2 && input.readBoolean()) {
+                val optimizerName = input.readUTF()
+                require(optimizerName == "adamw") { "Unsupported optimizer checkpoint '$optimizerName'." }
+                val optimizerStep = input.readLong()
+                val stateCount = input.readInt()
+                require(stateCount >= 0) { "Invalid optimizer state count $stateCount." }
+                val states = LinkedHashMap<String, MobileAdamW.ParameterSnapshot>(stateCount)
+                repeat(stateCount) {
+                    val name = input.readUTF()
+                    val expAvgSize = input.readInt()
+                    require(expAvgSize >= 0) { "Invalid AdamW exp_avg size $expAvgSize for '$name'." }
+                    val expAvgBytes = ByteArray(expAvgSize * Float.SIZE_BYTES)
+                    input.readFully(expAvgBytes)
+                    val expAvgSqSize = input.readInt()
+                    require(expAvgSqSize >= 0) { "Invalid AdamW exp_avg_sq size $expAvgSqSize for '$name'." }
+                    val expAvgSqBytes = ByteArray(expAvgSqSize * Float.SIZE_BYTES)
+                    input.readFully(expAvgSqBytes)
+                    states[name] = MobileAdamW.ParameterSnapshot(
+                        expAvg = expAvgBytes.toFloatArray(),
+                        expAvgSq = expAvgSqBytes.toFloatArray()
+                    )
+                }
+                MobileAdamW.Snapshot(optimizerStep, states)
+            } else {
+                null
+            }
+            return TrainingCheckpoint(step, records, optimizerSnapshot)
         }
     }
 
@@ -238,7 +309,8 @@ object TrainingCheckpointStore {
 
     private data class TrainingCheckpoint(
         val step: Long,
-        val parameters: List<TrainingCheckpointParameter>
+        val parameters: List<TrainingCheckpointParameter>,
+        val optimizerSnapshot: MobileAdamW.Snapshot?
     )
 
     private data class TrainingCheckpointParameter(

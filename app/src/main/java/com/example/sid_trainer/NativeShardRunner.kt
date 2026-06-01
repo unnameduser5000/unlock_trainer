@@ -7,7 +7,6 @@ import org.pytorch.executorch.DType
 import org.pytorch.executorch.EValue
 import org.pytorch.executorch.Module
 import org.pytorch.executorch.Tensor
-import org.pytorch.executorch.training.SGD
 import org.pytorch.executorch.training.TrainingModule
 import sid.Sid
 import java.io.Closeable
@@ -617,16 +616,18 @@ object NativeShardRunner {
         private val modelPath: String,
         private val module: TrainingModule
     ) : LoadedRuntime {
-        private var optimizer: SGD? = null
+        private var optimizer: MobileAdamW? = null
         private var optimizerLearningRate: Double? = null
         private var parameters: Map<String, Tensor>? = null
+        private var pendingOptimizerSnapshot: MobileAdamW.Snapshot? = null
         private var checkpointRestoreAttempted = false
         private var optimizerStepCount = 0L
         private val committedRequestKeys = LinkedHashSet<String>()
 
         override fun execute(request: Sid.ForwardChunkRequest): InvocationResult {
+            val learningRate = request.trainingLearningRate()
             val checkpointRestoreStartedAtNs = System.nanoTime()
-            ensureCheckpointRestored()
+            ensureCheckpointRestored(learningRate)
             val checkpointRestoreMs = elapsedMsSince(checkpointRestoreStartedAtNs)
             val requestKey = request.commitKey()
             val effectiveRequest = if (!request.evalOnly && committedRequestKeys.contains(requestKey)) {
@@ -656,7 +657,6 @@ object NativeShardRunner {
             var gradientCount = 0
             var optimizerStepApplied = false
             var checkpointSaved = false
-            val learningRate = effectiveRequest.trainingLearningRate()
 
             if (!effectiveRequest.evalOnly) {
                 val gradientsStartedAtNs = System.nanoTime()
@@ -668,9 +668,9 @@ object NativeShardRunner {
                 require(gradients.isNotEmpty()) {
                     "TrainingModule.executeForwardBackward() produced no gradients for $modelPath."
                 }
-                val sgd = optimizer.takeIf { optimizerLearningRate == learningRate } ?: run {
+                val adamW = optimizer.takeIf { optimizerLearningRate == learningRate } ?: run {
                     val optimizerStartedAtNs = System.nanoTime()
-                    tracedSection("sid_create_sgd") {
+                    tracedSection("sid_create_adamw") {
                         createOptimizer(learningRate)
                     }.also {
                         optimizer = it
@@ -679,8 +679,8 @@ object NativeShardRunner {
                     }
                 }
                 val stepStartedAtNs = System.nanoTime()
-                tracedSection("sid_sgd_step") {
-                    sgd.step(gradients)
+                tracedSection("sid_adamw_step") {
+                    adamW.step(gradients)
                 }
                 optimizerStepMs = elapsedMsSince(stepStartedAtNs)
                 optimizerStepApplied = true
@@ -690,7 +690,7 @@ object NativeShardRunner {
             } else {
                 Log.i(
                     LOG_TAG,
-                    "Eval-only request for $modelPath: skipped namedGradients(), SGD.create(), and SGD.step()."
+                    "Eval-only request for $modelPath: skipped namedGradients(), AdamW.create(), and AdamW.step()."
                 )
             }
             Log.i(
@@ -724,13 +724,22 @@ object NativeShardRunner {
             )
         }
 
-        private fun ensureCheckpointRestored() {
+        private fun ensureCheckpointRestored(learningRate: Double) {
             if (checkpointRestoreAttempted) {
                 return
             }
             checkpointRestoreAttempted = true
             val params = parametersForRuntime()
-            val result = TrainingCheckpointStore.restoreLatest(modelPath, params)
+            var checkpointHasOptimizerState = false
+            val result = TrainingCheckpointStore.restoreLatest(modelPath, params) { snapshot ->
+                checkpointHasOptimizerState = true
+                val existingOptimizer = optimizer
+                if (existingOptimizer != null && optimizerLearningRate == learningRate) {
+                    existingOptimizer.restore(snapshot)
+                } else {
+                    pendingOptimizerSnapshot = snapshot
+                }
+            }
             if (result.restored) {
                 optimizerStepCount = result.step
             }
@@ -738,7 +747,7 @@ object NativeShardRunner {
                 LOG_TAG,
                 "Checkpoint restore status for $modelPath restored=${result.restored} " +
                     "step=${result.step} parameters=${result.parameterCount} " +
-                    "path=${result.checkpointPath} message=${result.message}"
+                    "optimizerState=$checkpointHasOptimizerState path=${result.checkpointPath} message=${result.message}"
             )
         }
 
@@ -765,7 +774,12 @@ object NativeShardRunner {
                 return false
             }
             runCatching {
-                TrainingCheckpointStore.saveLatest(modelPath, optimizerStepCount, parametersForRuntime())
+                TrainingCheckpointStore.saveLatest(
+                    modelPath,
+                    optimizerStepCount,
+                    parametersForRuntime(),
+                    optimizer?.snapshot()
+                )
             }.onFailure { error ->
                 Log.e(
                     LOG_TAG,
@@ -783,14 +797,24 @@ object NativeShardRunner {
             return optimizerStepCount == 1L || optimizerStepCount % TRAINING_CHECKPOINT_INTERVAL_STEPS == 0L
         }
 
-        private fun createOptimizer(learningRate: Double): SGD {
+        private fun createOptimizer(learningRate: Double): MobileAdamW {
             val parameters = parametersForRuntime()
             Log.i(
                 LOG_TAG,
-                "Creating ExecuTorch SGD optimizer for $modelPath " +
+                "Creating mobile AdamW optimizer for $modelPath " +
                     "parameters=${parameters.size} lr=$learningRate"
             )
-            return SGD.create(parameters, learningRate)
+            val adamW = MobileAdamW(parameters, learningRate)
+            pendingOptimizerSnapshot?.let { snapshot ->
+                adamW.restore(snapshot)
+                pendingOptimizerSnapshot = null
+                Log.i(
+                    LOG_TAG,
+                    "Restored pending AdamW optimizer state for $modelPath " +
+                        "parameters=${snapshot.parameterStates.size} step=${snapshot.stepCount}"
+                )
+            }
+            return adamW
         }
 
         private fun Sid.ForwardChunkRequest.commitKey(): String {
