@@ -7,6 +7,7 @@ service CoordinatingService {
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
   rpc ReportRequestEvent(RequestEvent) returns (RequestEventAck);
   rpc SubmitRequest(ForwardChunkRequest) returns (ForwardChunkResponse);
+  rpc SubmitStageRequest(StageForwardChunkRequest) returns (ForwardChunkResponse);
 }
 
 service ParticipantService {
@@ -119,6 +120,13 @@ message ForwardChunkRequest {
   string request_id = 8;
   bool eval_only = 9;
   float learning_rate = 10;
+  bool stop_after_local_stage = 11;
+  string belief_transport_mode = 12;
+}
+
+message StageForwardChunkRequest {
+  int32 stage_id = 1;
+  ForwardChunkRequest request = 2;
 }
 
 message ForwardChunkResponse {

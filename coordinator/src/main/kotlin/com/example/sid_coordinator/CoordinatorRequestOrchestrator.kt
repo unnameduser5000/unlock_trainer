@@ -122,6 +122,125 @@ class CoordinatorRequestOrchestrator(
         }
     }
 
+    suspend fun submitStageRequest(
+        stageId: Int,
+        request: Sid.ForwardChunkRequest,
+        source: String
+    ): Sid.ForwardChunkResponse {
+        if (request.requestId.isBlank()) {
+            return failureResponse(request, "request_id must not be blank for coordinator stage submission.")
+        }
+
+        val requestId = request.requestId
+        val localOnlyRequest = request.toBuilder()
+            .setChunkIdx(stageId)
+            .setStopAfterLocalStage(true)
+            .build()
+        val plan = state.planStageRequestSubmission(stageId)
+        val submittedAtEpochMs = System.currentTimeMillis()
+        val submittedAtNs = System.nanoTime()
+        state.storeRequestPayload(requestId, localOnlyRequest.toByteArray(), submittedAtEpochMs)
+
+        if (!plan.accepted || plan.host == null || plan.port == null) {
+            val message = "Coordinator rejected stage request $requestId from $source: ${plan.message}"
+            logger.warn(message)
+            state.recordCoordinatorRequestEvent(
+                requestId = requestId,
+                batchId = localOnlyRequest.batchId,
+                chunkIdx = localOnlyRequest.chunkIdx,
+                stageId = plan.stageId,
+                nodeId = plan.nodeId,
+                eventType = Sid.RequestEventType.FAILED,
+                success = false,
+                message = message,
+                terminal = false
+            )
+            val completedAtMs = System.currentTimeMillis()
+            val response = failureResponse(localOnlyRequest, plan.message)
+            recordMetric(
+                localOnlyRequest,
+                response,
+                submittedAtEpochMs,
+                completedAtMs,
+                elapsedMsSince(submittedAtNs),
+                TokenPredictionMetrics(0, 0)
+            )
+            return response
+        }
+
+        state.recordCoordinatorRequestEvent(
+            requestId = requestId,
+            batchId = localOnlyRequest.batchId,
+            chunkIdx = localOnlyRequest.chunkIdx,
+            stageId = plan.stageId,
+            nodeId = plan.nodeId,
+            eventType = Sid.RequestEventType.REQUEST_RECEIVED,
+            success = true,
+            message = "Coordinator accepted local-only stage request from $source and dispatched it to stage ${plan.stageId} node ${plan.nodeId}; evalOnly=${localOnlyRequest.evalOnly}",
+            terminal = false
+        )
+
+        return try {
+            logger.info(
+                "Submitting local-only requestId={} batchId={} stage={} evalOnly={} node={} at {}:{} from {}",
+                requestId,
+                localOnlyRequest.batchId,
+                stageId,
+                localOnlyRequest.evalOnly,
+                plan.nodeId,
+                plan.host,
+                plan.port,
+                source
+            )
+            val response = ProtoHttpForwardClient.forwardChunk(
+                host = plan.host,
+                port = plan.port,
+                request = localOnlyRequest
+            )
+            val completedAtMs = System.currentTimeMillis()
+            val metrics = if (response.success && response.terminal) {
+                safeTokenMetrics(localOnlyRequest, response)
+            } else {
+                TokenPredictionMetrics(correct = 0, count = 0)
+            }
+            recordMetric(localOnlyRequest, response, submittedAtEpochMs, completedAtMs, elapsedMsSince(submittedAtNs), metrics)
+            response
+        } catch (t: Throwable) {
+            val completedAtMs = System.currentTimeMillis()
+            val message = "Coordinator dispatch to stage $stageId failed: ${t.message}"
+            logger.error(
+                "Stage dispatch failed for requestId={} stage={} node={} host={}:{}",
+                requestId,
+                stageId,
+                plan.nodeId,
+                plan.host,
+                plan.port,
+                t
+            )
+            state.recordCoordinatorRequestEvent(
+                requestId = requestId,
+                batchId = localOnlyRequest.batchId,
+                chunkIdx = localOnlyRequest.chunkIdx,
+                stageId = plan.stageId,
+                nodeId = plan.nodeId,
+                eventType = Sid.RequestEventType.FAILED,
+                success = false,
+                message = message,
+                terminal = false
+            )
+            val response = failureResponse(localOnlyRequest, message)
+            recordMetric(
+                localOnlyRequest,
+                response,
+                submittedAtEpochMs,
+                completedAtMs,
+                elapsedMsSince(submittedAtNs),
+                TokenPredictionMetrics(0, 0)
+            )
+            response
+        }
+    }
+
     suspend fun retryRequest(requestId: String): Sid.ForwardChunkResponse {
         val payload = state.loadRequestPayload(requestId)
             ?: return Sid.ForwardChunkResponse.newBuilder()
@@ -132,10 +251,19 @@ class CoordinatorRequestOrchestrator(
                 .setTerminal(false)
                 .build()
 
-        return submitRequest(
-            request = Sid.ForwardChunkRequest.parseFrom(payload.payloadProto),
-            source = "admin-retry"
-        )
+        val request = Sid.ForwardChunkRequest.parseFrom(payload.payloadProto)
+        return if (request.stopAfterLocalStage) {
+            submitStageRequest(
+                stageId = request.chunkIdx,
+                request = request,
+                source = "admin-stage-retry"
+            )
+        } else {
+            submitRequest(
+                request = request,
+                source = "admin-retry"
+            )
+        }
     }
 
     private fun failureResponse(

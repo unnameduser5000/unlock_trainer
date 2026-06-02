@@ -49,6 +49,14 @@ tasks.register<JavaExec>("runPreparedPipelineExperiment") {
     workingDir = rootProject.projectDir
 }
 
+tasks.register<JavaExec>("runPreparedStagePipelineExperiment") {
+    group = "application"
+    description = "Run coordinator-managed per-stage prepared tensor pipeline experiments."
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("com.example.sid_coordinator.RunPreparedStagePipelineExperimentMainKt")
+    workingDir = rootProject.projectDir
+}
+
 sourceSets {
     main {
         proto {

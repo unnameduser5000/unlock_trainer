@@ -2,7 +2,91 @@
 
 This file is the first file to read after any context reset.
 
-Last updated: 2026-05-31 Asia/Shanghai
+Last updated: 2026-06-02 Asia/Shanghai
+
+## 2026-06-02 Mainline: Scheduler Work
+
+Do not go back to inference smoke as the default next step. The current mainline is scheduler improvement for real multi-phone training.
+
+Implemented code path:
+
+- `app/src/main/proto/sid.proto`
+  - `ForwardChunkRequest.stop_after_local_stage`
+  - `ForwardChunkRequest.belief_transport_mode`
+  - `StageForwardChunkRequest`
+  - `CoordinatingService.SubmitStageRequest`
+- `app/src/main/java/com/example/sid_trainer/MainActivity.kt`
+  - Android worker can now execute only its local stage and return without recursively forwarding to the downstream phone.
+  - Android worker supports `belief_transport_mode=full|terminal|none`.
+- `coordinator/src/main/kotlin/com/example/sid_coordinator/CoordinatorRequestOrchestrator.kt`
+  - coordinator can dispatch a request to a specific stage worker.
+- `coordinator/src/main/kotlin/com/example/sid_coordinator/RunPreparedStagePipelineExperimentMain.kt`
+  - new experimental runner with explicit `Q0 -> stage0 -> Q1 -> stage1 -> Q2 -> stage2 -> Done` queues.
+- `tools/export/sid_export_mobile.py`
+  - export supports `--belief_transport_mode full|terminal|none`.
+  - `full`: old belief/KL path, nonzero chunks consume previous full-vocab log-probs and every chunk returns full log-probs.
+  - `terminal`: CE-only transport path, intermediate chunks do not consume or return full-vocab log-probs; terminal chunk returns full log-probs for accuracy metrics.
+  - `none`: CE-only no-logprob-return path; no chunk returns full-vocab log-probs.
+- `coordinator/build.gradle.kts`
+  - new task `:coordinator:runPreparedStagePipelineExperiment`.
+
+Verified locally:
+
+```powershell
+.\gradlew.bat :coordinator:compileKotlin --offline --no-daemon
+.\gradlew.bat :app:compileDebugKotlin --offline --no-daemon
+python -m py_compile tools\export\sid_export_mobile.py
+```
+
+All pass on 2026-06-02.
+
+Important distinction:
+
+- Old runner: `:coordinator:runPreparedPipelineExperiment`
+  - bounded in-flight full-chain requests, `coordinator -> stage0 -> stage1 -> stage2`.
+- New runner: `:coordinator:runPreparedStagePipelineExperiment`
+  - coordinator-owned per-stage queues, each worker returns after local execute.
+
+Suggested first phone validation after reinstalling workers with the new proto:
+
+```powershell
+.\gradlew.bat :coordinator:runPreparedStagePipelineExperiment --offline --no-daemon --args="127.0.0.1 50051 data/sft_requests/tinyllama_agnews128_label_train512_seed20260531/requests.jsonl 0 6 debug_runs/stage-pipeline-smoke-YYYYMMDD-HHMMSS/results.csv stage-pipeline-smoke 1 0 false true 0 10000 420000 3 3"
+```
+
+Argument order after `requestPrefix` is:
+
+```text
+minValidLabels delayMs evalOnly stopOnFailure transientRetryCount transientRetryDelayMs submitRpcDeadlineMs maxBufferedPerStage stageCount beliefTransportMode
+```
+
+For the current CE-only AG News mainline, use `beliefTransportMode=terminal` after exporting matching PTEs:
+
+```powershell
+.\gradlew.bat :coordinator:runPreparedStagePipelineExperiment --offline --no-daemon --args="127.0.0.1 50051 data/sft_requests/tinyllama_agnews128_label_train512_seed20260531/requests.jsonl 0 6 debug_runs/stage-pipeline-smoke-YYYYMMDD-HHMMSS/results.csv stage-pipeline-smoke 1 0 false true 0 10000 420000 3 3 terminal"
+```
+
+Server export command for matching LoRA PTEs:
+
+```bash
+cd ~/sg-exe-trainer
+BELIEF_TRANSPORT_MODE=terminal \
+NUM_CHUNKS=3 \
+CHUNK_IDX=0,1,2 \
+SEQ_LEN=128 \
+TRANSPORT_DTYPE=float16 \
+ALPHA=1.0 \
+LABEL_SMOOTHING=0.0 \
+ARTIFACT_PREFIX=tinyllama_lora \
+ARTIFACT_SUFFIX=_seq128_terminal \
+OUTPUT_DIR=model \
+bash tools/export/export_lora_tinyllama.sh
+```
+
+Current limitation:
+
+- Old PTEs exported before `--belief_transport_mode` still behave as `full`. Runtime `terminal`/`none` is only valid with newly exported matching PTEs.
+- CE-only still computes vocab logits inside each chunk to form local CE loss. The optional full-vocab switch removes cross-stage log-prob input/output and KL/belief transport; it is not a sampled-CE or label-head replacement.
+- The stage-pipeline runtime still needs phone validation and comparison against the old `window3` path.
 
 Related algorithm-history note:
 

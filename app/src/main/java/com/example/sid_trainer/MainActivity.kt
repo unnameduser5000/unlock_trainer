@@ -435,7 +435,12 @@ class MainActivity : ComponentActivity() {
         val requestId = request.requestId.ifBlank { "batch-${request.batchId}" }
         val requestReceivedEpochMs = System.currentTimeMillis()
         val chunkStartedAtNs = System.nanoTime()
-        appendLog("Chunk received request=$requestId chunk=${request.chunkIdx} evalOnly=${request.evalOnly}")
+        val localOnly = request.stopAfterLocalStage
+        val beliefTransportMode = normalizeBeliefTransportMode(request.beliefTransportMode)
+        appendLog(
+            "Chunk received request=$requestId chunk=${request.chunkIdx} " +
+                "evalOnly=${request.evalOnly} localOnly=$localOnly beliefMode=$beliefTransportMode"
+        )
         grpcManager.reportRequestEvent(
             registration = registration,
             requestId = requestId,
@@ -443,7 +448,7 @@ class MainActivity : ComponentActivity() {
             chunkIdx = request.chunkIdx,
             eventType = Sid.RequestEventType.REQUEST_RECEIVED,
             success = true,
-            message = "Chunk received on stage ${registration.stageId}; evalOnly=${request.evalOnly}",
+            message = "Chunk received on stage ${registration.stageId}; evalOnly=${request.evalOnly}; localOnly=$localOnly beliefMode=$beliefTransportMode",
             terminal = registration.isTerminal
         )
 
@@ -466,7 +471,7 @@ class MainActivity : ComponentActivity() {
             )
         }
 
-        if (!registration.isTerminal && (!registration.routeReady || registration.nextHop == null)) {
+        if (!localOnly && !registration.isTerminal && (!registration.routeReady || registration.nextHop == null)) {
             appendLog(
                 "No downstream route available for request=$requestId at epoch=${registration.routingEpoch}"
             )
@@ -572,35 +577,46 @@ class MainActivity : ComponentActivity() {
             .setOutputShiftLogPBytes(execution.outputShiftLogP.data.size().toLong())
             .setRequestReceivedEpochMs(requestReceivedEpochMs)
 
+        val executionShiftLogP = normalizeExecutionBeliefOutput(execution.outputShiftLogP, beliefTransportMode)
+        val responseShiftLogP = if (shouldReturnBeliefForStage(beliefTransportMode, registration.isTerminal)) {
+            executionShiftLogP
+        } else {
+            emptyTensorLike(executionShiftLogP)
+        }
+
         val localResponseBuilder = Sid.ForwardChunkResponse.newBuilder()
             .setSuccess(true)
             .setMessage("Stage ${registration.stageId} finished request $requestId")
             .setLocalLoss(execution.localLoss)
             .setOutputHiddenStates(execution.outputHiddenStates)
-            .setOutputShiftLogP(execution.outputShiftLogP)
+            .setOutputShiftLogP(responseShiftLogP)
             .setProcessedChunkIdx(request.chunkIdx)
             .setProcessedStageId(registration.stageId)
             .setTerminal(registration.isTerminal)
 
-        if (registration.isTerminal) {
+        if (registration.isTerminal || localOnly) {
             val totalStageMs = elapsedMsSince(chunkStartedAtNs)
             val localResponse = localResponseBuilder
+                .setTerminal(registration.isTerminal)
                 .addStageMetrics(
                     stageMetricBuilder
                         .setStageTotalMs(totalStageMs)
                         .build()
                 )
                 .build()
-            appendLog("Terminal response returned for request=$requestId totalStageMs=$totalStageMs")
+            appendLog(
+                "Local response returned for request=$requestId terminal=${registration.isTerminal} " +
+                    "localOnly=$localOnly totalStageMs=$totalStageMs"
+            )
             grpcManager.reportRequestEvent(
                 registration = registration,
                 requestId = requestId,
                 batchId = request.batchId,
                 chunkIdx = request.chunkIdx,
-                eventType = Sid.RequestEventType.COMPLETED,
+                eventType = if (registration.isTerminal) Sid.RequestEventType.COMPLETED else Sid.RequestEventType.LOCAL_COMPLETED,
                 success = true,
-                message = "Terminal stage completed request $requestId; totalStageMs=$totalStageMs",
-                terminal = true
+                message = "Stage ${registration.stageId} returned locally for request $requestId; localOnly=$localOnly totalStageMs=$totalStageMs",
+                terminal = registration.isTerminal
             )
             return localResponse
         }
@@ -610,17 +626,23 @@ class MainActivity : ComponentActivity() {
         }
 
         val beliefEncodeStartedAtNs = System.nanoTime()
-        val transportedBelief = if (ENABLE_TOPK_BELIEF_TRANSPORT) {
-            BeliefTopKCodec.encodeForTransport(execution.outputShiftLogP)
+        val rawBeliefForDownstream = if (shouldForwardBeliefToNextStage(beliefTransportMode)) {
+            executionShiftLogP
         } else {
-            execution.outputShiftLogP
+            emptyTensorLike(executionShiftLogP)
+        }
+        val transportedBelief = if (ENABLE_TOPK_BELIEF_TRANSPORT && !rawBeliefForDownstream.data.isEmpty) {
+            BeliefTopKCodec.encodeForTransport(rawBeliefForDownstream)
+        } else {
+            rawBeliefForDownstream
         }
         val beliefEncodeMs = elapsedMsSince(beliefEncodeStartedAtNs)
         val beliefTransportMessage = "beliefTopKEnabled=$ENABLE_TOPK_BELIEF_TRANSPORT " +
             "beliefTopK=${BeliefTopKCodec.DEFAULT_TOP_K} " +
-            "beliefDenseBytes=${execution.outputShiftLogP.data.size()} " +
+            "beliefDenseBytes=${executionShiftLogP.data.size()} " +
             "beliefTransportBytes=${transportedBelief.data.size()} " +
-            "beliefTransportDtype=${transportedBelief.dataType}"
+            "beliefTransportDtype=${transportedBelief.dataType} " +
+            "beliefTransportMode=$beliefTransportMode"
 
         val nextRequest = Sid.ForwardChunkRequest.newBuilder()
             .setBatchId(request.batchId)
@@ -633,6 +655,7 @@ class MainActivity : ComponentActivity() {
             .setRequestId(requestId)
             .setEvalOnly(request.evalOnly)
             .setLearningRate(request.learningRate)
+            .setBeliefTransportMode(beliefTransportMode)
             .build()
 
         appendLog(
@@ -659,7 +682,7 @@ class MainActivity : ComponentActivity() {
         val totalStageMs = elapsedMsSince(chunkStartedAtNs)
         val stageMetric = stageMetricBuilder
             .setBeliefEncodeMs(beliefEncodeMs)
-            .setBeliefDenseBytes(execution.outputShiftLogP.data.size().toLong())
+            .setBeliefDenseBytes(executionShiftLogP.data.size().toLong())
             .setBeliefTransportBytes(transportedBelief.data.size().toLong())
             .setBeliefTransportDtype(transportedBelief.dataType)
             .setForwardMs(forwardMs)
@@ -726,6 +749,31 @@ class MainActivity : ComponentActivity() {
             .addAllShape(reference.shapeList)
             .setDataType(reference.dataType)
             .build()
+    }
+
+    private fun normalizeBeliefTransportMode(rawMode: String): String {
+        return when (rawMode.trim().lowercase()) {
+            "", "full", "dense" -> "full"
+            "terminal", "terminal_only", "final", "final_only" -> "terminal"
+            "none", "off", "disabled", "false" -> "none"
+            else -> "full"
+        }
+    }
+
+    private fun shouldForwardBeliefToNextStage(mode: String): Boolean {
+        return mode == "full"
+    }
+
+    private fun shouldReturnBeliefForStage(mode: String, terminal: Boolean): Boolean {
+        return mode == "full" || (mode == "terminal" && terminal)
+    }
+
+    private fun normalizeExecutionBeliefOutput(output: Sid.TensorData, mode: String): Sid.TensorData {
+        return if (mode == "full" || output.shapeCount == 3) {
+            output
+        } else {
+            emptyTensorLike(output)
+        }
     }
 
     private fun memoryDeltaMessage(before: WorkerTelemetry, after: WorkerTelemetry): String {

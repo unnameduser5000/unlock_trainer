@@ -57,4 +57,19 @@ class CoordinatorService(
         )
         return requestOrchestrator.submitRequest(request, source = "grpc-submit")
     }
+
+    override suspend fun submitStageRequest(request: Sid.StageForwardChunkRequest): Sid.ForwardChunkResponse {
+        logger.info(
+            "SubmitStageRequest requestId={} batchId={} stageId={} chunkIdx={}",
+            request.request.requestId,
+            request.request.batchId,
+            request.stageId,
+            request.request.chunkIdx
+        )
+        return requestOrchestrator.submitStageRequest(
+            stageId = request.stageId,
+            request = request.request,
+            source = "grpc-stage-submit"
+        )
+    }
 }

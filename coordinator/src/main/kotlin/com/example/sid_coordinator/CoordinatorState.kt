@@ -1283,6 +1283,48 @@ class CoordinatorState(
         )
     }
 
+    fun planStageRequestSubmission(stageId: Int): RequestSubmissionPlan = lock.withLock {
+        val stage = config.stages.firstOrNull { it.stageId == stageId }
+            ?: return RequestSubmissionPlan(
+                accepted = false,
+                stageId = stageId,
+                nodeId = -1,
+                host = null,
+                port = null,
+                message = "Stage $stageId is not configured."
+            )
+        if (drainedStageIds.contains(stage.stageId)) {
+            return RequestSubmissionPlan(
+                accepted = false,
+                stageId = stage.stageId,
+                nodeId = -1,
+                host = null,
+                port = null,
+                message = "Stage ${stage.stageId} is drained."
+            )
+        }
+        val now = Instant.now()
+        val node = nodeIdByStageId[stage.stageId]
+            ?.let(nodesById::get)
+            ?.takeIf { it.isLive(now, leaseDuration) }
+            ?: return RequestSubmissionPlan(
+                accepted = false,
+                stageId = stage.stageId,
+                nodeId = -1,
+                host = null,
+                port = null,
+                message = "Stage ${stage.stageId} has no live worker."
+            )
+        RequestSubmissionPlan(
+            accepted = true,
+            stageId = stage.stageId,
+            nodeId = node.nodeId,
+            host = node.ipAddress,
+            port = node.grpcPort,
+            message = "Dispatching to stage ${stage.stageId} worker ${node.nodeId}"
+        )
+    }
+
     fun recordCoordinatorRequestEvent(
         requestId: String,
         batchId: Int,

@@ -24,7 +24,8 @@ private data class PreparedExperimentArgs(
     val stopOnFailure: Boolean,
     val transientRetryCount: Int,
     val transientRetryDelayMs: Long,
-    val submitRpcDeadlineMs: Long
+    val submitRpcDeadlineMs: Long,
+    val beliefTransportMode: String
 )
 
 fun main(args: Array<String>) {
@@ -47,6 +48,7 @@ fun main(args: Array<String>) {
         "dataset_index",
         "valid_labels",
         "eval_only",
+        "belief_transport_mode",
         "success",
         "terminal",
         "processed_stage_id",
@@ -97,7 +99,12 @@ fun main(args: Array<String>) {
             }
 
             val requestId = "${parsed.requestPrefix}-${indexed.index.toString().padStart(6, '0')}"
-            val request = record.toForwardChunkRequest(manifestDir, requestId, parsed.evalOnly)
+            val request = record.toForwardChunkRequest(
+                manifestDir = manifestDir,
+                requestIdOverride = requestId,
+                evalOnly = parsed.evalOnly,
+                beliefTransportMode = parsed.beliefTransportMode
+            )
             var elapsedMs = 0L
             val requestStartedAtNs = System.nanoTime()
             val response = try {
@@ -120,6 +127,7 @@ fun main(args: Array<String>) {
                     record.dataset_index,
                     validLabels,
                     parsed.evalOnly,
+                    parsed.beliefTransportMode,
                     false,
                     false,
                     -1,
@@ -178,6 +186,7 @@ fun main(args: Array<String>) {
                 record.dataset_index,
                 validLabels,
                 parsed.evalOnly,
+                parsed.beliefTransportMode,
                 response.success,
                 response.terminal,
                 response.processedStageId,
@@ -196,7 +205,8 @@ fun main(args: Array<String>) {
             )
             println(
                 "requestId=$requestId index=${indexed.index} validLabels=$validLabels " +
-                "evalOnly=${parsed.evalOnly} success=${response.success} terminal=${response.terminal} elapsedMs=$elapsedMs " +
+                "evalOnly=${parsed.evalOnly} beliefMode=${parsed.beliefTransportMode} " +
+                    "success=${response.success} terminal=${response.terminal} elapsedMs=$elapsedMs " +
                     "loss=${response.localLoss} tokenAccuracy=${metrics.accuracy} " +
                     "tokens=${metrics.count} labelChoiceAccuracy=${metrics.labelChoiceAccuracy} " +
                     "labelChoiceTokens=${metrics.labelChoiceCount} message=${response.message}"
@@ -216,6 +226,7 @@ fun main(args: Array<String>) {
 
     println("manifest=$manifestPath")
     println("outputCsv=${parsed.outputCsvPath.toAbsolutePath().normalize()}")
+    println("beliefTransportMode=${parsed.beliefTransportMode}")
     println("submitted=$submitted skipped=$skipped succeeded=$succeeded failed=$failed")
     println("avgLocalLoss=${if (lossRows == 0) 0.0 else totalLoss / lossRows.toDouble()}")
     println("tokenAccuracy=${if (totalTokens == 0) 0.0 else totalCorrect.toDouble() / totalTokens.toDouble()} tokens=$totalTokens")
@@ -257,7 +268,8 @@ private fun parseArgs(args: Array<String>): PreparedExperimentArgs {
         submitRpcDeadlineMs = (
             args.getOrNull(13)?.toLongOrNull()
                 ?: DEFAULT_SUBMIT_RPC_DEADLINE_MS
-        ).coerceAtLeast(1L)
+        ).coerceAtLeast(1L),
+        beliefTransportMode = normalizeBeliefTransportMode(args.getOrNull(14))
     )
 }
 
@@ -328,6 +340,7 @@ private fun csvRow(
     datasetIndex: Int?,
     validLabels: Int,
     evalOnly: Boolean,
+    beliefTransportMode: String,
     success: Boolean,
     terminal: Boolean,
     processedStageId: Int,
@@ -350,6 +363,7 @@ private fun csvRow(
         datasetIndex?.toString().orEmpty(),
         validLabels.toString(),
         evalOnly.toString(),
+        beliefTransportMode,
         success.toString(),
         terminal.toString(),
         processedStageId.toString(),

@@ -11,6 +11,7 @@ CHUNK_IDX="${CHUNK_IDX:-0,1}"
 SEQ_LEN="${SEQ_LEN:-64}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
 TRANSPORT_DTYPE="${TRANSPORT_DTYPE:-float16}"
+BELIEF_TRANSPORT_MODE="${BELIEF_TRANSPORT_MODE:-full}"
 ARTIFACT_PREFIX="${ARTIFACT_PREFIX:-tinyllama_lora}"
 ARTIFACT_SUFFIX="${ARTIFACT_SUFFIX:-}"
 OUTPUT_DIR="${OUTPUT_DIR:-model}"
@@ -38,6 +39,7 @@ python tools/export/sid_export_mobile.py \
   --seq_len "${SEQ_LEN}" \
   --batch_size "${BATCH_SIZE}" \
   --transport_dtype "${TRANSPORT_DTYPE}" \
+  --belief_transport_mode "${BELIEF_TRANSPORT_MODE}" \
   --alpha "${ALPHA}" \
   --label_smoothing "${LABEL_SMOOTHING}" \
   --artifact_prefix "${ARTIFACT_PREFIX}" \

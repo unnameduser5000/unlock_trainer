@@ -35,6 +35,17 @@ def transport_cast(tensor: torch.Tensor, transport_dtype: torch.dtype) -> torch.
     return tensor.to(transport_dtype)
 
 
+def normalize_belief_transport_mode(raw_mode: str) -> str:
+    normalized = raw_mode.strip().lower()
+    if normalized in {"", "full", "dense"}:
+        return "full"
+    if normalized in {"terminal", "terminal_only", "final", "final_only"}:
+        return "terminal"
+    if normalized in {"none", "off", "disabled", "false"}:
+        return "none"
+    raise ValueError(f"Unsupported belief transport mode: {raw_mode}. Use full, terminal, or none.")
+
+
 class LoRALinear(nn.Module):
     def __init__(
         self,
@@ -119,6 +130,8 @@ class ExportableSIDChunk(nn.Module):
         lm_head: nn.Module,
         vocab_size: int,
         rotary_emb: nn.Module | None,
+        is_terminal_chunk: bool,
+        belief_transport_mode: str,
         alpha: float = 0.5,
         label_smoothing: float = 0.1,
         transport_dtype: torch.dtype = torch.float16,
@@ -130,9 +143,25 @@ class ExportableSIDChunk(nn.Module):
         self.lm_head = lm_head
         self.rotary_emb = rotary_emb
         self.vocab_size = vocab_size
+        self.is_terminal_chunk = is_terminal_chunk
+        self.belief_transport_mode = normalize_belief_transport_mode(belief_transport_mode)
         self.alpha = alpha
         self.label_smoothing = label_smoothing
         self.transport_dtype = transport_dtype
+
+    @property
+    def consumes_prev_log_probs(self) -> bool:
+        return self.chunk_idx > 0 and self.belief_transport_mode == "full"
+
+    @property
+    def uses_belief_loss(self) -> bool:
+        return self.consumes_prev_log_probs and self.alpha < 1.0
+
+    @property
+    def returns_full_log_probs(self) -> bool:
+        return self.belief_transport_mode == "full" or (
+            self.belief_transport_mode == "terminal" and self.is_terminal_chunk
+        )
 
     def forward(
         self,
@@ -176,7 +205,7 @@ class ExportableSIDChunk(nn.Module):
         ).reshape_as(shift_labels)
         loss_ce = (loss_ce_unmasked * valid_mask).sum() / valid_tokens_count
 
-        if self.chunk_idx == 0:
+        if not self.uses_belief_loss:
             total_loss = loss_ce
         else:
             if prev_log_probs is None:
@@ -193,10 +222,13 @@ class ExportableSIDChunk(nn.Module):
             total_loss = self.alpha * loss_ce + (1.0 - self.alpha) * loss_kl
 
         next_hidden = transport_cast(curr_hidden.detach(), self.transport_dtype)
-        next_log_probs = transport_cast(
-            F.log_softmax(logits.float(), dim=-1).detach(),
-            self.transport_dtype,
-        )
+        if self.returns_full_log_probs:
+            next_log_probs = transport_cast(
+                F.log_softmax(logits.float(), dim=-1).detach(),
+                self.transport_dtype,
+            )
+        else:
+            next_log_probs = transport_cast(curr_hidden.detach().flatten()[:1] * 0.0, self.transport_dtype)
         return total_loss, next_hidden, next_log_probs
 
 
@@ -227,6 +259,7 @@ def build_chunk_module(
     alpha: float,
     label_smoothing: float,
     transport_dtype: torch.dtype,
+    belief_transport_mode: str,
 ) -> tuple[ExportableSIDChunk, int, int]:
     layers, final_norm, lm_head, vocab_size, rotary_emb = get_model_parts(backbone)
     total_layers = len(layers)
@@ -241,6 +274,8 @@ def build_chunk_module(
         lm_head=lm_head,
         vocab_size=vocab_size,
         rotary_emb=rotary_emb,
+        is_terminal_chunk=target_chunk == num_chunks - 1,
+        belief_transport_mode=belief_transport_mode,
         alpha=alpha,
         label_smoothing=label_smoothing,
         transport_dtype=transport_dtype,
@@ -255,13 +290,14 @@ def build_example_args(
     seq_len: int,
     batch_size: int,
     target_chunk: int,
+    consumes_prev_log_probs: bool,
 ) -> tuple[torch.Tensor, ...]:
     dummy_hidden = torch.randn((batch_size, seq_len, hidden_dim), dtype=torch.float32)
     dummy_mask = torch.zeros((batch_size, 1, seq_len, seq_len), dtype=torch.float32)
     dummy_pos = torch.arange(seq_len, dtype=torch.long).unsqueeze(0).repeat(batch_size, 1)
     dummy_labels = torch.ones((batch_size, seq_len), dtype=torch.long)
 
-    if target_chunk == 0:
+    if not consumes_prev_log_probs:
         return (dummy_hidden, dummy_mask, dummy_pos, dummy_labels)
 
     dummy_prev_log_probs = torch.randn((batch_size, seq_len, vocab_size), dtype=torch.float32)
@@ -392,6 +428,7 @@ def export_chunk(
     alpha: float,
     label_smoothing: float,
     transport_dtype: torch.dtype,
+    belief_transport_mode: str,
     use_xnnpack: bool,
     lora_rank: int,
     lora_alpha: float,
@@ -400,6 +437,7 @@ def export_chunk(
     dump_joint_graph: bool,
 ) -> Path:
     resolved_model_name = resolve_model_name(model_name)
+    normalized_belief_transport_mode = normalize_belief_transport_mode(belief_transport_mode)
     print(f"[1/5] Loading model: {resolved_model_name}")
     backbone = AutoModelForCausalLM.from_pretrained(
         resolved_model_name,
@@ -414,8 +452,14 @@ def export_chunk(
         alpha=alpha,
         label_smoothing=label_smoothing,
         transport_dtype=transport_dtype,
+        belief_transport_mode=normalized_belief_transport_mode,
     )
     print(f"      layers=[{start}, {end - 1}]")
+    print(
+        "      belief_transport_mode="
+        f"{normalized_belief_transport_mode} consumes_prev_log_probs={chunk_module.consumes_prev_log_probs} "
+        f"returns_full_log_probs={chunk_module.returns_full_log_probs}"
+    )
 
     chunk_module.train()
     injected_lora = 0
@@ -449,6 +493,7 @@ def export_chunk(
         seq_len=seq_len,
         batch_size=batch_size,
         target_chunk=target_chunk,
+        consumes_prev_log_probs=chunk_module.consumes_prev_log_probs,
     )
     print(
         f"[3/5] Tracing joint graph with seq_len={seq_len}, "
@@ -566,6 +611,17 @@ def main() -> None:
     parser.add_argument("--alpha", type=float, default=0.5)
     parser.add_argument("--label_smoothing", type=float, default=0.1)
     parser.add_argument("--transport_dtype", type=str, default="float16")
+    parser.add_argument(
+        "--belief_transport_mode",
+        type=str,
+        default="full",
+        choices=("full", "terminal", "none"),
+        help=(
+            "Controls full-vocab log-prob IO. full keeps the previous belief/KL path; "
+            "terminal omits intermediate full-vocab outputs but returns final log-probs for metrics; "
+            "none omits all full-vocab log-prob outputs."
+        ),
+    )
     parser.add_argument("--output_dir", type=Path, default=Path("./exported_pte"))
     parser.add_argument(
         "--artifact_prefix",
@@ -632,6 +688,7 @@ def main() -> None:
         raise ValueError("lora_init_std must be positive.")
 
     transport_dtype = parse_transport_dtype(args.transport_dtype)
+    belief_transport_mode = normalize_belief_transport_mode(args.belief_transport_mode)
     chunk_indices = parse_chunk_indices(args.chunk_idx, args.num_chunks)
     lora_targets = parse_csv_set(args.lora_targets)
 
@@ -649,6 +706,7 @@ def main() -> None:
             alpha=args.alpha,
             label_smoothing=args.label_smoothing,
             transport_dtype=transport_dtype,
+            belief_transport_mode=belief_transport_mode,
             use_xnnpack=args.enable_xnnpack,
             lora_rank=args.lora_rank,
             lora_alpha=args.lora_alpha,

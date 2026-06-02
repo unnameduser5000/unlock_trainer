@@ -2,12 +2,12 @@ package com.example.sid_coordinator
 
 import com.google.gson.Gson
 import io.grpc.ManagedChannelBuilder
-import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.async
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.joinAll
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
-import kotlinx.coroutines.selects.select
 import sid.CoordinatingServiceGrpcKt
 import sid.Sid
 import java.nio.file.Files
@@ -17,7 +17,7 @@ import java.time.LocalDateTime
 import java.time.format.DateTimeFormatter
 import java.util.concurrent.TimeUnit
 
-private data class PreparedPipelineExperimentArgs(
+private data class StagePipelineExperimentArgs(
     val host: String,
     val port: Int,
     val manifestPath: Path,
@@ -32,17 +32,27 @@ private data class PreparedPipelineExperimentArgs(
     val transientRetryCount: Int,
     val transientRetryDelayMs: Long,
     val submitRpcDeadlineMs: Long,
-    val maxInFlight: Int,
+    val maxBufferedPerStage: Int,
+    val stageCount: Int,
     val beliefTransportMode: String
 )
 
-private data class PipelineSubmission(
+private data class StagePipelineSubmission(
     val submissionSeq: Int,
     val indexed: IndexedPreparedRequestRecord,
     val validLabels: Int
 )
 
-private data class PipelineResult(
+private data class StagePipelineWork(
+    val submission: StagePipelineSubmission,
+    val originalRequest: Sid.ForwardChunkRequest,
+    val currentRequest: Sid.ForwardChunkRequest,
+    val submittedEpochMs: Long,
+    val startedAtNs: Long,
+    val stageMetrics: List<Sid.StageExecutionMetrics>
+)
+
+private data class StagePipelineResult(
     val submissionSeq: Int,
     val requestId: String,
     val recordIndex: Int,
@@ -132,7 +142,7 @@ private data class PipelineResult(
 }
 
 fun main(args: Array<String>) = runBlocking {
-    val parsed = parsePipelineArgs(args)
+    val parsed = parseStagePipelineArgs(args)
     val manifestPath = parsed.manifestPath.toAbsolutePath().normalize()
     val manifestDir = manifestPath.parent
     val outputPath = parsed.outputCsvPath.toAbsolutePath().normalize()
@@ -140,7 +150,7 @@ fun main(args: Array<String>) = runBlocking {
     val maxMessageSizeBytes = 50 * 1024 * 1024
 
     val records = readManifestRecords(manifestPath)
-    val submissions = mutableListOf<PipelineSubmission>()
+    val submissions = mutableListOf<StagePipelineSubmission>()
     var skipped = 0
     for (indexed in records) {
         if (indexed.index < parsed.startIndex) {
@@ -149,7 +159,6 @@ fun main(args: Array<String>) = runBlocking {
         if (parsed.maxSubmitted > 0 && submissions.size >= parsed.maxSubmitted) {
             break
         }
-
         val validLabels = indexed.record.countValidLabels(manifestDir)
         if (validLabels < parsed.minValidLabels) {
             skipped++
@@ -159,7 +168,7 @@ fun main(args: Array<String>) = runBlocking {
             )
             continue
         }
-        submissions += PipelineSubmission(
+        submissions += StagePipelineSubmission(
             submissionSeq = submissions.size,
             indexed = indexed,
             validLabels = validLabels
@@ -170,64 +179,98 @@ fun main(args: Array<String>) = runBlocking {
         .usePlaintext()
         .maxInboundMessageSize(maxMessageSizeBytes)
         .build()
-    val results = mutableListOf<PipelineResult>()
+    val stub = CoordinatingServiceGrpcKt.CoordinatingServiceCoroutineStub(channel)
+    val stageQueues = List(parsed.stageCount) { Channel<StagePipelineWork>(parsed.maxBufferedPerStage) }
+    val resultChannel = Channel<StagePipelineResult>(parsed.maxBufferedPerStage)
+    val stopLaunching = java.util.concurrent.atomic.AtomicBoolean(false)
+    val results = mutableListOf<StagePipelineResult>()
 
+    writeStagePipelineCsv(outputPath, results)
     try {
-        val stub = CoordinatingServiceGrpcKt.CoordinatingServiceCoroutineStub(channel)
-        var nextSubmission = 0
-        var stopLaunching = false
-        val active = mutableListOf<Deferred<PipelineResult>>()
-
-        writePipelineCsv(outputPath, results)
-        while ((!stopLaunching && nextSubmission < submissions.size) || active.isNotEmpty()) {
-            while (!stopLaunching && active.size < parsed.maxInFlight && nextSubmission < submissions.size) {
-                val submission = submissions[nextSubmission++]
-                active += async(Dispatchers.IO) {
-                    runPipelineSubmission(
+        val workers = (0 until parsed.stageCount).map { stageId ->
+            launch(Dispatchers.IO) {
+                for (work in stageQueues[stageId]) {
+                    val resultOrNext = runStage(
                         stub = stub,
-                        manifestDir = manifestDir,
-                        submission = submission,
+                        stageId = stageId,
+                        lastStageId = parsed.stageCount - 1,
+                        work = work,
                         parsed = parsed
                     )
+                    val next = resultOrNext.nextWork
+                    if (next != null) {
+                        stageQueues[stageId + 1].send(next)
+                    } else {
+                        resultChannel.send(requireNotNull(resultOrNext.result))
+                    }
                 }
-                if (parsed.delayMs > 0 && active.size < parsed.maxInFlight) {
+                if (stageId + 1 < parsed.stageCount) {
+                    stageQueues[stageId + 1].close()
+                }
+            }
+        }
+
+        val collector = launch {
+            for (result in resultChannel) {
+                results += result
+                writeStagePipelineCsv(outputPath, results)
+                println(
+                    "requestId=${result.requestId} seq=${result.submissionSeq} index=${result.recordIndex} " +
+                        "validLabels=${result.validLabels} evalOnly=${result.evalOnly} success=${result.success} " +
+                        "terminal=${result.terminal} elapsedMs=${result.elapsedMs} loss=${result.localLoss} " +
+                        "tokenAccuracy=${result.tokenAccuracy} tokens=${result.tokenCount} " +
+                        "labelChoiceAccuracy=${result.labelChoiceAccuracy} labelChoiceTokens=${result.labelChoiceCount} " +
+                        "stages=${result.stageMetrics.size} localTrainMs=${result.sumLocalTrainMs} " +
+                        "otherMs=${result.endToEndOtherMs} lrs=${result.stageLearningRates} " +
+                        "message=${result.message}"
+                )
+                if ((!result.countedSuccess) && parsed.stopOnFailure) {
+                    stopLaunching.set(true)
+                    println(
+                        "stopOnFailure=true; no new stage-pipeline submissions after failed requestId=${result.requestId}; " +
+                            "draining queued/in-flight work."
+                    )
+                }
+            }
+        }
+
+        launch {
+            for (submission in submissions) {
+                if (stopLaunching.get()) {
+                    break
+                }
+                val indexed = submission.indexed
+                val requestId = "${parsed.requestPrefix}-${indexed.index.toString().padStart(6, '0')}"
+                val request = indexed.record.toForwardChunkRequest(
+                    manifestDir = manifestDir,
+                    requestIdOverride = requestId,
+                    evalOnly = parsed.evalOnly,
+                    beliefTransportMode = parsed.beliefTransportMode
+                ).toBuilder()
+                    .setChunkIdx(0)
+                    .setStopAfterLocalStage(true)
+                    .setBeliefTransportMode(parsed.beliefTransportMode)
+                    .build()
+                stageQueues[0].send(
+                    StagePipelineWork(
+                        submission = submission,
+                        originalRequest = request,
+                        currentRequest = request,
+                        submittedEpochMs = System.currentTimeMillis(),
+                        startedAtNs = System.nanoTime(),
+                        stageMetrics = emptyList()
+                    )
+                )
+                if (parsed.delayMs > 0) {
                     delay(parsed.delayMs)
                 }
             }
+            stageQueues[0].close()
+        }.join()
 
-            if (active.isEmpty()) {
-                break
-            }
-
-            val completed = select<Pair<Deferred<PipelineResult>, PipelineResult>> {
-                active.forEach { deferred ->
-                    deferred.onAwait { result -> deferred to result }
-                }
-            }
-            active.remove(completed.first)
-            val result = completed.second
-            results += result
-            writePipelineCsv(outputPath, results)
-
-            println(
-                "requestId=${result.requestId} seq=${result.submissionSeq} index=${result.recordIndex} " +
-                    "validLabels=${result.validLabels} evalOnly=${result.evalOnly} success=${result.success} " +
-                    "terminal=${result.terminal} elapsedMs=${result.elapsedMs} loss=${result.localLoss} " +
-                    "tokenAccuracy=${result.tokenAccuracy} tokens=${result.tokenCount} " +
-                    "labelChoiceAccuracy=${result.labelChoiceAccuracy} labelChoiceTokens=${result.labelChoiceCount} " +
-                    "stages=${result.stageMetrics.size} localTrainMs=${result.sumLocalTrainMs} " +
-                    "otherMs=${result.endToEndOtherMs} lrs=${result.stageLearningRates} " +
-                    "message=${result.message}"
-            )
-
-            if ((!result.countedSuccess) && parsed.stopOnFailure) {
-                stopLaunching = true
-                println(
-                    "stopOnFailure=true; no new submissions after failed requestId=${result.requestId}; " +
-                        "waiting for ${active.size} in-flight request(s) to drain."
-                )
-            }
-        }
+        workers.joinAll()
+        resultChannel.close()
+        collector.join()
     } finally {
         channel.shutdownNow()
     }
@@ -244,7 +287,8 @@ fun main(args: Array<String>) = runBlocking {
 
     println("manifest=$manifestPath")
     println("outputCsv=$outputPath")
-    println("maxInFlight=${parsed.maxInFlight}")
+    println("stageCount=${parsed.stageCount}")
+    println("maxBufferedPerStage=${parsed.maxBufferedPerStage}")
     println("beliefTransportMode=${parsed.beliefTransportMode}")
     println("selected=${submissions.size} submitted=$submitted skipped=$skipped succeeded=$succeeded failed=$failed")
     println("avgLocalLoss=${if (lossRows == 0) 0.0 else totalLoss / lossRows.toDouble()}")
@@ -259,58 +303,95 @@ fun main(args: Array<String>) = runBlocking {
     println("submitRpcDeadlineMs=${parsed.submitRpcDeadlineMs}")
 }
 
-private suspend fun runPipelineSubmission(
+private data class StageRunOutcome(
+    val nextWork: StagePipelineWork?,
+    val result: StagePipelineResult?
+)
+
+private suspend fun runStage(
     stub: CoordinatingServiceGrpcKt.CoordinatingServiceCoroutineStub,
-    manifestDir: Path,
-    submission: PipelineSubmission,
-    parsed: PreparedPipelineExperimentArgs
-): PipelineResult {
-    val indexed = submission.indexed
-    val record = indexed.record
-    val requestId = "${parsed.requestPrefix}-${indexed.index.toString().padStart(6, '0')}"
-    val request = record.toForwardChunkRequest(
-        manifestDir = manifestDir,
-        requestIdOverride = requestId,
-        evalOnly = parsed.evalOnly,
-        beliefTransportMode = parsed.beliefTransportMode
-    )
-    val submittedEpochMs = System.currentTimeMillis()
-    val startedAtNs = System.nanoTime()
-    return try {
-        val response = submitWithTransientRetries(
+    stageId: Int,
+    lastStageId: Int,
+    work: StagePipelineWork,
+    parsed: StagePipelineExperimentArgs
+): StageRunOutcome {
+    val request = work.currentRequest.toBuilder()
+        .setChunkIdx(stageId)
+        .setStopAfterLocalStage(true)
+        .setBeliefTransportMode(parsed.beliefTransportMode)
+        .build()
+    val response = try {
+        submitStageWithTransientRetries(
             stub = stub,
+            stageId = stageId,
             request = request,
-            requestId = requestId,
-            recordIndex = indexed.index,
+            requestId = request.requestId,
+            recordIndex = work.submission.indexed.index,
             retryCount = parsed.transientRetryCount,
             retryDelayMs = parsed.transientRetryDelayMs,
             submitRpcDeadlineMs = parsed.submitRpcDeadlineMs
         )
-        val completedEpochMs = System.currentTimeMillis()
-        val metrics = if (response.success && response.terminal) {
+    } catch (t: Throwable) {
+        return StageRunOutcome(
+            nextWork = null,
+            result = failedStagePipelineResult(
+                work = work,
+                stageId = stageId,
+                request = request,
+                message = "stage $stageId submit failed: ${t.message}"
+            )
+        )
+    }
+
+    val combinedMetrics = work.stageMetrics + response.stageMetricsList
+    if (response.success && stageId < lastStageId) {
+        val nextRequest = request.toBuilder()
+            .setChunkIdx(stageId + 1)
+            .setHiddenStates(response.outputHiddenStates)
+            .setShiftLogPPrev(stagePipelineBeliefForNextStage(response.outputShiftLogP, parsed.beliefTransportMode))
+            .setStopAfterLocalStage(true)
+            .setBeliefTransportMode(parsed.beliefTransportMode)
+            .build()
+        return StageRunOutcome(
+            nextWork = work.copy(
+                currentRequest = nextRequest,
+                stageMetrics = combinedMetrics
+            ),
+            result = null
+        )
+    }
+
+    val metrics = if (response.success && stageId == lastStageId) {
+        runCatching {
             computeShiftedTokenPredictionMetrics(
                 response.outputShiftLogP,
-                request.labels,
-                record.singleTokenLabelChoices()
+                work.originalRequest.labels,
+                work.submission.indexed.record.singleTokenLabelChoices()
             )
-        } else {
+        }.getOrElse {
             TokenPredictionMetrics(correct = 0, count = 0)
         }
-        PipelineResult(
-            submissionSeq = submission.submissionSeq,
-            requestId = requestId,
-            recordIndex = indexed.index,
-            datasetIndex = record.dataset_index,
-            validLabels = submission.validLabels,
+    } else {
+        TokenPredictionMetrics(correct = 0, count = 0)
+    }
+    val completedEpochMs = System.currentTimeMillis()
+    return StageRunOutcome(
+        nextWork = null,
+        result = StagePipelineResult(
+            submissionSeq = work.submission.submissionSeq,
+            requestId = request.requestId,
+            recordIndex = work.submission.indexed.index,
+            datasetIndex = work.submission.indexed.record.dataset_index,
+            validLabels = work.submission.validLabels,
             evalOnly = parsed.evalOnly,
             beliefTransportMode = parsed.beliefTransportMode,
             success = response.success,
             terminal = response.terminal,
             processedStageId = response.processedStageId,
             processedChunkIdx = response.processedChunkIdx,
-            submittedEpochMs = submittedEpochMs,
+            submittedEpochMs = work.submittedEpochMs,
             completedEpochMs = completedEpochMs,
-            elapsedMs = elapsedMsSince(startedAtNs),
+            elapsedMs = elapsedMsSince(work.startedAtNs),
             outputHiddenBytes = response.outputHiddenStates.data.size(),
             outputShiftLogPBytes = response.outputShiftLogP.data.size(),
             localLoss = response.localLoss,
@@ -318,40 +399,66 @@ private suspend fun runPipelineSubmission(
             tokenCount = metrics.count,
             labelChoiceCorrect = metrics.labelChoiceCorrect,
             labelChoiceCount = metrics.labelChoiceCount,
-            stageMetrics = response.stageMetricsList,
+            stageMetrics = combinedMetrics,
             message = response.message
         )
-    } catch (t: Throwable) {
-        PipelineResult(
-            submissionSeq = submission.submissionSeq,
-            requestId = requestId,
-            recordIndex = indexed.index,
-            datasetIndex = record.dataset_index,
-            validLabels = submission.validLabels,
-            evalOnly = parsed.evalOnly,
-            beliefTransportMode = parsed.beliefTransportMode,
-            success = false,
-            terminal = false,
-            processedStageId = -1,
-            processedChunkIdx = record.chunk_idx,
-            submittedEpochMs = submittedEpochMs,
-            completedEpochMs = System.currentTimeMillis(),
-            elapsedMs = elapsedMsSince(startedAtNs),
-            outputHiddenBytes = 0,
-            outputShiftLogPBytes = 0,
-            localLoss = 0f,
-            tokenCorrect = 0,
-            tokenCount = 0,
-            labelChoiceCorrect = 0,
-            labelChoiceCount = 0,
-            stageMetrics = emptyList(),
-            message = "submit failed: ${t.message}"
-        )
+    )
+}
+
+private fun failedStagePipelineResult(
+    work: StagePipelineWork,
+    stageId: Int,
+    request: Sid.ForwardChunkRequest,
+    message: String
+): StagePipelineResult {
+    return StagePipelineResult(
+        submissionSeq = work.submission.submissionSeq,
+        requestId = request.requestId,
+        recordIndex = work.submission.indexed.index,
+        datasetIndex = work.submission.indexed.record.dataset_index,
+        validLabels = work.submission.validLabels,
+        evalOnly = request.evalOnly,
+        beliefTransportMode = normalizeBeliefTransportMode(request.beliefTransportMode),
+        success = false,
+        terminal = false,
+        processedStageId = stageId,
+        processedChunkIdx = request.chunkIdx,
+        submittedEpochMs = work.submittedEpochMs,
+        completedEpochMs = System.currentTimeMillis(),
+        elapsedMs = elapsedMsSince(work.startedAtNs),
+        outputHiddenBytes = 0,
+        outputShiftLogPBytes = 0,
+        localLoss = 0f,
+        tokenCorrect = 0,
+        tokenCount = 0,
+        labelChoiceCorrect = 0,
+        labelChoiceCount = 0,
+        stageMetrics = work.stageMetrics,
+        message = message
+    )
+}
+
+private fun stagePipelineBeliefForNextStage(
+    outputShiftLogP: Sid.TensorData,
+    beliefTransportMode: String
+): Sid.TensorData {
+    return if (normalizeBeliefTransportMode(beliefTransportMode) == "full") {
+        outputShiftLogP
+    } else {
+        emptyTensorLike(outputShiftLogP)
     }
 }
 
-private suspend fun submitWithTransientRetries(
+private fun emptyTensorLike(reference: Sid.TensorData): Sid.TensorData {
+    return Sid.TensorData.newBuilder()
+        .addAllShape(reference.shapeList)
+        .setDataType(reference.dataType)
+        .build()
+}
+
+private suspend fun submitStageWithTransientRetries(
     stub: CoordinatingServiceGrpcKt.CoordinatingServiceCoroutineStub,
+    stageId: Int,
     request: Sid.ForwardChunkRequest,
     requestId: String,
     recordIndex: Int,
@@ -366,12 +473,17 @@ private suspend fun submitWithTransientRetries(
         val startedAtNs = System.nanoTime()
         try {
             val response = stub.withDeadlineAfter(submitRpcDeadlineMs, TimeUnit.MILLISECONDS)
-                .submitRequest(request)
+                .submitStageRequest(
+                    Sid.StageForwardChunkRequest.newBuilder()
+                        .setStageId(stageId)
+                        .setRequest(request)
+                        .build()
+                )
             val attemptElapsedMs = elapsedMsSince(startedAtNs)
-            if (response.success || !isTransientFailure(response.message) || attempt >= retryCount) {
-                if (!response.success && isTransientFailure(response.message) && attempt >= retryCount) {
+            if (response.success || !isStagePipelineTransientFailure(response.message) || attempt >= retryCount) {
+                if (!response.success && isStagePipelineTransientFailure(response.message) && attempt >= retryCount) {
                     println(
-                        "TRANSIENT exhausted requestId=$requestId index=$recordIndex " +
+                        "TRANSIENT exhausted requestId=$requestId index=$recordIndex stage=$stageId " +
                             "attempt=$attemptNumber/${retryCount + 1} elapsedMs=$attemptElapsedMs " +
                             "message=${response.message}"
                     )
@@ -379,18 +491,18 @@ private suspend fun submitWithTransientRetries(
                 return response
             }
             println(
-                "TRANSIENT retry requestId=$requestId index=$recordIndex " +
+                "TRANSIENT retry requestId=$requestId index=$recordIndex stage=$stageId " +
                     "attempt=$attemptNumber/${retryCount + 1} elapsedMs=$attemptElapsedMs " +
                     "delayMs=$retryDelayMs message=${response.message}"
             )
         } catch (t: Throwable) {
             lastFailure = t
             val attemptElapsedMs = elapsedMsSince(startedAtNs)
-            if (!isTransientFailure(t.message.orEmpty()) || attempt >= retryCount) {
+            if (!isStagePipelineTransientFailure(t.message.orEmpty()) || attempt >= retryCount) {
                 throw t
             }
             println(
-                "TRANSIENT retry requestId=$requestId index=$recordIndex " +
+                "TRANSIENT retry requestId=$requestId index=$recordIndex stage=$stageId " +
                     "attempt=$attemptNumber/${retryCount + 1} elapsedMs=$attemptElapsedMs " +
                     "delayMs=$retryDelayMs exception=${t.message}"
             )
@@ -400,50 +512,57 @@ private suspend fun submitWithTransientRetries(
             delay(retryDelayMs)
         }
     }
-    throw lastFailure ?: IllegalStateException("submit failed after transient retries")
+    throw lastFailure ?: IllegalStateException("stage submit failed after transient retries")
 }
 
-private fun parsePipelineArgs(args: Array<String>): PreparedPipelineExperimentArgs {
+private fun parseStagePipelineArgs(args: Array<String>): StagePipelineExperimentArgs {
     val timestamp = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss"))
     val stopOnFailure = args.getOrNull(10)?.toBooleanLenient() ?: true
-    return PreparedPipelineExperimentArgs(
+    return StagePipelineExperimentArgs(
         host = args.getOrNull(0) ?: "127.0.0.1",
         port = args.getOrNull(1)?.toIntOrNull() ?: 50051,
         manifestPath = Paths.get(args.getOrNull(2) ?: "data/sft_requests/requests.jsonl"),
         startIndex = args.getOrNull(3)?.toIntOrNull() ?: 0,
         maxSubmitted = args.getOrNull(4)?.toIntOrNull() ?: 0,
         outputCsvPath = Paths.get(
-            args.getOrNull(5) ?: "debug_runs/prepared-pipeline-experiment-$timestamp/results.csv"
+            args.getOrNull(5) ?: "debug_runs/prepared-stage-pipeline-experiment-$timestamp/results.csv"
         ),
-        requestPrefix = args.getOrNull(6) ?: "prepared-pipeline-experiment-$timestamp",
+        requestPrefix = args.getOrNull(6) ?: "prepared-stage-pipeline-experiment-$timestamp",
         minValidLabels = args.getOrNull(7)?.toIntOrNull() ?: 1,
         delayMs = args.getOrNull(8)?.toLongOrNull() ?: 0L,
         evalOnly = args.getOrNull(9)?.toBooleanLenient() ?: false,
         stopOnFailure = stopOnFailure,
         transientRetryCount = (
             args.getOrNull(11)?.toIntOrNull()
-                ?: if (stopOnFailure) 0 else DEFAULT_PIPELINE_TRANSIENT_RETRY_COUNT
+                ?: if (stopOnFailure) 0 else DEFAULT_STAGE_PIPELINE_TRANSIENT_RETRY_COUNT
         ).coerceAtLeast(0),
         transientRetryDelayMs = (
             args.getOrNull(12)?.toLongOrNull()
-                ?: DEFAULT_PIPELINE_TRANSIENT_RETRY_DELAY_MS
+                ?: DEFAULT_STAGE_PIPELINE_TRANSIENT_RETRY_DELAY_MS
         ).coerceAtLeast(0L),
         submitRpcDeadlineMs = (
             args.getOrNull(13)?.toLongOrNull()
-                ?: DEFAULT_PIPELINE_SUBMIT_RPC_DEADLINE_MS
+                ?: DEFAULT_STAGE_PIPELINE_SUBMIT_RPC_DEADLINE_MS
         ).coerceAtLeast(1L),
-        maxInFlight = (args.getOrNull(14)?.toIntOrNull() ?: DEFAULT_MAX_IN_FLIGHT).coerceAtLeast(1),
-        beliefTransportMode = normalizeBeliefTransportMode(args.getOrNull(15))
+        maxBufferedPerStage = (
+            args.getOrNull(14)?.toIntOrNull()
+                ?: DEFAULT_STAGE_PIPELINE_BUFFERED_PER_STAGE
+        ).coerceAtLeast(1),
+        stageCount = (
+            args.getOrNull(15)?.toIntOrNull()
+                ?: DEFAULT_STAGE_PIPELINE_STAGE_COUNT
+        ).coerceAtLeast(1),
+        beliefTransportMode = normalizeBeliefTransportMode(args.getOrNull(16))
     )
 }
 
-private fun writePipelineCsv(path: Path, results: List<PipelineResult>) {
-    val rows = mutableListOf(PIPELINE_CSV_HEADER)
+private fun writeStagePipelineCsv(path: Path, results: List<StagePipelineResult>) {
+    val rows = mutableListOf(STAGE_PIPELINE_CSV_HEADER)
     rows += results.sortedBy { it.submissionSeq }.map { it.toCsvRow() }
     Files.write(path, rows)
 }
 
-private fun PipelineResult.toCsvRow(): String {
+private fun StagePipelineResult.toCsvRow(): String {
     return listOf(
         submissionSeq.toString(),
         requestId,
@@ -492,11 +611,11 @@ private fun PipelineResult.toCsvRow(): String {
     ).joinToString(",") { it.csvEscape() }
 }
 
-private fun PipelineResult.stageTimingsJson(): String {
+private fun StagePipelineResult.stageTimingsJson(): String {
     if (stageMetrics.isEmpty()) {
         return "[]"
     }
-    return TIMING_GSON.toJson(
+    return STAGE_PIPELINE_TIMING_GSON.toJson(
         stageMetrics.map { metric ->
             linkedMapOf<String, Any>(
                 "stage_id" to metric.stageId,
@@ -536,9 +655,9 @@ private fun PipelineResult.stageTimingsJson(): String {
     )
 }
 
-private fun isTransientFailure(message: String): Boolean {
+private fun isStagePipelineTransientFailure(message: String): Boolean {
     val normalized = message.lowercase()
-    return PIPELINE_TRANSIENT_FAILURE_MARKERS.any { normalized.contains(it) }
+    return STAGE_PIPELINE_TRANSIENT_FAILURE_MARKERS.any { normalized.contains(it) }
 }
 
 private fun String.csvEscape(): String {
@@ -562,12 +681,13 @@ private fun elapsedMsSince(startedAtNs: Long): Long {
     return ((System.nanoTime() - startedAtNs) / 1_000_000L).coerceAtLeast(0L)
 }
 
-private const val DEFAULT_MAX_IN_FLIGHT = 3
-private const val DEFAULT_PIPELINE_TRANSIENT_RETRY_COUNT = 18
-private const val DEFAULT_PIPELINE_TRANSIENT_RETRY_DELAY_MS = 10_000L
-private const val DEFAULT_PIPELINE_SUBMIT_RPC_DEADLINE_MS = 420_000L
+private const val DEFAULT_STAGE_PIPELINE_STAGE_COUNT = 3
+private const val DEFAULT_STAGE_PIPELINE_BUFFERED_PER_STAGE = 3
+private const val DEFAULT_STAGE_PIPELINE_TRANSIENT_RETRY_COUNT = 18
+private const val DEFAULT_STAGE_PIPELINE_TRANSIENT_RETRY_DELAY_MS = 10_000L
+private const val DEFAULT_STAGE_PIPELINE_SUBMIT_RPC_DEADLINE_MS = 420_000L
 
-private val PIPELINE_CSV_HEADER = listOf(
+private val STAGE_PIPELINE_CSV_HEADER = listOf(
     "submission_seq",
     "request_id",
     "record_index",
@@ -614,13 +734,13 @@ private val PIPELINE_CSV_HEADER = listOf(
     "message"
 ).joinToString(",")
 
-private val TIMING_GSON = Gson()
+private val STAGE_PIPELINE_TIMING_GSON = Gson()
 
-private val PIPELINE_TRANSIENT_FAILURE_MARKERS = listOf(
+private val STAGE_PIPELINE_TRANSIENT_FAILURE_MARKERS = listOf(
     "has no live worker",
     "downstream route is not ready",
     "no downstream node connected",
-    "coordinator dispatch to stage 0 failed",
+    "coordinator dispatch to stage",
     "downstream forwarding failed",
     "connection reset",
     "connection refused",

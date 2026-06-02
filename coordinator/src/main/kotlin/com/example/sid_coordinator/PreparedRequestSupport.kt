@@ -53,6 +53,17 @@ data class TokenPredictionMetrics(
         get() = if (labelChoiceCount == 0) 0.0 else labelChoiceCorrect.toDouble() / labelChoiceCount.toDouble()
 }
 
+const val DEFAULT_BELIEF_TRANSPORT_MODE = "full"
+
+fun normalizeBeliefTransportMode(rawMode: String?): String {
+    return when (rawMode.orEmpty().trim().lowercase()) {
+        "", "full", "dense" -> "full"
+        "terminal", "terminal_only", "final", "final_only" -> "terminal"
+        "none", "off", "disabled", "false" -> "none"
+        else -> error("Unsupported belief transport mode '$rawMode'. Use full, terminal, or none.")
+    }
+}
+
 fun readManifestRecord(path: Path, index: Int): PreparedRequestRecord {
     require(index >= 0) { "record index must be non-negative" }
     val line = Files.newBufferedReader(path).useLines { lines ->
@@ -76,14 +87,17 @@ fun readManifestRecords(path: Path): List<IndexedPreparedRequestRecord> {
 fun PreparedRequestRecord.toForwardChunkRequest(
     manifestDir: Path,
     requestIdOverride: String = "",
-    evalOnly: Boolean = false
+    evalOnly: Boolean = false,
+    beliefTransportMode: String = DEFAULT_BELIEF_TRANSPORT_MODE
 ): Sid.ForwardChunkRequest {
     val requestId = requestIdOverride.ifBlank { request_id }
+    val normalizedBeliefMode = normalizeBeliefTransportMode(beliefTransportMode)
     return Sid.ForwardChunkRequest.newBuilder()
         .setRequestId(requestId)
         .setBatchId(batch_id)
         .setChunkIdx(chunk_idx)
         .setEvalOnly(evalOnly)
+        .setBeliefTransportMode(normalizedBeliefMode)
         .setLearningRate(learning_rate?.takeIf { it > 0f } ?: 0f)
         .setHiddenStates(requiredTensor("hidden_states", manifestDir))
         .setAttentionMask(requiredTensor("attention_mask", manifestDir))

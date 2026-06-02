@@ -11,13 +11,19 @@ fun main(args: Array<String>) {
     val recordIndex = args.getOrNull(3)?.toIntOrNull() ?: 0
     val requestIdOverride = args.getOrNull(4).orEmpty()
     val evalOnly = args.getOrNull(5)?.toBooleanLenient() ?: false
+    val beliefTransportMode = normalizeBeliefTransportMode(args.getOrNull(6))
     val maxMessageSizeBytes = 50 * 1024 * 1024
 
     val record = readManifestRecord(manifestPath, recordIndex)
     val manifestDir = manifestPath.toAbsolutePath().normalize().parent
     val requestId = requestIdOverride.ifBlank { record.request_id }
     val validLabels = record.countValidLabels(manifestDir)
-    val request = record.toForwardChunkRequest(manifestDir, requestId, evalOnly)
+    val request = record.toForwardChunkRequest(
+        manifestDir = manifestDir,
+        requestIdOverride = requestId,
+        evalOnly = evalOnly,
+        beliefTransportMode = beliefTransportMode
+    )
 
     val channel = ManagedChannelBuilder.forAddress(host, port)
         .usePlaintext()
@@ -43,6 +49,7 @@ fun main(args: Array<String>) {
         println("recordIndex=$recordIndex")
         println("validLabels=$validLabels")
         println("evalOnly=$evalOnly")
+        println("beliefTransportMode=$beliefTransportMode")
         println("success=${response.success}")
         println("message=${response.message}")
         println("processedStageId=${response.processedStageId}")
