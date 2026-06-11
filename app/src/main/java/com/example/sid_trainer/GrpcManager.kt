@@ -25,6 +25,7 @@ data class NextHopInfo(
 
 data class WorkerRegistration(
     val nodeId: Int,
+    val deviceId: String,
     val stageId: Int,
     val isTerminal: Boolean,
     val nextHop: NextHopInfo?,
@@ -39,6 +40,8 @@ data class WorkerRegistration(
         return buildString {
             append("node=")
             append(nodeId)
+            append(", device=")
+            append(deviceId)
             append(", stage=")
             append(stageId)
             append(", terminal=")
@@ -132,6 +135,7 @@ class GrpcManager(
 
             val registration = WorkerRegistration(
                 nodeId = response.nodeId,
+                deviceId = deviceId,
                 stageId = response.stageId,
                 isTerminal = response.terminal,
                 nextHop = response.toNextHopInfo(),

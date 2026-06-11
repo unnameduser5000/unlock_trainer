@@ -1,5 +1,6 @@
 package com.example.sid_trainer
 
+import android.content.Intent
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -53,13 +54,18 @@ class MainActivity : ComponentActivity() {
     companion object {
         private const val UI_LOG_TAG = "SidWorkerUi"
         private const val ENABLE_TOPK_BELIEF_TRANSPORT = false
+        private const val EXTRA_COORDINATOR_HOST = "sid.coordinator_host"
+        private const val EXTRA_COORDINATOR_PORT = "sid.coordinator_port"
+        private const val EXTRA_DEVICE_ID = "sid.device_id"
+        private const val EXTRA_LOCAL_PORT = "sid.local_port"
+        private const val EXTRA_AUTO_START = "sid.auto_start"
     }
 
     private val logMessages = mutableStateListOf<String>()
     private val isWorkerRunning = mutableStateOf(false)
     private val modelFilePath = mutableStateOf<String?>(null)
     private val modelCacheSummary = mutableStateOf("No shard prepared")
-    private val coordinatorHost = mutableStateOf("192.168.137.1")
+    private val coordinatorHost = mutableStateOf("192.168.1.10")
     private val coordinatorPort = mutableStateOf("50051")
     private val deviceId = mutableStateOf(defaultDeviceId())
     private val localServerPort = mutableStateOf("26052")
@@ -73,6 +79,7 @@ class MainActivity : ComponentActivity() {
     private var workerJob: Job? = null
     private var activeGrpcManager: GrpcManager? = null
     private var autoStartRequested = false
+    private var autoStartOnLaunch = false
 
     private val pickModelLauncher =
         registerForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
@@ -81,6 +88,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        applyLaunchOverrides(intent)
         setContent {
             MaterialTheme {
                 MainConsoleScreen()
@@ -89,15 +97,29 @@ class MainActivity : ComponentActivity() {
         appendLog("SID worker ready.")
     }
 
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        applyLaunchOverrides(intent)
+        appendLog("Launch options updated from adb intent.")
+        if (autoStartOnLaunch && !isWorkerRunning.value) {
+            startWorker()
+        }
+    }
+
     @Composable
     private fun MainConsoleScreen() {
         LaunchedEffect(Unit) {
             if (!autoStartRequested) {
                 autoStartRequested = true
-                appendLog(
-                    "Auto-starting worker with coordinator=${coordinatorHost.value}:${coordinatorPort.value}, deviceId=${deviceId.value}, localPort=${localServerPort.value}"
-                )
-                startWorker()
+                if (autoStartOnLaunch) {
+                    appendLog(
+                        "Auto-starting worker with coordinator=${coordinatorHost.value}:${coordinatorPort.value}, deviceId=${deviceId.value}, localPort=${localServerPort.value}"
+                    )
+                    startWorker()
+                } else {
+                    appendLog("Auto-start disabled. Configure the fields and press Start Worker, or launch with sid.auto_start=true.")
+                }
             }
         }
 
@@ -492,17 +514,19 @@ class MainActivity : ComponentActivity() {
             )
         }
 
-        val memoryBefore = WorkerTelemetryReader.read(applicationContext)
         val localQueueStartedAtNs = System.nanoTime()
         var localQueueWaitMs = 0L
+        lateinit var memoryStats: MemoryPeakStats
         val execution = try {
             localExecutionMutex.withLock {
                 localQueueWaitMs = elapsedMsSince(localQueueStartedAtNs)
+                val memorySampler = MemoryPeakSampler.create(applicationContext).start()
                 Trace.beginSection("sid_worker_local_execute")
                 try {
                     NativeShardRunner.execute(modelPath, request)
                 } finally {
                     Trace.endSection()
+                    memoryStats = memorySampler.stop()
                 }
             }
         } catch (t: Throwable) {
@@ -524,8 +548,7 @@ class MainActivity : ComponentActivity() {
             )
         }
         val localElapsedMs = elapsedMsSince(localQueueStartedAtNs)
-        val memoryAfter = WorkerTelemetryReader.read(applicationContext)
-        val memoryTimingMessage = memoryDeltaMessage(memoryBefore, memoryAfter)
+        val memoryTimingMessage = memoryDeltaMessage(memoryStats)
         val localTimingMessage = "runtime=${execution.runtimeName} method=${execution.methodName} " +
             "inputs=${execution.inputCount} lr=${execution.learningRate} " +
             "localQueueWaitMs=$localQueueWaitMs localMs=$localElapsedMs " +
@@ -553,6 +576,7 @@ class MainActivity : ComponentActivity() {
             .setStageId(registration.stageId)
             .setChunkIdx(request.chunkIdx)
             .setNodeId(registration.nodeId)
+            .setDeviceId(registration.deviceId)
             .setTerminal(registration.isTerminal)
             .setEvalOnly(execution.evalOnly)
             .setOptimizerStepApplied(execution.optimizerStepApplied)
@@ -575,6 +599,17 @@ class MainActivity : ComponentActivity() {
             .setOutputConvertMs(execution.timing.outputConvertMs)
             .setOutputHiddenBytes(execution.outputHiddenStates.data.size().toLong())
             .setOutputShiftLogPBytes(execution.outputShiftLogP.data.size().toLong())
+            .setMemorySampleIntervalMs(memoryStats.intervalMs)
+            .setMemorySampleCount(memoryStats.sampleCount)
+            .setPssBeforeKb(memoryStats.before.appPssKb)
+            .setPssAfterKb(memoryStats.after.appPssKb)
+            .setPssPeakKb(memoryStats.pssPeakKb)
+            .setPrivateDirtyBeforeKb(memoryStats.before.appPrivateDirtyKb)
+            .setPrivateDirtyAfterKb(memoryStats.after.appPrivateDirtyKb)
+            .setPrivateDirtyPeakKb(memoryStats.privateDirtyPeakKb)
+            .setJavaHeapBeforeKb(memoryStats.before.runtimeUsedMemoryKb)
+            .setJavaHeapAfterKb(memoryStats.after.runtimeUsedMemoryKb)
+            .setJavaHeapPeakKb(memoryStats.javaHeapPeakKb)
             .setRequestReceivedEpochMs(requestReceivedEpochMs)
 
         val executionShiftLogP = normalizeExecutionBeliefOutput(execution.outputShiftLogP, beliefTransportMode)
@@ -776,12 +811,17 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun memoryDeltaMessage(before: WorkerTelemetry, after: WorkerTelemetry): String {
-        return "pssBeforeKb=${before.appPssKb} pssAfterKb=${after.appPssKb} " +
-            "pssDeltaKb=${after.appPssKb - before.appPssKb} " +
-            "privateDirtyBeforeKb=${before.appPrivateDirtyKb} privateDirtyAfterKb=${after.appPrivateDirtyKb} " +
-            "javaHeapBeforeKb=${before.runtimeUsedMemoryKb} javaHeapAfterKb=${after.runtimeUsedMemoryKb} " +
-            "javaHeapDeltaKb=${after.runtimeUsedMemoryKb - before.runtimeUsedMemoryKb}"
+    private fun memoryDeltaMessage(stats: MemoryPeakStats): String {
+        return "memorySampleIntervalMs=${stats.intervalMs} memorySampleCount=${stats.sampleCount} " +
+            "pssBeforeKb=${stats.before.appPssKb} pssAfterKb=${stats.after.appPssKb} " +
+            "pssPeakKb=${stats.pssPeakKb} pssDeltaKb=${stats.after.appPssKb - stats.before.appPssKb} " +
+            "privateDirtyBeforeKb=${stats.before.appPrivateDirtyKb} " +
+            "privateDirtyAfterKb=${stats.after.appPrivateDirtyKb} " +
+            "privateDirtyPeakKb=${stats.privateDirtyPeakKb} " +
+            "javaHeapBeforeKb=${stats.before.runtimeUsedMemoryKb} " +
+            "javaHeapAfterKb=${stats.after.runtimeUsedMemoryKb} " +
+            "javaHeapPeakKb=${stats.javaHeapPeakKb} " +
+            "javaHeapDeltaKb=${stats.after.runtimeUsedMemoryKb - stats.before.runtimeUsedMemoryKb}"
     }
 
     private fun stopWorker() {
@@ -817,6 +857,53 @@ class MainActivity : ComponentActivity() {
         val summary = lines.joinToString("\n")
         runOnUiThread {
             modelCacheSummary.value = summary
+        }
+    }
+
+    private fun applyLaunchOverrides(intent: Intent?) {
+        val extras = intent?.extras ?: return
+        val applied = mutableListOf<String>()
+
+        extras.readStringExtra(EXTRA_COORDINATOR_HOST)?.let {
+            coordinatorHost.value = it
+            applied += "coordinatorHost=$it"
+        }
+        extras.readPortExtra(EXTRA_COORDINATOR_PORT)?.let {
+            coordinatorPort.value = it
+            applied += "coordinatorPort=$it"
+        }
+        extras.readStringExtra(EXTRA_DEVICE_ID)?.let {
+            deviceId.value = it
+            applied += "deviceId=$it"
+        }
+        extras.readPortExtra(EXTRA_LOCAL_PORT)?.let {
+            localServerPort.value = it
+            applied += "localPort=$it"
+        }
+        extras.readBooleanExtra(EXTRA_AUTO_START)?.let {
+            autoStartOnLaunch = it
+            applied += "autoStart=$it"
+        }
+
+        if (applied.isNotEmpty()) {
+            appendLog("Launch options applied: ${applied.joinToString(", ")}")
+        }
+    }
+
+    private fun Bundle.readStringExtra(key: String): String? {
+        return get(key)?.toString()?.trim()?.takeIf { it.isNotEmpty() }
+    }
+
+    private fun Bundle.readPortExtra(key: String): String? {
+        return readStringExtra(key)?.filter { it.isDigit() }?.takeIf { it.isNotEmpty() }
+    }
+
+    private fun Bundle.readBooleanExtra(key: String): Boolean? {
+        return when (val value = get(key)) {
+            is Boolean -> value
+            is String -> value.equals("true", ignoreCase = true) || value == "1" || value.equals("yes", ignoreCase = true)
+            is Number -> value.toInt() != 0
+            else -> null
         }
     }
 

@@ -33,10 +33,19 @@ class TelemetryRow:
     worker_state: str
 
 
+@dataclass(frozen=True)
+class StageMemoryPoint:
+    time_epoch_ms: int
+    device_id: str
+    stage_id: int
+    pss_peak_mb: float
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--db", type=Path, default=Path("coordinator/coordinator/data/coordinator.db"))
     parser.add_argument("--results_csv", type=Path, required=True)
+    parser.add_argument("--stage_memory_csv", type=Path)
     parser.add_argument("--output_dir", type=Path, required=True)
     parser.add_argument("--pad_ms", type=int, default=60_000)
     return parser.parse_args()
@@ -53,6 +62,18 @@ def run_window(results_csv: Path, pad_ms: int) -> tuple[int, int]:
     if not starts or not ends:
         raise ValueError(f"No timing rows in {results_csv}")
     return min(starts) - pad_ms, max(ends) + pad_ms
+
+
+def read_result_midpoints(results_csv: Path) -> dict[int, int]:
+    midpoints: dict[int, int] = {}
+    with results_csv.open(newline="", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            submission_seq = int(row["submission_seq"])
+            submitted_ms = int(float(row["submitted_epoch_ms"]))
+            completed_ms = int(float(row["completed_epoch_ms"]))
+            midpoints[submission_seq] = submitted_ms + ((completed_ms - submitted_ms) // 2)
+    return midpoints
 
 
 def read_rows(db_path: Path, start_ms: int, end_ms: int) -> list[TelemetryRow]:
@@ -186,7 +207,38 @@ def write_summary(path: Path, rows: list[TelemetryRow], start_ms: int, end_ms: i
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
-def plot(path: Path, rows: list[TelemetryRow]) -> None:
+def read_stage_memory_points(
+    path: Path | None,
+    result_midpoints: dict[int, int],
+) -> list[StageMemoryPoint]:
+    if path is None or not path.exists():
+        return []
+    points: list[StageMemoryPoint] = []
+    with path.open(newline="", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            submission_seq_text = row.get("submission_seq", "").strip()
+            device_id = row.get("device_id", "").strip()
+            stage_id_text = row.get("stage_id", "").strip()
+            pss_peak_text = row.get("pss_peak_kb", "").strip()
+            if not submission_seq_text or not device_id or not stage_id_text or not pss_peak_text:
+                continue
+            submission_seq = int(submission_seq_text)
+            time_epoch_ms = result_midpoints.get(submission_seq)
+            if time_epoch_ms is None:
+                continue
+            points.append(
+                StageMemoryPoint(
+                    time_epoch_ms=time_epoch_ms,
+                    device_id=device_id,
+                    stage_id=int(stage_id_text),
+                    pss_peak_mb=int(pss_peak_text) / 1024.0,
+                )
+            )
+    return points
+
+
+def plot(path: Path, rows: list[TelemetryRow], stage_memory_points: list[StageMemoryPoint]) -> None:
     if not rows:
         return
     base_ms = min(row.observed_epoch_ms for row in rows)
@@ -195,6 +247,7 @@ def plot(path: Path, rows: list[TelemetryRow]) -> None:
         by_device[row.device_id].append(row)
 
     fig, axes = plt.subplots(4, 1, figsize=(11.5, 9.0), sharex=True)
+    pss_axis = axes[-1]
     specs = [
         ("battery_level", "Battery (%)", lambda row: row.battery_level),
         ("battery_temp_c", "Battery temp (C)", lambda row: row.battery_temp_c),
@@ -215,12 +268,42 @@ def plot(path: Path, rows: list[TelemetryRow]) -> None:
                 ys.append(float(value))
             if xs:
                 stage_ids = ",".join(str(stage) for stage in sorted({row.stage_id for row in device_rows}))
-                ax.plot(xs, ys, marker=".", linewidth=1.2, markersize=3, label=f"{device_id} stage {stage_ids}")
+                line = ax.plot(xs, ys, marker=".", linewidth=1.2, markersize=3, label=f"{device_id} stage {stage_ids}")[0]
+                if ax is pss_axis:
+                    device_points = [
+                        point
+                        for point in stage_memory_points
+                        if point.device_id == device_id and point.stage_id in {row.stage_id for row in device_rows}
+                    ]
+                    if device_points:
+                        point_xs = [(point.time_epoch_ms - base_ms) / 60000.0 for point in device_points]
+                        point_ys = [point.pss_peak_mb for point in device_points]
+                        ax.scatter(
+                            point_xs,
+                            point_ys,
+                            color=line.get_color(),
+                            marker="x",
+                            s=18,
+                            linewidths=0.8,
+                            alpha=0.65,
+                            label=f"{device_id} stage peak samples",
+                        )
         ax.set_ylabel(ylabel)
         ax.grid(True, alpha=0.25)
         ax.legend(loc="best", fontsize=8)
     axes[-1].set_xlabel("Minutes from first telemetry sample")
-    fig.suptitle("Worker telemetry during train512 window=3 run")
+    if stage_memory_points:
+        pss_axis.text(
+            0.01,
+            0.03,
+            "solid: heartbeat PSS samples; x: per-request stage-local PSS peaks",
+            transform=pss_axis.transAxes,
+            fontsize=8,
+            va="bottom",
+            ha="left",
+            bbox={"facecolor": "white", "alpha": 0.75, "edgecolor": "none"},
+        )
+    fig.suptitle("Worker telemetry with stage-local peak memory")
     fig.tight_layout()
     fig.savefig(path, dpi=180)
     plt.close(fig)
@@ -230,10 +313,12 @@ def main() -> None:
     args = parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     start_ms, end_ms = run_window(args.results_csv, args.pad_ms)
+    result_midpoints = read_result_midpoints(args.results_csv)
     rows = read_rows(args.db, start_ms, end_ms)
+    stage_memory_points = read_stage_memory_points(args.stage_memory_csv, result_midpoints)
     write_csv(args.output_dir / "worker-telemetry-final.csv", rows)
     write_summary(args.output_dir / "worker-telemetry-summary.txt", rows, start_ms, end_ms)
-    plot(args.output_dir / "worker-telemetry-timeseries.png", rows)
+    plot(args.output_dir / "worker-telemetry-timeseries.png", rows, stage_memory_points)
     print(f"rows={len(rows)}")
     print(f"wrote={args.output_dir / 'worker-telemetry-final.csv'}")
     print(f"wrote={args.output_dir / 'worker-telemetry-summary.txt'}")

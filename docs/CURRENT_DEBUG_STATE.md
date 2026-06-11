@@ -2,7 +2,23 @@
 
 This file is the first file to read after any context reset.
 
-Last updated: 2026-06-02 Asia/Shanghai
+Last updated: 2026-06-03 Asia/Shanghai
+
+## 2026-06-03 Report Draft Style Reset
+
+Main report draft:
+
+- `docs/DEFENSE_REPORT_DRAFT.md`
+
+Current writing policy for this report:
+
+- Write as a paper-style Chinese stage report for a reviewer/teacher, not as a debug memo or Q&A defense script.
+- Avoid meta-discourse such as "评审可能会问", "一句话总结", "核心问题可以表述为", and repeated defensive patterns such as "不是...而是..." or "不否认...".
+- Use a continuous argument structure: motivation -> BP-free chunk-local training -> contrast with 1F1B -> system design -> scheduler design -> experiments -> limitations and next work.
+- Keep CE-only as the current phone experiment quality claim. Belief/KD is optional background, not the core quality conclusion.
+- Describe 2026-06-02 three-phone AdamW as a real phone training result with recovery limitations: eval-before acc 0.3359, eval-after acc 0.8398, mean loss 7.6778 -> 1.1673, train512 has 462/512 complete optimizer-step rows and 50/512 recovery-marked rows.
+- Use "完整更新样本" / "非完整更新样本" in Chinese report prose instead of overusing debug terms like clean/caveat.
+- Keep figures from `docs/figures/defense_report_v2/`: quality, train loss, update completeness, worker timing, stage timeline, and telemetry.
 
 ## 2026-06-02 Mainline: Scheduler Work
 
@@ -87,6 +103,45 @@ Current limitation:
 - Old PTEs exported before `--belief_transport_mode` still behave as `full`. Runtime `terminal`/`none` is only valid with newly exported matching PTEs.
 - CE-only still computes vocab logits inside each chunk to form local CE loss. The optional full-vocab switch removes cross-stage log-prob input/output and KL/belief transport; it is not a sampled-CE or label-head replacement.
 - The stage-pipeline runtime still needs phone validation and comparison against the old `window3` path.
+
+### 2026-06-02 Memory Peak Sampler
+
+New runs after this point record per-local-stage sampled peak memory in `StageExecutionMetrics`.
+
+Implementation:
+
+- Android worker starts a `MemoryPeakSampler` immediately before `NativeShardRunner.execute(...)` and stops it immediately after local execution.
+- The sampler uses the same source as heartbeat telemetry: `ActivityManager.getProcessMemoryInfo(Process.myPid())` for app PSS/private dirty and `Runtime.totalMemory() - Runtime.freeMemory()` for Java heap.
+- Default interval is `100 ms`.
+
+New structured fields:
+
+```text
+memory_sample_interval_ms
+memory_sample_count
+pss_before_kb
+pss_after_kb
+pss_peak_kb
+private_dirty_before_kb
+private_dirty_after_kb
+private_dirty_peak_kb
+java_heap_before_kb
+java_heap_after_kb
+java_heap_peak_kb
+```
+
+Pipeline CSVs now also include request-level summaries:
+
+```text
+max_pss_peak_kb
+max_private_dirty_peak_kb
+max_java_heap_peak_kb
+```
+
+Interpretation caveat:
+
+- This is a sampled peak, not a precise allocator-level heapprofd peak. It is much better than before/after sampling for showing transient training memory, but very short spikes below the sampling interval can still be missed.
+- For distributed runs, report per-stage or max-stage peak. Do not blindly sum peaks across phones unless the question is total cluster footprint.
 
 Related algorithm-history note:
 
@@ -2329,3 +2384,91 @@ Clean AG News device-MAC run final stitched result:
 Held-out delta after train512: label-choice accuracy -0.0234, avg local loss -2.0540.
 
 Recovery caveat: eval-after256-window3 stopped after 115 successful rows plus 3 failed in-flight rows when Pixel/stage 2 changed IP from 192.168.137.5 to 192.168.137.135. Pixel was relaunched and eval-after256-recovery-from115-window3 completed the remaining 141 rows. Treat the stitched quality result as valid only if checkpoint restore preserved the trained LoRA state across that Pixel relaunch; system-wise, this is a successful documented recovery from data-plane/IP churn.
+
+Update: 2026-06-02 Memory metrics correction.
+
+Memory peak sampling is now recorded per local stage execution on the Android worker, and each `StageExecutionMetrics` row carries both volatile `node_id` and stable `device_id`.
+
+Important interpretation:
+
+- `max_pss_peak_kb`, `max_private_dirty_peak_kb`, and `max_java_heap_peak_kb` in the main experiment CSV are request-level worst-stage summaries only. They are useful for detecting whether any phone/stage hit a dangerous peak, but they are not a fair per-phone comparison.
+- Per-device analysis must use the generated sidecar CSV next to each result file: if the main output is `results.csv`, the long table is `results.stage_memory.csv`.
+- `results.stage_memory.csv` has one row per `(request_id, stage_id, node_id/device_id)` and includes timing fields plus `pss_before_kb`, `pss_peak_kb`, `pss_delta_peak_kb`, `private_dirty_*`, and `java_heap_*`.
+- For plots/reporting, group by `device_id` and `stage_id`; use `pss_peak_kb` for total app resident-memory pressure and `pss_delta_peak_kb` for approximate execution-time increment over that worker's pre-execute baseline.
+- `node_id` can change after worker re-registration, especially after Wi-Fi/IP churn; use `device_id` as the stable phone identity in figures.
+
+Verification after this change:
+
+- `.\gradlew.bat :coordinator:compileKotlin --offline --no-daemon` passed.
+- `.\gradlew.bat :app:compileDebugKotlin --offline --no-daemon` passed.
+
+Update: 2026-06-03 00:45 Asia/Shanghai.
+
+New three-phone terminal-belief stage-pipeline run after installing the per-device memory sampler APK and using the newly downloaded `*_seq128_terminal.pte` shards.
+
+Setup:
+
+- Coordinator restarted with `coordinator/config/pipeline.json`.
+- Stages active: `0 NX809J 192.168.137.52:26052`, `1 Lenovo_L71091 192.168.137.251:26052`, `2 Pixel_10_Pro_XL 192.168.137.13:26052`.
+- `stage-pipeline-smoke-20260603-000801`: 6/6 succeeded, 0 failed, confirmed `results.stage_memory.csv` contains `device_id` for all stages.
+- Deleted only current terminal checkpoints (`tinyllama_lora_chunk_*_seq128_terminal.latest.sidckpt`) after smoke, then restarted workers so train128 starts from clean terminal shard weights.
+
+Train128 result:
+
+- Run dir: `debug_runs/stage-pipeline-train128-20260603-001258`
+- Command: `runPreparedStagePipelineExperiment ... train512 requests offset=0 limit=128 evalOnly=false stopOnFailure=false retry=18 window=3 stageCount=3 beliefTransportMode=terminal`
+- Success: 128/128, failures 0.
+- Runtime: `BUILD SUCCESSFUL in 30m 47s`.
+- Avg local loss: `3.1908`.
+- Label-choice online train signal: `81/128 = 0.6328`.
+- First 16 avg loss: `5.5964`; last 16 avg loss: `2.6504`.
+- Completion interval: avg `14.112s`, P50 `14.221s`, P90 `15.827s`.
+- Avg request elapsed: `89.911s`; avg summed local elapsed: `30.842s`; avg model execute: `30.447s`; avg other/pipeline queue: `59.240s`.
+
+Per-stage train128 averages from `results.stage_memory.csv`:
+
+| stage/device | local elapsed | execute | stage total | avg PSS peak | max PSS peak |
+|---|---:|---:|---:|---:|---:|
+| stage0 NX809J | 12.635s | 12.535s | 12.887s | 2932.8 MiB | 3382.0 MiB |
+| stage1 Lenovo_L71091 | 8.619s | 8.448s | 8.868s | 2923.9 MiB | 3351.1 MiB |
+| stage2 Pixel_10_Pro_XL | 9.588s | 9.464s | 9.801s | 3334.4 MiB | 3814.5 MiB |
+
+Interpretation: steady-state throughput is bounded mostly by stage0/NX local execute time. The large per-request `elapsed_ms` is pipeline queue latency, not worker local queue (`local_queue_wait_ms` remains near zero) and not recursive worker forwarding (`forward_ms=0` in stage-pipeline mode).
+
+Update: 2026-06-03 02:21 Asia/Shanghai.
+
+Train512 continuation completed cleanly after train128. This run continued from the train128 checkpoints, so the combined training path is 128 + 384 = 512 samples, not an independent-from-zero train512.
+
+- Run dir: `debug_runs/stage-pipeline-train512-cont-20260603-004729`
+- Command shape: `runPreparedStagePipelineExperiment ... train512 requests offset=128 limit=384 evalOnly=false stopOnFailure=false retry=18 window=3 stageCount=3 beliefTransportMode=terminal`
+- Success: 384/384, failures 0.
+- Runtime: `BUILD SUCCESSFUL in 1h 33m 5s`.
+- Avg local loss over continuation: `1.0767`.
+- Label-choice online train signal: `314/384 = 0.8177`.
+- First 16 avg loss: `2.2436`; last 16 avg loss: `0.4381`.
+- Completion interval: avg `14.417s`, P50 `14.481s`, P90 `16.521s`.
+- Avg request elapsed: `94.878s`; avg summed local elapsed: `33.658s`; avg model execute: `33.259s`; avg other/pipeline queue: `61.367s`.
+
+Per-stage train512-cont averages from `results.stage_memory.csv`:
+
+| stage/device | local elapsed | execute | stage total | avg PSS peak | max PSS peak |
+|---|---:|---:|---:|---:|---:|
+| stage0 NX809J | 13.279s | 13.185s | 13.495s | 3367.4 MiB | 3380.0 MiB |
+| stage1 Lenovo_L71091 | 9.312s | 9.136s | 9.515s | 3335.5 MiB | 3378.1 MiB |
+| stage2 Pixel_10_Pro_XL | 11.067s | 10.938s | 11.257s | 3794.4 MiB | 3840.7 MiB |
+
+Final combined online train signal across train128 + continuation:
+
+- Samples: 512/512 succeeded, 0 failed.
+- Label-choice online train signal: `(81 + 314) / 512 = 395/512 = 0.7715`.
+- Loss decreases clearly in-run, but this is still train-stream/online signal. Held-out eval should be run separately before presenting accuracy.
+
+Pipeline visualization assets:
+
+- Script: `tools/report/plot_stage_device_timeline.py`
+- Source data: `debug_runs/stage-pipeline-train512-cont-20260603-004729/results.stage_memory.csv`
+- First-window Gantt: `docs/figures/stage_pipeline_train512_cont/train512_first24_gantt.png`
+- Steady-state Gantt: `docs/figures/stage_pipeline_train512_cont/train512_mid24_gantt.png`
+- Steady-state utilization: `docs/figures/stage_pipeline_train512_cont/train512_mid24_utilization.png`
+
+Important caveat: Pixel's device clock is not synchronized with NX/Lenovo, so the Gantt uses reconstructed relative time from request order and per-stage durations, not raw cross-device `request_received_epoch_ms`. For presentation, describe it as a reconstructed coordinator-view timeline. The figure shows stage0/NX as the bottleneck in the plotted steady-state window (`utilization ~= 0.94`, avg execute `13.2s`) while stage1/stage2 have visible idle gaps.

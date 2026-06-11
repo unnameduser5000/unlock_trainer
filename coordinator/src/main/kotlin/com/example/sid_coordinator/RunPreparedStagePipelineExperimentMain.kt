@@ -134,6 +134,15 @@ private data class StagePipelineResult(
     val sumForwardWaitMs: Long
         get() = stageMetrics.sumOf { it.forwardMs }
 
+    val maxPssPeakKb: Long
+        get() = stageMetrics.maxOfOrNull { it.pssPeakKb } ?: 0L
+
+    val maxPrivateDirtyPeakKb: Long
+        get() = stageMetrics.maxOfOrNull { it.privateDirtyPeakKb } ?: 0L
+
+    val maxJavaHeapPeakKb: Long
+        get() = stageMetrics.maxOfOrNull { it.javaHeapPeakKb } ?: 0L
+
     val endToEndOtherMs: Long
         get() = (elapsedMs - sumLocalTrainMs).coerceAtLeast(0L)
 
@@ -560,6 +569,7 @@ private fun writeStagePipelineCsv(path: Path, results: List<StagePipelineResult>
     val rows = mutableListOf(STAGE_PIPELINE_CSV_HEADER)
     rows += results.sortedBy { it.submissionSeq }.map { it.toCsvRow() }
     Files.write(path, rows)
+    writeStagePipelineMemoryCsv(stageMemoryCsvPath(path), results)
 }
 
 private fun StagePipelineResult.toCsvRow(): String {
@@ -604,6 +614,9 @@ private fun StagePipelineResult.toCsvRow(): String {
         sumOutputConvertMs.toString(),
         sumBeliefEncodeMs.toString(),
         sumForwardWaitMs.toString(),
+        maxPssPeakKb.toString(),
+        maxPrivateDirtyPeakKb.toString(),
+        maxJavaHeapPeakKb.toString(),
         endToEndOtherMs.toString(),
         stageLearningRates,
         stageTimingsJson(),
@@ -621,6 +634,7 @@ private fun StagePipelineResult.stageTimingsJson(): String {
                 "stage_id" to metric.stageId,
                 "chunk_idx" to metric.chunkIdx,
                 "node_id" to metric.nodeId,
+                "device_id" to metric.deviceId,
                 "terminal" to metric.terminal,
                 "eval_only" to metric.evalOnly,
                 "optimizer_step_applied" to metric.optimizerStepApplied,
@@ -649,10 +663,101 @@ private fun StagePipelineResult.stageTimingsJson(): String {
                 "belief_transport_dtype" to metric.beliefTransportDtype,
                 "forward_ms" to metric.forwardMs,
                 "stage_total_ms" to metric.stageTotalMs,
+                "memory_sample_interval_ms" to metric.memorySampleIntervalMs,
+                "memory_sample_count" to metric.memorySampleCount,
+                "pss_before_kb" to metric.pssBeforeKb,
+                "pss_after_kb" to metric.pssAfterKb,
+                "pss_peak_kb" to metric.pssPeakKb,
+                "private_dirty_before_kb" to metric.privateDirtyBeforeKb,
+                "private_dirty_after_kb" to metric.privateDirtyAfterKb,
+                "private_dirty_peak_kb" to metric.privateDirtyPeakKb,
+                "java_heap_before_kb" to metric.javaHeapBeforeKb,
+                "java_heap_after_kb" to metric.javaHeapAfterKb,
+                "java_heap_peak_kb" to metric.javaHeapPeakKb,
                 "request_received_epoch_ms" to metric.requestReceivedEpochMs
             )
         }
     )
+}
+
+private fun writeStagePipelineMemoryCsv(path: Path, results: List<StagePipelineResult>) {
+    val rows = mutableListOf(STAGE_PIPELINE_MEMORY_CSV_HEADER)
+    rows += results
+        .sortedBy { it.submissionSeq }
+        .flatMap { it.toStageMemoryCsvRows() }
+    Files.write(path, rows)
+}
+
+private fun StagePipelineResult.toStageMemoryCsvRows(): List<String> {
+    return stageMetrics.map { metric ->
+        listOf(
+            submissionSeq.toString(),
+            requestId,
+            recordIndex.toString(),
+            datasetIndex?.toString().orEmpty(),
+            validLabels.toString(),
+            evalOnly.toString(),
+            beliefTransportMode,
+            success.toString(),
+            terminal.toString(),
+            elapsedMs.toString(),
+            metric.stageId.toString(),
+            metric.chunkIdx.toString(),
+            metric.nodeId.toString(),
+            metric.deviceId,
+            metric.runtimeName,
+            metric.methodName,
+            metric.inputCount.toString(),
+            metric.learningRate.toString(),
+            metric.localLoss.toString(),
+            metric.localQueueWaitMs.toString(),
+            metric.localElapsedMs.toString(),
+            metric.runtimeAcquireMs.toString(),
+            metric.checkpointRestoreMs.toString(),
+            metric.inputBuildMs.toString(),
+            metric.executeMs.toString(),
+            metric.gradientsMs.toString(),
+            metric.optimizerCreateMs.toString(),
+            metric.optimizerStepMs.toString(),
+            metric.outputConvertMs.toString(),
+            metric.outputHiddenBytes.toString(),
+            metric.outputShiftLogPBytes.toString(),
+            metric.beliefEncodeMs.toString(),
+            metric.beliefDenseBytes.toString(),
+            metric.beliefTransportBytes.toString(),
+            metric.beliefTransportDtype,
+            metric.forwardMs.toString(),
+            metric.stageTotalMs.toString(),
+            metric.memorySampleIntervalMs.toString(),
+            metric.memorySampleCount.toString(),
+            metric.pssBeforeKb.toString(),
+            metric.pssAfterKb.toString(),
+            metric.pssPeakKb.toString(),
+            (metric.pssAfterKb - metric.pssBeforeKb).toString(),
+            (metric.pssPeakKb - metric.pssBeforeKb).toString(),
+            metric.privateDirtyBeforeKb.toString(),
+            metric.privateDirtyAfterKb.toString(),
+            metric.privateDirtyPeakKb.toString(),
+            (metric.privateDirtyAfterKb - metric.privateDirtyBeforeKb).toString(),
+            (metric.privateDirtyPeakKb - metric.privateDirtyBeforeKb).toString(),
+            metric.javaHeapBeforeKb.toString(),
+            metric.javaHeapAfterKb.toString(),
+            metric.javaHeapPeakKb.toString(),
+            (metric.javaHeapAfterKb - metric.javaHeapBeforeKb).toString(),
+            (metric.javaHeapPeakKb - metric.javaHeapBeforeKb).toString(),
+            metric.requestReceivedEpochMs.toString()
+        ).joinToString(",") { it.csvEscape() }
+    }
+}
+
+private fun stageMemoryCsvPath(path: Path): Path {
+    val fileName = path.fileName.toString()
+    val baseName = if (fileName.lowercase().endsWith(".csv")) {
+        fileName.substring(0, fileName.length - 4)
+    } else {
+        fileName
+    }
+    return path.resolveSibling("$baseName.stage_memory.csv")
 }
 
 private fun isStagePipelineTransientFailure(message: String): Boolean {
@@ -728,10 +833,71 @@ private val STAGE_PIPELINE_CSV_HEADER = listOf(
     "sum_output_convert_ms",
     "sum_belief_encode_ms",
     "sum_forward_wait_ms",
+    "max_pss_peak_kb",
+    "max_private_dirty_peak_kb",
+    "max_java_heap_peak_kb",
     "end_to_end_other_ms",
     "stage_learning_rates",
     "stage_timings_json",
     "message"
+).joinToString(",")
+
+private val STAGE_PIPELINE_MEMORY_CSV_HEADER = listOf(
+    "submission_seq",
+    "request_id",
+    "record_index",
+    "dataset_index",
+    "valid_labels",
+    "eval_only",
+    "belief_transport_mode",
+    "success",
+    "terminal",
+    "elapsed_ms",
+    "stage_id",
+    "chunk_idx",
+    "node_id",
+    "device_id",
+    "runtime_name",
+    "method_name",
+    "input_count",
+    "learning_rate",
+    "local_loss",
+    "local_queue_wait_ms",
+    "local_elapsed_ms",
+    "runtime_acquire_ms",
+    "checkpoint_restore_ms",
+    "input_build_ms",
+    "execute_ms",
+    "gradients_ms",
+    "optimizer_create_ms",
+    "optimizer_step_ms",
+    "output_convert_ms",
+    "output_hidden_bytes",
+    "output_shift_log_p_bytes",
+    "belief_encode_ms",
+    "belief_dense_bytes",
+    "belief_transport_bytes",
+    "belief_transport_dtype",
+    "forward_ms",
+    "stage_total_ms",
+    "memory_sample_interval_ms",
+    "memory_sample_count",
+    "pss_before_kb",
+    "pss_after_kb",
+    "pss_peak_kb",
+    "pss_delta_after_kb",
+    "pss_delta_peak_kb",
+    "private_dirty_before_kb",
+    "private_dirty_after_kb",
+    "private_dirty_peak_kb",
+    "private_dirty_delta_after_kb",
+    "private_dirty_delta_peak_kb",
+    "java_heap_before_kb",
+    "java_heap_after_kb",
+    "java_heap_peak_kb",
+    "java_heap_delta_after_kb",
+    "java_heap_delta_peak_kb",
+    "request_received_epoch_ms"
 ).joinToString(",")
 
 private val STAGE_PIPELINE_TIMING_GSON = Gson()

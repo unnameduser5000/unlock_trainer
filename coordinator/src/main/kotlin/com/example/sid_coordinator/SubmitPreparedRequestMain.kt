@@ -44,6 +44,9 @@ fun main(args: Array<String>) {
         } else {
             TokenPredictionMetrics(correct = 0, count = 0)
         }
+        val maxPssPeakKb = response.stageMetricsList.maxOfOrNull { it.pssPeakKb } ?: 0L
+        val maxPrivateDirtyPeakKb = response.stageMetricsList.maxOfOrNull { it.privateDirtyPeakKb } ?: 0L
+        val maxJavaHeapPeakKb = response.stageMetricsList.maxOfOrNull { it.javaHeapPeakKb } ?: 0L
         println("requestId=$requestId")
         println("manifest=$manifestPath")
         println("recordIndex=$recordIndex")
@@ -57,6 +60,23 @@ fun main(args: Array<String>) {
         println("terminal=${response.terminal}")
         println("outputHiddenBytes=${response.outputHiddenStates.data.size()}")
         println("outputShiftLogPBytes=${response.outputShiftLogP.data.size()}")
+        println("maxPssPeakKb=$maxPssPeakKb")
+        println("maxPrivateDirtyPeakKb=$maxPrivateDirtyPeakKb")
+        println("maxJavaHeapPeakKb=$maxJavaHeapPeakKb")
+        response.stageMetricsList.forEach { metric ->
+            println(
+                "stageMemory stage=${metric.stageId} chunk=${metric.chunkIdx} " +
+                    "node=${metric.nodeId} device=${metric.deviceId.ifBlank { "unknown" }} " +
+                    "pssBeforeKb=${metric.pssBeforeKb} pssPeakKb=${metric.pssPeakKb} " +
+                    "pssDeltaPeakKb=${metric.pssPeakKb - metric.pssBeforeKb} " +
+                    "privateDirtyBeforeKb=${metric.privateDirtyBeforeKb} " +
+                    "privateDirtyPeakKb=${metric.privateDirtyPeakKb} " +
+                    "privateDirtyDeltaPeakKb=${metric.privateDirtyPeakKb - metric.privateDirtyBeforeKb} " +
+                    "javaHeapBeforeKb=${metric.javaHeapBeforeKb} javaHeapPeakKb=${metric.javaHeapPeakKb} " +
+                    "javaHeapDeltaPeakKb=${metric.javaHeapPeakKb - metric.javaHeapBeforeKb} " +
+                    "samples=${metric.memorySampleCount} intervalMs=${metric.memorySampleIntervalMs}"
+            )
+        }
         println("localLoss=${response.localLoss}")
         println("tokenCorrect=${metrics.correct}")
         println("tokenCount=${metrics.count}")

@@ -174,4 +174,16 @@ message StageExecutionMetrics {
   int64 forward_ms = 30;
   int64 stage_total_ms = 31;
   int64 request_received_epoch_ms = 32;
+  int64 memory_sample_interval_ms = 33;
+  int64 memory_sample_count = 34;
+  int64 pss_before_kb = 35;
+  int64 pss_after_kb = 36;
+  int64 pss_peak_kb = 37;
+  int64 private_dirty_before_kb = 38;
+  int64 private_dirty_after_kb = 39;
+  int64 private_dirty_peak_kb = 40;
+  int64 java_heap_before_kb = 41;
+  int64 java_heap_after_kb = 42;
+  int64 java_heap_peak_kb = 43;
+  string device_id = 44;
 }

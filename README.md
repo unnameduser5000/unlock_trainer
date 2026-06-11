@@ -401,25 +401,37 @@ Invoke-RestMethod http://127.0.0.1:18080/api/v1/status
 
 ## Android Worker Setup
 
-Install the APK onto each phone:
+The worker can be launched with adb intent extras, so routine phone startup does not require manually typing values into the UI.
+
+PowerShell:
 
 ```powershell
-adb -s <serial> install -r app\build\outputs\apk\debug\app-debug.apk
+.\tools\android\start_worker.ps1 `
+  -Serial <serial> `
+  -CoordinatorHost 192.168.1.10 `
+  -DeviceId android_stage_0 `
+  -Install
 ```
 
-The worker UI expects:
+Bash:
 
-- `Coordinator Host`
-- `Coordinator Port`
-- `Device ID`
-- `Local Data Port`
+```bash
+tools/android/start_worker.sh \
+  --serial <serial> \
+  --coordinator-host 192.168.1.10 \
+  --device-id android_stage_0 \
+  --install
+```
 
-Typical values:
+The script builds and installs the debug APK when `-Install` / `--install` is set, then starts `MainActivity` with:
 
-- `Coordinator Host` = coordinator machine LAN IP
-- `Coordinator Port` = `50051`
-- `Local Data Port` = one free port on the phone, for example `26052` or `50052`
-- `Device ID` = must exactly match `pipeline.json`
+- `sid.coordinator_host`
+- `sid.coordinator_port`, default `50051`
+- `sid.device_id`, which must match `coordinator/config/pipeline.json`
+- `sid.local_port`, default `26052`
+- `sid.auto_start=true`
+
+Without those launch extras, the app opens with auto-start disabled. You can still edit the fields in the UI and press `Start Worker`.
 
 When the worker starts:
 
@@ -430,10 +442,8 @@ When the worker starts:
 
 Logs are visible both in-app and in `logcat`.
 
-Example log command:
-
 ```powershell
-adb -s <serial> logcat -s SidWorkerUi ExecuTorchShardRunner
+adb -s <serial> logcat -s SidWorkerUi ExecuTorchShardRunner GrpcManager AndroidRuntime
 ```
 
 ## End-to-End Demo
@@ -444,13 +454,23 @@ adb -s <serial> logcat -s SidWorkerUi ExecuTorchShardRunner
 ./gradlew :coordinator:run
 ```
 
-### 2. Start the workers on two phones
+### 2. Start the configured workers
 
-Make sure both devices:
+For each configured stage, launch one phone with the matching `deviceId` from `coordinator/config/pipeline.json`:
 
-- are on the same LAN
-- have matching `Device ID` values
-- can reach the coordinator host
+```bash
+tools/android/start_worker.sh \
+  --serial <serial> \
+  --coordinator-host 192.168.1.10 \
+  --device-id android_stage_0 \
+  --install
+```
+
+Make sure every worker device:
+
+- is on the same LAN as the coordinator
+- uses a `deviceId` that exists in the pipeline config
+- can reach the coordinator host and HTTP artifact port
 
 ### 3. Check control-plane status
 

@@ -56,6 +56,9 @@ fun main(args: Array<String>) {
         "elapsed_ms",
         "output_hidden_bytes",
         "output_shift_log_p_bytes",
+        "max_pss_peak_kb",
+        "max_private_dirty_peak_kb",
+        "max_java_heap_peak_kb",
         "local_loss",
         "token_correct",
         "token_count",
@@ -65,6 +68,7 @@ fun main(args: Array<String>) {
         "label_choice_accuracy",
         "message"
     ).joinToString(",")
+    val memoryRows = mutableListOf(PREPARED_MEMORY_CSV_HEADER)
 
     var submitted = 0
     var skipped = 0
@@ -135,6 +139,9 @@ fun main(args: Array<String>) {
                     elapsedMs,
                     0,
                     0,
+                    0,
+                    0,
+                    0,
                     0f,
                     0,
                     0,
@@ -179,6 +186,9 @@ fun main(args: Array<String>) {
                 totalLoss += response.localLoss.toDouble()
                 lossRows++
             }
+            val maxPssPeakKb = response.stageMetricsList.maxOfOrNull { it.pssPeakKb } ?: 0L
+            val maxPrivateDirtyPeakKb = response.stageMetricsList.maxOfOrNull { it.privateDirtyPeakKb } ?: 0L
+            val maxJavaHeapPeakKb = response.stageMetricsList.maxOfOrNull { it.javaHeapPeakKb } ?: 0L
             submitted++
             rows += csvRow(
                 requestId,
@@ -194,6 +204,9 @@ fun main(args: Array<String>) {
                 elapsedMs,
                 response.outputHiddenStates.data.size(),
                 response.outputShiftLogP.data.size(),
+                maxPssPeakKb,
+                maxPrivateDirtyPeakKb,
+                maxJavaHeapPeakKb,
                 response.localLoss,
                 metrics.correct,
                 metrics.count,
@@ -203,13 +216,27 @@ fun main(args: Array<String>) {
                 metrics.labelChoiceAccuracy,
                 response.message
             )
+            memoryRows += preparedStageMemoryCsvRows(
+                requestId = requestId,
+                recordIndex = indexed.index,
+                datasetIndex = record.dataset_index,
+                validLabels = validLabels,
+                evalOnly = parsed.evalOnly,
+                beliefTransportMode = parsed.beliefTransportMode,
+                success = response.success,
+                terminal = response.terminal,
+                elapsedMs = elapsedMs,
+                response = response
+            )
             println(
                 "requestId=$requestId index=${indexed.index} validLabels=$validLabels " +
                 "evalOnly=${parsed.evalOnly} beliefMode=${parsed.beliefTransportMode} " +
                     "success=${response.success} terminal=${response.terminal} elapsedMs=$elapsedMs " +
                     "loss=${response.localLoss} tokenAccuracy=${metrics.accuracy} " +
                     "tokens=${metrics.count} labelChoiceAccuracy=${metrics.labelChoiceAccuracy} " +
-                    "labelChoiceTokens=${metrics.labelChoiceCount} message=${response.message}"
+                    "labelChoiceTokens=${metrics.labelChoiceCount} maxPssPeakKb=$maxPssPeakKb " +
+                    "maxPrivateDirtyPeakKb=$maxPrivateDirtyPeakKb maxJavaHeapPeakKb=$maxJavaHeapPeakKb " +
+                    "message=${response.message}"
             )
             if ((!response.success || !response.terminal) && parsed.stopOnFailure) {
                 println("stopOnFailure=true; stopping after failed requestId=$requestId index=${indexed.index}")
@@ -222,6 +249,7 @@ fun main(args: Array<String>) {
     } finally {
         channel.shutdownNow()
         Files.write(parsed.outputCsvPath, rows)
+        Files.write(stageMemoryCsvPath(parsed.outputCsvPath), memoryRows)
     }
 
     println("manifest=$manifestPath")
@@ -238,6 +266,88 @@ fun main(args: Array<String>) {
     println("stopOnFailure=${parsed.stopOnFailure}")
     println("transientRetryCount=${parsed.transientRetryCount} transientRetryDelayMs=${parsed.transientRetryDelayMs}")
     println("submitRpcDeadlineMs=${parsed.submitRpcDeadlineMs}")
+}
+
+private fun preparedStageMemoryCsvRows(
+    requestId: String,
+    recordIndex: Int,
+    datasetIndex: Int?,
+    validLabels: Int,
+    evalOnly: Boolean,
+    beliefTransportMode: String,
+    success: Boolean,
+    terminal: Boolean,
+    elapsedMs: Long,
+    response: Sid.ForwardChunkResponse
+): List<String> {
+    return response.stageMetricsList.map { metric ->
+        listOf(
+            requestId,
+            recordIndex.toString(),
+            datasetIndex?.toString().orEmpty(),
+            validLabels.toString(),
+            evalOnly.toString(),
+            beliefTransportMode,
+            success.toString(),
+            terminal.toString(),
+            elapsedMs.toString(),
+            metric.stageId.toString(),
+            metric.chunkIdx.toString(),
+            metric.nodeId.toString(),
+            metric.deviceId,
+            metric.runtimeName,
+            metric.methodName,
+            metric.inputCount.toString(),
+            metric.learningRate.toString(),
+            metric.localLoss.toString(),
+            metric.localQueueWaitMs.toString(),
+            metric.localElapsedMs.toString(),
+            metric.runtimeAcquireMs.toString(),
+            metric.checkpointRestoreMs.toString(),
+            metric.inputBuildMs.toString(),
+            metric.executeMs.toString(),
+            metric.gradientsMs.toString(),
+            metric.optimizerCreateMs.toString(),
+            metric.optimizerStepMs.toString(),
+            metric.outputConvertMs.toString(),
+            metric.outputHiddenBytes.toString(),
+            metric.outputShiftLogPBytes.toString(),
+            metric.beliefEncodeMs.toString(),
+            metric.beliefDenseBytes.toString(),
+            metric.beliefTransportBytes.toString(),
+            metric.beliefTransportDtype,
+            metric.forwardMs.toString(),
+            metric.stageTotalMs.toString(),
+            metric.memorySampleIntervalMs.toString(),
+            metric.memorySampleCount.toString(),
+            metric.pssBeforeKb.toString(),
+            metric.pssAfterKb.toString(),
+            metric.pssPeakKb.toString(),
+            (metric.pssAfterKb - metric.pssBeforeKb).toString(),
+            (metric.pssPeakKb - metric.pssBeforeKb).toString(),
+            metric.privateDirtyBeforeKb.toString(),
+            metric.privateDirtyAfterKb.toString(),
+            metric.privateDirtyPeakKb.toString(),
+            (metric.privateDirtyAfterKb - metric.privateDirtyBeforeKb).toString(),
+            (metric.privateDirtyPeakKb - metric.privateDirtyBeforeKb).toString(),
+            metric.javaHeapBeforeKb.toString(),
+            metric.javaHeapAfterKb.toString(),
+            metric.javaHeapPeakKb.toString(),
+            (metric.javaHeapAfterKb - metric.javaHeapBeforeKb).toString(),
+            (metric.javaHeapPeakKb - metric.javaHeapBeforeKb).toString(),
+            metric.requestReceivedEpochMs.toString()
+        ).joinToString(",") { it.csvEscape() }
+    }
+}
+
+private fun stageMemoryCsvPath(path: Path): Path {
+    val fileName = path.fileName.toString()
+    val baseName = if (fileName.lowercase().endsWith(".csv")) {
+        fileName.substring(0, fileName.length - 4)
+    } else {
+        fileName
+    }
+    return path.resolveSibling("$baseName.stage_memory.csv")
 }
 
 private fun parseArgs(args: Array<String>): PreparedExperimentArgs {
@@ -348,6 +458,9 @@ private fun csvRow(
     elapsedMs: Long,
     outputHiddenBytes: Int,
     outputShiftLogPBytes: Int,
+    maxPssPeakKb: Long,
+    maxPrivateDirtyPeakKb: Long,
+    maxJavaHeapPeakKb: Long,
     localLoss: Float,
     tokenCorrect: Int,
     tokenCount: Int,
@@ -371,6 +484,9 @@ private fun csvRow(
         elapsedMs.toString(),
         outputHiddenBytes.toString(),
         outputShiftLogPBytes.toString(),
+        maxPssPeakKb.toString(),
+        maxPrivateDirtyPeakKb.toString(),
+        maxJavaHeapPeakKb.toString(),
         localLoss.toString(),
         tokenCorrect.toString(),
         tokenCount.toString(),
@@ -421,3 +537,60 @@ private val TRANSIENT_FAILURE_MARKERS = listOf(
     "timeout",
     "timed out"
 )
+
+private val PREPARED_MEMORY_CSV_HEADER = listOf(
+    "request_id",
+    "record_index",
+    "dataset_index",
+    "valid_labels",
+    "eval_only",
+    "belief_transport_mode",
+    "success",
+    "terminal",
+    "elapsed_ms",
+    "stage_id",
+    "chunk_idx",
+    "node_id",
+    "device_id",
+    "runtime_name",
+    "method_name",
+    "input_count",
+    "learning_rate",
+    "local_loss",
+    "local_queue_wait_ms",
+    "local_elapsed_ms",
+    "runtime_acquire_ms",
+    "checkpoint_restore_ms",
+    "input_build_ms",
+    "execute_ms",
+    "gradients_ms",
+    "optimizer_create_ms",
+    "optimizer_step_ms",
+    "output_convert_ms",
+    "output_hidden_bytes",
+    "output_shift_log_p_bytes",
+    "belief_encode_ms",
+    "belief_dense_bytes",
+    "belief_transport_bytes",
+    "belief_transport_dtype",
+    "forward_ms",
+    "stage_total_ms",
+    "memory_sample_interval_ms",
+    "memory_sample_count",
+    "pss_before_kb",
+    "pss_after_kb",
+    "pss_peak_kb",
+    "pss_delta_after_kb",
+    "pss_delta_peak_kb",
+    "private_dirty_before_kb",
+    "private_dirty_after_kb",
+    "private_dirty_peak_kb",
+    "private_dirty_delta_after_kb",
+    "private_dirty_delta_peak_kb",
+    "java_heap_before_kb",
+    "java_heap_after_kb",
+    "java_heap_peak_kb",
+    "java_heap_delta_after_kb",
+    "java_heap_delta_peak_kb",
+    "request_received_epoch_ms"
+).joinToString(",")
