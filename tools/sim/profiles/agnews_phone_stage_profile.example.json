@@ -1,0 +1,35 @@
+{
+  "name": "agnews-phone-stage-pipeline-20260603",
+  "source": "Derived from local stage-pipeline train/eval CSV summaries. Use --stage-memory-csv with fresh results when available.",
+  "belief_transport_mode": "terminal",
+  "seq_len": 128,
+  "stages": [
+    {
+      "stage_id": 0,
+      "device_id": "NX809J",
+      "duration_ms": 13382.1,
+      "output_hidden_bytes": 524288,
+      "output_shift_log_p_bytes": 2,
+      "pss_peak_kb": 3465216,
+      "java_heap_peak_kb": 38810
+    },
+    {
+      "stage_id": 1,
+      "device_id": "Lenovo_L71091",
+      "duration_ms": 10307.1,
+      "output_hidden_bytes": 524288,
+      "output_shift_log_p_bytes": 2,
+      "pss_peak_kb": 3426714,
+      "java_heap_peak_kb": 36762
+    },
+    {
+      "stage_id": 2,
+      "device_id": "Pixel_10_Pro_XL",
+      "duration_ms": 13112.0,
+      "output_hidden_bytes": 524288,
+      "output_shift_log_p_bytes": 8192000,
+      "pss_peak_kb": 3926450,
+      "java_heap_peak_kb": 125167
+    }
+  ]
+}
