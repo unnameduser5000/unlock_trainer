@@ -3,11 +3,17 @@
 Use this when phone training is too slow and each phone-like stage should map to
 a different server GPU.
 
-Main script:
+Main speed-oriented script:
+
+- `tools/sim/run_bpfree_lora_pipeline_dist.py`
+
+Fallback/debug script:
 
 - `tools/sim/run_bpfree_lora_pipeline_multigpu.py`
 
-This is real PyTorch training. It is not the lightweight queue simulator.
+Both are real PyTorch training. They are not the lightweight queue simulator.
+Use the distributed script first on the server; the fallback script uses CPU
+`multiprocessing.Queue` handoff and is mainly for debugging.
 
 ## What It Runs
 
@@ -37,21 +43,21 @@ stage0(request i) -> stage1(request i) -> stage2(request i)
 
 There is no cross-stage backward pass.
 
-Boundary tensors are passed between processes as CPU tensors through bounded
-multiprocessing queues. This keeps the first server runner simple and explicit;
-it is not the final high-performance NCCL implementation.
+In the distributed runner, boundary hidden states move through
+`torch.distributed.send/recv` between adjacent ranks. With `--dist_backend nccl`
+and `--stage_devices cuda:0,cuda:1,cuda:2`, this is GPU tensor communication
+handled by NCCL instead of the CPU queue fallback.
 
 ## Example
 
 ```bash
-python tools/sim/run_bpfree_lora_pipeline_multigpu.py \
+python tools/sim/run_bpfree_lora_pipeline_dist.py \
   --model_name tinyllama \
   --train_manifest data/sft_requests/tinyllama_agnews128_label_train512_seed20260531/requests.jsonl \
   --eval_manifest data/sft_requests/tinyllama_agnews128_label_eval256_seed20260531/requests.jsonl \
   --output_dir debug_runs/server_multigpu/agnews_3gpu_terminal \
   --num_chunks 3 \
   --stage_devices cuda:0,cuda:1,cuda:2 \
-  --max_buffered_per_stage 3 \
   --train_limit 512 \
   --eval_limit 256 \
   --train_epochs 1 \
@@ -66,14 +72,13 @@ python tools/sim/run_bpfree_lora_pipeline_multigpu.py \
 For a quick smoke:
 
 ```bash
-python tools/sim/run_bpfree_lora_pipeline_multigpu.py \
+python tools/sim/run_bpfree_lora_pipeline_dist.py \
   --model_name tinyllama \
   --train_manifest data/sft_requests/tinyllama_agnews128_label_train512_seed20260531/requests.jsonl \
   --eval_manifest data/sft_requests/tinyllama_agnews128_label_eval256_seed20260531/requests.jsonl \
   --output_dir debug_runs/server_multigpu/smoke \
   --num_chunks 3 \
   --stage_devices cuda:0,cuda:1,cuda:2 \
-  --max_buffered_per_stage 1 \
   --train_limit 4 \
   --eval_limit 4 \
   --skip_eval_after
@@ -83,8 +88,13 @@ python tools/sim/run_bpfree_lora_pipeline_multigpu.py \
 
 - `--stage_devices`: one device per stage. This is the explicit server mapping
   that replaces phone device assignment.
-- `--max_buffered_per_stage`: bounded queue capacity between stages. This
-  mirrors the phone runner's `maxBufferedPerStage`.
+- `--dist_backend`: defaults to `nccl`, which is the intended same-machine
+  multi-GPU backend.
+- `--master_port`: change this if another distributed job is already using the
+  default rendezvous port.
+- The distributed runner uses blocking point-to-point send/recv for natural
+  backpressure. The older `--max_buffered_per_stage` queue parameter only
+  applies to the CPU Queue fallback runner.
 - `--belief_transport_mode terminal`: current CE-only AG News path. Intermediate
   stages do not send full vocab log-probs; the terminal stage returns log-probs
   for metrics.
