@@ -42,6 +42,7 @@ from transformers import AutoModelForCausalLM
 from run_bpfree_lora_label_experiment import (
     configure_lora_trainable,
     get_model_parts,
+    infer_module_compute_dtype,
     inject_lora_adapters,
     label_choice_metrics,
     load_tensor,
@@ -120,7 +121,7 @@ class ServerBpfreeChunk(nn.Module):
         )
 
     def compute_dtype(self) -> torch.dtype:
-        return next(self.parameters()).dtype
+        return infer_module_compute_dtype(self)
 
     def forward(
         self,
@@ -271,11 +272,24 @@ def load_stage0_state_cpu(record: dict[str, Any], manifest_dir: str) -> dict[str
     }
 
 
-def move_state_to_device(state: dict[str, Any], device: torch.device) -> dict[str, Any]:
+def move_state_to_device(
+    state: dict[str, Any],
+    device: torch.device,
+    compute_dtype: Optional[torch.dtype] = None,
+) -> dict[str, Any]:
     moved = {}
     for key in ("hidden", "attention_mask", "position_ids", "labels", "prev_log_probs"):
         value = state.get(key)
-        moved[key] = value.to(device, non_blocking=False) if isinstance(value, torch.Tensor) else None
+        if not isinstance(value, torch.Tensor):
+            moved[key] = None
+        elif key in {"hidden", "attention_mask"} and compute_dtype is not None:
+            moved[key] = value.to(device=device, dtype=compute_dtype, non_blocking=False)
+        elif key in {"position_ids", "labels"}:
+            moved[key] = value.to(device=device, dtype=torch.long, non_blocking=False)
+        elif key == "prev_log_probs":
+            moved[key] = value.to(device=device, dtype=torch.float32, non_blocking=False)
+        else:
+            moved[key] = value.to(device=device, non_blocking=False)
     return moved
 
 
@@ -359,7 +373,7 @@ def stage_worker_main(
 
             state_cpu = cpu_state_from_task(task)
             h2d_started = time.perf_counter()
-            state = move_state_to_device(state_cpu, device)
+            state = move_state_to_device(state_cpu, device, chunk.compute_dtype())
             if device.type == "cuda":
                 torch.cuda.synchronize(device)
             h2d_ms = (time.perf_counter() - h2d_started) * 1000.0

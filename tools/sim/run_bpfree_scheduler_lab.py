@@ -177,11 +177,24 @@ def load_initial_state(record: dict[str, Any], manifest_dir: Path) -> dict[str, 
     }
 
 
-def move_state_to_device(state: dict[str, Any], device: torch.device) -> dict[str, Any]:
+def move_state_to_device(
+    state: dict[str, Any],
+    device: torch.device,
+    compute_dtype: Optional[torch.dtype] = None,
+) -> dict[str, Any]:
     moved: dict[str, Any] = {}
     for key in ("hidden", "attention_mask", "position_ids", "labels", "prev_log_probs"):
         value = state.get(key)
-        moved[key] = value.to(device, non_blocking=False) if isinstance(value, torch.Tensor) else None
+        if not isinstance(value, torch.Tensor):
+            moved[key] = None
+        elif key in {"hidden", "attention_mask"} and compute_dtype is not None:
+            moved[key] = value.to(device=device, dtype=compute_dtype, non_blocking=False)
+        elif key in {"position_ids", "labels"}:
+            moved[key] = value.to(device=device, dtype=torch.long, non_blocking=False)
+        elif key == "prev_log_probs":
+            moved[key] = value.to(device=device, dtype=torch.float32, non_blocking=False)
+        else:
+            moved[key] = value.to(device=device, non_blocking=False)
     return moved
 
 
@@ -285,7 +298,7 @@ def stage_worker_main(
                 continue
 
             train_this_stage = task["mode"] == "train" and spec.stage_id in cfg.train_chunks
-            state = move_state_to_device(task["input_state"], device)
+            state = move_state_to_device(task["input_state"], device, chunk.compute_dtype())
 
             lr = cfg.learning_rate
             if lr is None:

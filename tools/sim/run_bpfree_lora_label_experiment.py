@@ -55,10 +55,13 @@ class LoRALinear(nn.Module):
             param.requires_grad = False
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        base_out = self.base(x)
-        lora_hidden = F.linear(x, self.lora_a)
+        base_dtype = self.base.weight.dtype
+        lora_dtype = self.lora_a.dtype
+        base_out = self.base(x.to(dtype=base_dtype))
+        lora_input = x.to(dtype=lora_dtype)
+        lora_hidden = F.linear(lora_input, self.lora_a)
         lora_out = F.linear(lora_hidden, self.lora_b) * self.scaling
-        return base_out + lora_out
+        return (base_out.float() + lora_out.float()).to(dtype=base_dtype)
 
 
 def inject_lora_adapters(
@@ -101,6 +104,23 @@ def configure_lora_trainable(module: nn.Module) -> tuple[int, int]:
     return trainable, frozen
 
 
+def infer_module_compute_dtype(module: nn.Module) -> torch.dtype:
+    for submodule in module.modules():
+        base = getattr(submodule, "base", None)
+        if isinstance(base, nn.Linear) and base.weight.is_floating_point():
+            return base.weight.dtype
+    for submodule in module.modules():
+        if isinstance(submodule, nn.Linear) and submodule.weight.is_floating_point():
+            return submodule.weight.dtype
+    for param in module.parameters():
+        if not param.requires_grad and param.is_floating_point():
+            return param.dtype
+    for param in module.parameters():
+        if param.is_floating_point():
+            return param.dtype
+    raise RuntimeError("Could not infer module compute dtype.")
+
+
 class BpfreeChunk(nn.Module):
     def __init__(
         self,
@@ -124,7 +144,7 @@ class BpfreeChunk(nn.Module):
         self.label_smoothing = label_smoothing
 
     def compute_dtype(self) -> torch.dtype:
-        return next(self.parameters()).dtype
+        return infer_module_compute_dtype(self)
 
     def forward(
         self,
