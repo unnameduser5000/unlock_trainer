@@ -208,6 +208,16 @@ def state_bytes(state: Optional[dict[str, Any]]) -> int:
     return total
 
 
+def bytes_to_mib(value: int) -> float:
+    return round(value / (1024.0 * 1024.0), 2)
+
+
+def optional_float(value: Any) -> Optional[float]:
+    if value in (None, ""):
+        return None
+    return float(value)
+
+
 def build_worker_optimizer(params: list[torch.nn.Parameter], cfg: LabConfig) -> torch.optim.Optimizer:
     return build_optimizer(
         params=params,
@@ -270,9 +280,13 @@ def stage_worker_main(
         if device.type == "cuda":
             torch.cuda.empty_cache()
             torch.cuda.reset_peak_memory_stats(device)
+        cuda_allocated = int(torch.cuda.memory_allocated(device)) if device.type == "cuda" else 0
+        cuda_reserved = int(torch.cuda.memory_reserved(device)) if device.type == "cuda" else 0
         print(
             f"[{spec.worker_id}] ready lora_modules={injected} all_trainable={trainable} "
-            f"frozen={frozen} local_trainable={sum(p.numel() for p in local_params)}",
+            f"frozen={frozen} local_trainable={sum(p.numel() for p in local_params)} "
+            f"compute_dtype={chunk.compute_dtype()} cuda_allocated_mib={bytes_to_mib(cuda_allocated)} "
+            f"cuda_reserved_mib={bytes_to_mib(cuda_reserved)}",
             flush=True,
         )
 
@@ -596,6 +610,7 @@ class SchedulerLab:
         self.next_event_seq = 0
         self.stage_attempts: dict[tuple[int, int], int] = defaultdict(int)
         self.request_attempts: dict[int, list[dict[str, Any]]] = defaultdict(list)
+        self.worker_metric_accum: dict[str, dict[str, Any]] = {}
 
         self.results_path = output_dir / "scheduler_results.csv"
         self.metrics_path = output_dir / "scheduler_stage_metrics.csv"
@@ -912,6 +927,7 @@ class SchedulerLab:
             "max_inflight": self.max_inflight,
             "max_attempts": self.max_attempts,
             "workers": [spec.__dict__ for spec in self.worker_specs],
+            "gpu_metrics_by_worker": self.gpu_metrics_by_worker(),
             "results_csv": str(self.results_path),
             "metrics_csv": str(self.metrics_path),
             "ledger_csv": str(self.ledger_path),
@@ -932,8 +948,93 @@ class SchedulerLab:
         self.result_handle.flush()
 
     def write_metric(self, metric: dict[str, Any]) -> None:
+        self.accumulate_metric(metric)
         self.metric_writer.writerow({name: metric.get(name, "") for name in metric_fieldnames()})
         self.metric_handle.flush()
+
+    def accumulate_metric(self, metric: dict[str, Any]) -> None:
+        worker_id = str(metric.get("worker_id") or "")
+        if not worker_id:
+            return
+        stats = self.worker_metric_accum.setdefault(
+            worker_id,
+            {
+                "worker_id": worker_id,
+                "stage_id": metric.get("stage_id"),
+                "device": metric.get("device"),
+                "tasks": 0,
+                "train_tasks": 0,
+                "failures": 0,
+                "execute_ms_sum": 0.0,
+                "execute_ms_count": 0,
+                "optimizer_ms_sum": 0.0,
+                "optimizer_ms_count": 0,
+                "stage_total_ms_sum": 0.0,
+                "stage_total_ms_count": 0,
+                "max_cuda_peak_memory_allocated": 0,
+                "max_cuda_peak_memory_reserved": 0,
+            },
+        )
+        stats["tasks"] += 1
+        if bool(metric.get("train")):
+            stats["train_tasks"] += 1
+        if metric.get("failure"):
+            stats["failures"] += 1
+        for source, total_key, count_key in (
+            ("execute_ms", "execute_ms_sum", "execute_ms_count"),
+            ("optimizer_ms", "optimizer_ms_sum", "optimizer_ms_count"),
+            ("stage_total_ms", "stage_total_ms_sum", "stage_total_ms_count"),
+        ):
+            parsed = optional_float(metric.get(source))
+            if parsed is not None:
+                stats[total_key] += parsed
+                stats[count_key] += 1
+        allocated = optional_float(metric.get("cuda_peak_memory_allocated"))
+        reserved = optional_float(metric.get("cuda_peak_memory_reserved"))
+        if allocated is not None:
+            stats["max_cuda_peak_memory_allocated"] = max(
+                int(stats["max_cuda_peak_memory_allocated"]),
+                int(allocated),
+            )
+        if reserved is not None:
+            stats["max_cuda_peak_memory_reserved"] = max(
+                int(stats["max_cuda_peak_memory_reserved"]),
+                int(reserved),
+            )
+
+    def gpu_metrics_by_worker(self) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for worker_id in sorted(self.worker_metric_accum):
+            stats = self.worker_metric_accum[worker_id]
+            execute_count = int(stats["execute_ms_count"])
+            optimizer_count = int(stats["optimizer_ms_count"])
+            total_count = int(stats["stage_total_ms_count"])
+            rows.append(
+                {
+                    "worker_id": stats["worker_id"],
+                    "stage_id": stats["stage_id"],
+                    "device": stats["device"],
+                    "tasks": stats["tasks"],
+                    "train_tasks": stats["train_tasks"],
+                    "failures": stats["failures"],
+                    "avg_execute_ms": (
+                        stats["execute_ms_sum"] / execute_count if execute_count else 0.0
+                    ),
+                    "avg_optimizer_ms": (
+                        stats["optimizer_ms_sum"] / optimizer_count if optimizer_count else 0.0
+                    ),
+                    "avg_stage_total_ms": (
+                        stats["stage_total_ms_sum"] / total_count if total_count else 0.0
+                    ),
+                    "max_cuda_peak_memory_allocated_mib": bytes_to_mib(
+                        int(stats["max_cuda_peak_memory_allocated"])
+                    ),
+                    "max_cuda_peak_memory_reserved_mib": bytes_to_mib(
+                        int(stats["max_cuda_peak_memory_reserved"])
+                    ),
+                }
+            )
+        return rows
 
     def write_ledger(
         self,
