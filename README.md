@@ -1,14 +1,16 @@
-# UnLok: Resilient Collaborative Training
+# ZeroLock: Concurrent Memory-Efficient Training via Modular Update Decoupling
 
-This repository implements the system described in **"Resilient Collaborative
-On-Device Training System: Backpropagation-Beyond Approach."** It includes the
+This repository provides the implementation and evaluation artifact for
+**"ZeroLock: Concurrent Memory-Efficient Training via Modular Update
+Decoupling."** It includes the
 multi-stage training runtime, Android implementation, ExecuTorch extension,
 comparison systems, and scripts for the five evaluation sections.
 
-UnLok removes the end-to-end backward dependency between pipeline stages. Each
-stage constructs a local objective, performs a local backward pass, and commits
-its optimizer update independently. Stage boundaries carry detached forward
-hidden states; they do not carry backward gradients or optimizer state.
+ZeroLock uses the UnLok algorithm to remove the end-to-end backward dependency
+between pipeline stages. Each stage constructs a local objective, performs a
+local backward pass, and commits its optimizer update independently. Stage
+boundaries carry detached forward hidden states; they do not carry backward
+gradients or optimizer state.
 
 In this repository, **BP-free** means *free of cross-stage backpropagation*.
 Local backpropagation remains part of every stage update.
