@@ -1,0 +1,54 @@
+{
+  "name": "scheduler_timeline_train512_seed20260531",
+  "description": "Timestamped real-GPU runs for per-device schedule and bubble plots.",
+  "output_root": "debug_runs/scheduler_reports/full_train512_eval256_3seeds/timeline_train512_seed20260531",
+  "target_stage": 2,
+  "seeds": [20260531],
+  "defaults": {
+    "model_name": "tinyllama",
+    "manifest": "data/sft_requests/tinyllama_agnews128_label_train512_seed20260531/requests.jsonl",
+    "num_chunks": 3,
+    "stage_devices": ["cuda:0", "cuda:1", "cuda:2"],
+    "topology": "phone_fixed",
+    "target_stage": 2,
+    "train_limit": 512,
+    "max_inflight": 8,
+    "scheduler_policy": "fifo",
+    "recovery_policy": "replay_after_update",
+    "belief_transport_mode": "terminal",
+    "dtype": "bfloat16",
+    "train_chunks": "all",
+    "progress_interval": 128
+  },
+  "cases": [
+    {
+      "name": "all_updates"
+    },
+    {
+      "name": "stride3",
+      "overrides": {
+        "stage_train_strides": {
+          "{target_stage}": 3
+        }
+      }
+    },
+    {
+      "name": "queue0",
+      "overrides": {
+        "stage_update_policy": "queue_gated",
+        "stage_update_queue_thresholds": {
+          "{target_stage}": 0
+        }
+      }
+    },
+    {
+      "name": "queue2",
+      "overrides": {
+        "stage_update_policy": "queue_gated",
+        "stage_update_queue_thresholds": {
+          "{target_stage}": 2
+        }
+      }
+    }
+  ]
+}

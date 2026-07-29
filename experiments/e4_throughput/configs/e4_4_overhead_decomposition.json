@@ -1,0 +1,68 @@
+{
+  "experiment_id": "e4_4_pipedream_trace_omp4_v2",
+  "description": "Four-schedule synchronized overhead traces with OMP_NUM_THREADS=4 fixed for every method",
+  "repetitions": 1,
+  "model_name": "tinyllama",
+  "train_manifest": "data/sft_requests/tinyllama_agnews128_label_train10000_formal_v1/requests.jsonl",
+  "eval_manifest": "data/sft_requests/tinyllama_agnews128_label_eval256_seed20260531/requests.jsonl",
+  "eval_limit": 1,
+  "train_epochs": 1,
+  "gpu_count": 3,
+  "stage_devices": "cuda:0,cuda:1,cuda:2",
+  "profiles": [
+    {
+      "name": "local",
+      "link_latency_ms": 0.0,
+      "link_bandwidth_mbps": 0.0,
+      "link_jitter_ms": 0.0
+    },
+    {
+      "name": "constrained",
+      "link_latency_ms": 30.0,
+      "link_bandwidth_mbps": 50.0,
+      "link_jitter_ms": 0.0
+    }
+  ],
+  "regimes": [
+    {
+      "name": "online_b1_m1",
+      "physical_request_batch": 1,
+      "microbatches_per_update": 1,
+      "train_limit": 64,
+      "methods": ["bpfree", "exactbp_gpipe"]
+    },
+    {
+      "name": "throughput_b8_m4",
+      "physical_request_batch": 8,
+      "microbatches_per_update": 4,
+      "train_limit": 256,
+      "methods": [
+        "bpfree",
+        "exactbp_gpipe",
+        "exactbp_1f1b",
+        "pipedream"
+      ]
+    }
+  ],
+  "dtype": "bfloat16",
+  "learning_rate": 0.0003,
+  "optimizer": "adamw",
+  "grad_clip": 0.0,
+  "label_smoothing": 0.0,
+  "trainable_mode": "lora",
+  "lora_targets": "q_proj,v_proj",
+  "lora_rank": 4,
+  "lora_alpha": 16.0,
+  "lora_init_std": 0.01,
+  "lora_init_seed": 20260531,
+  "seed": 20260531,
+  "link_emulation_seed": 20260531,
+  "belief_transport_mode": "none",
+  "master_port_base": 30540,
+  "output_root": "results/e4_throughput/raw/e4_4_pipedream_trace_omp4_v2",
+  "analysis_output": "results/e4_throughput/analysis/e4_4_pipedream_trace_omp4_v2",
+  "omp_num_threads": 4,
+  "recv_prepost_depth": 4,
+  "max_pending_send_bytes": 67108864,
+  "max_posted_recv_bytes": 67108864
+}

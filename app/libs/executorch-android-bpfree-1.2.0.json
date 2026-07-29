@@ -1,0 +1,38 @@
+{
+  "artifact": "executorch-android-bpfree-1.2.0.aar",
+  "artifact_sha256": "f9ad80026e10856480d0d8bff082ce6df19e681d2459631c6722aad5f1f128a3",
+  "artifact_size": 2254041,
+  "upstream": {
+    "repository": "https://github.com/pytorch/executorch.git",
+    "tag": "v1.2.0",
+    "commit": "0b0e2c5cdd67c8b4396a46ea1d1aa72ffb0128d7"
+  },
+  "build": {
+    "android_abis": [
+      "arm64-v8a"
+    ],
+    "cmake_build_type": "Release",
+    "executorch_build_extension_llm": false,
+    "executorch_build_kernels_optimized": true
+  },
+  "anonymous_snapshot": {
+    "canonical_artifact_sha256": "dfef4039fc757d93578521054d360a1be5b4b873bf580f494665ff38913ebf8b",
+    "source_path_replacement": "anonymous"
+  },
+  "contents": {
+    "class_archive": "classes.jar",
+    "native_library": "jni/arm64-v8a/libexecutorch.so",
+    "native_library_sha256": "752cf1e2b2bfbb4dff3234ee52f0b64c2202f428de42835d46ce1f7383853bd1",
+    "native_library_size": 6492264,
+    "required_java_classes": [
+      "org/pytorch/executorch/training/BPFreeTrainingModule.class",
+      "org/pytorch/executorch/training/BPFreeTrainingModule$BoundaryResult.class"
+    ],
+    "required_native_markers": [
+      "sid_bpfree_pipeline::pipeline_boundary.out",
+      "kernels/optimized/cpu/op_add.cpp",
+      "kernels/optimized/cpu/op_mm.cpp",
+      "kernels/optimized/cpu/op_linear.cpp"
+    ]
+  }
+}

@@ -1,0 +1,229 @@
+{
+  "version": "0.1",
+  "locale": "zh-CN",
+  "tools": [
+    {
+      "name": "alarm.create",
+      "description": "Create an alarm.",
+      "required": ["time"],
+      "parameters": {
+        "time": "HH:MM or natural-language time",
+        "date": "optional date such as tomorrow or weekday",
+        "label": "optional alarm label",
+        "repeat": "none|daily|weekdays|weekends|weekday"
+      }
+    },
+    {
+      "name": "alarm.delete",
+      "description": "Delete an alarm.",
+      "required": ["time"],
+      "parameters": {
+        "time": "HH:MM or natural-language time",
+        "date": "optional date or weekday",
+        "label": "optional alarm label"
+      }
+    },
+    {
+      "name": "timer.start",
+      "description": "Start a countdown timer.",
+      "required": ["duration"],
+      "parameters": {
+        "duration": "duration such as 10m or 1h30m",
+        "label": "optional timer label"
+      }
+    },
+    {
+      "name": "reminder.create",
+      "description": "Create a reminder.",
+      "required": ["title"],
+      "parameters": {
+        "title": "reminder content",
+        "time": "optional time",
+        "date": "optional date",
+        "location": "optional location trigger"
+      }
+    },
+    {
+      "name": "calendar.create_event",
+      "description": "Create a calendar event.",
+      "required": ["title", "date"],
+      "parameters": {
+        "title": "event title",
+        "date": "event date",
+        "start_time": "optional start time",
+        "end_time": "optional end time",
+        "location": "optional location",
+        "attendees": "optional attendee names"
+      }
+    },
+    {
+      "name": "calendar.find_event",
+      "description": "Find calendar events.",
+      "required": ["query"],
+      "parameters": {
+        "query": "event keywords",
+        "date": "optional date range"
+      }
+    },
+    {
+      "name": "app.open",
+      "description": "Open an installed app.",
+      "required": ["app_name"],
+      "parameters": {
+        "app_name": "app display name"
+      }
+    },
+    {
+      "name": "settings.toggle",
+      "description": "Turn a phone system capability on or off.",
+      "required": ["setting", "state"],
+      "parameters": {
+        "setting": "wifi|bluetooth|mobile_data|airplane_mode|do_not_disturb|flashlight|hotspot|location|dark_mode|battery_saver",
+        "state": "on|off"
+      }
+    },
+    {
+      "name": "settings.set_volume",
+      "description": "Set media/ring/alarm volume.",
+      "required": ["stream", "level"],
+      "parameters": {
+        "stream": "media|ring|alarm|notification",
+        "level": "0-100"
+      }
+    },
+    {
+      "name": "settings.set_brightness",
+      "description": "Set screen brightness.",
+      "required": ["level"],
+      "parameters": {
+        "level": "0-100 or auto",
+        "auto": "true|false"
+      }
+    },
+    {
+      "name": "contacts.search",
+      "description": "Search contacts.",
+      "required": ["name"],
+      "parameters": {
+        "name": "contact name or nickname"
+      }
+    },
+    {
+      "name": "phone.call",
+      "description": "Start a phone call.",
+      "required": ["contact"],
+      "parameters": {
+        "contact": "contact name or phone number",
+        "number_type": "mobile|home|work|unknown"
+      }
+    },
+    {
+      "name": "sms.send",
+      "description": "Send a text message.",
+      "required": ["recipient", "content"],
+      "parameters": {
+        "recipient": "contact name or phone number",
+        "content": "message body"
+      }
+    },
+    {
+      "name": "email.compose",
+      "description": "Compose an email draft.",
+      "required": ["recipient", "subject"],
+      "parameters": {
+        "recipient": "contact or email address",
+        "subject": "email subject",
+        "body": "optional body"
+      }
+    },
+    {
+      "name": "notes.create",
+      "description": "Create a note.",
+      "required": ["content"],
+      "parameters": {
+        "content": "note content",
+        "title": "optional title"
+      }
+    },
+    {
+      "name": "weather.query",
+      "description": "Query weather.",
+      "required": ["location"],
+      "parameters": {
+        "location": "city or current_location",
+        "date": "today|tomorrow|weekday|date"
+      }
+    },
+    {
+      "name": "navigation.start",
+      "description": "Start navigation.",
+      "required": ["destination"],
+      "parameters": {
+        "destination": "destination name or address",
+        "mode": "driving|walking|transit|cycling"
+      }
+    },
+    {
+      "name": "music.play",
+      "description": "Play music.",
+      "required": ["query"],
+      "parameters": {
+        "query": "song, artist, playlist, or genre",
+        "app_name": "optional music app"
+      }
+    },
+    {
+      "name": "camera.open",
+      "description": "Open camera mode.",
+      "required": ["mode"],
+      "parameters": {
+        "mode": "photo|video|portrait|night|scan"
+      }
+    },
+    {
+      "name": "smart_home.control",
+      "description": "Control a smart-home device.",
+      "required": ["device", "action"],
+      "parameters": {
+        "device": "device name or room",
+        "action": "turn_on|turn_off|set_temperature|set_brightness|set_color",
+        "value": "optional value for temperature/brightness/color"
+      }
+    },
+    {
+      "name": "file.search",
+      "description": "Search local files.",
+      "required": ["query"],
+      "parameters": {
+        "query": "filename or content keyword",
+        "file_type": "optional document|image|video|audio|any"
+      }
+    },
+    {
+      "name": "clipboard.copy",
+      "description": "Copy text to clipboard.",
+      "required": ["content"],
+      "parameters": {
+        "content": "text to copy"
+      }
+    },
+    {
+      "name": "payment.open_scan",
+      "description": "Open payment or QR scan.",
+      "required": ["app_name"],
+      "parameters": {
+        "app_name": "Alipay|WeChat|bank app|default",
+        "mode": "pay|scan"
+      }
+    },
+    {
+      "name": "translation.translate",
+      "description": "Translate short text locally when possible.",
+      "required": ["text", "target_language"],
+      "parameters": {
+        "text": "source text",
+        "target_language": "target language name"
+      }
+    }
+  ]
+}

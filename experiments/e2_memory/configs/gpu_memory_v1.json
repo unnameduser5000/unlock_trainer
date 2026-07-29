@@ -1,0 +1,108 @@
+{
+  "schema_version": 1,
+  "protocol_id": "e2-gpu-memory-v1",
+  "provenance": {
+    "reconstructs_protocol": "e2-memory-v2.1-no-terminal-logprobs-20260717",
+    "paper_scope": "E2 GPU Memory Exchange",
+    "historical_evidence_root": "results/e2_memory_v2/raw/formal_v2"
+  },
+  "manifests": {
+    "train": {
+      "path": "data/sft_requests/tinyllama_agnews128_label_train10000_formal_v1/requests.jsonl",
+      "sha256": "cf334ced6b3f3af86a46134326649c5e0c47e2c67898acf682924c182a4344c6"
+    },
+    "eval": {
+      "path": "data/sft_requests/tinyllama_agnews128_label_eval256_seed20260531/requests.jsonl",
+      "sha256": "da8df942a548df4cd50891fd0f6e6d6c4d147ef0b3aa9eb193c779a4d2e99438"
+    }
+  },
+  "model": {
+    "name": "tinyllama",
+    "num_stages": 3,
+    "stage_devices": "cuda:0,cuda:1,cuda:2",
+    "dtype": "bfloat16",
+    "trainable_mode": "lora",
+    "lora_rank": 4,
+    "lora_alpha": 16.0,
+    "lora_targets": "q_proj,v_proj",
+    "lora_init_std": 0.01
+  },
+  "optimization": {
+    "optimizer": "adamw",
+    "learning_rate": 0.0003,
+    "grad_clip": 0.0,
+    "label_smoothing": 0.0,
+    "seed": 20260531,
+    "effective_batch": 32,
+    "train_windows": 8
+  },
+  "transport": {
+    "recv_prepost_depth": 4,
+    "max_pending_send_bytes": 67108864,
+    "max_posted_recv_bytes": 67108864,
+    "link_latency_ms": 0.0,
+    "link_bandwidth_mbps": 0.0,
+    "link_jitter_ms": 0.0
+  },
+  "measurement": {
+    "activation_tracking": true,
+    "terminal_output_log_probabilities": false,
+    "memory_warmup_windows": 0,
+    "fresh_process_per_run": true,
+    "omp_num_threads": 4,
+    "bpfree_deferred_backward_group_size": 1,
+    "bpfree_window_input_staging": 0
+  },
+  "repetitions": {
+    "default": 1,
+    "primary": 3,
+    "primary_geometry": "b8_m4"
+  },
+  "methods": [
+    {
+      "id": "bpfree",
+      "paper_label": "BP-free",
+      "runtime": "bpfree",
+      "belief_transport_mode": "none"
+    },
+    {
+      "id": "exactbp_1f1b",
+      "paper_label": "Sync 1F1B",
+      "runtime": "exactbp",
+      "pipeline_schedule": "1f1b"
+    },
+    {
+      "id": "exactbp_gpipe",
+      "paper_label": "GPipe",
+      "runtime": "exactbp",
+      "pipeline_schedule": "gpipe"
+    },
+    {
+      "id": "pipedream",
+      "paper_label": "PipeDream",
+      "runtime": "pipedream"
+    }
+  ],
+  "geometries": [
+    {
+      "id": "b1_m32",
+      "physical_batch_size": 1,
+      "microbatches": 32
+    },
+    {
+      "id": "b2_m16",
+      "physical_batch_size": 2,
+      "microbatches": 16
+    },
+    {
+      "id": "b4_m8",
+      "physical_batch_size": 4,
+      "microbatches": 8
+    },
+    {
+      "id": "b8_m4",
+      "physical_batch_size": 8,
+      "microbatches": 4
+    }
+  ]
+}

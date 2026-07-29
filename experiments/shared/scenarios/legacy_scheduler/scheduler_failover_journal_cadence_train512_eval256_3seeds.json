@@ -1,0 +1,55 @@
+{
+  "name": "scheduler_failover_journal_cadence_train512_eval256_3seeds",
+  "description": "Real-GPU active recovery comparison: wait, every-step state handoff, and journaled checkpoint handoff.",
+  "output_root": "debug_runs/failover_journal_cadence_train512_eval256_3seeds",
+  "target_stage": 2,
+  "seeds": [20260531, 20260532, 20260533],
+  "defaults": {
+    "model_name": "tinyllama",
+    "manifest": "data/sft_requests/tinyllama_agnews128_label_train512_seed20260531/requests.jsonl",
+    "eval_manifest": "data/sft_requests/tinyllama_agnews128_label_eval256_seed20260531/requests.jsonl",
+    "num_chunks": 3,
+    "topology": "worker_pool",
+    "workers": ["0:cuda:0", "1:cuda:1", "2:cuda:2", "1:cuda:3"],
+    "standby_worker_ids": ["w3-s1"],
+    "train_limit": 512,
+    "eval_limit": 256,
+    "max_inflight": 8,
+    "scheduler_policy": "recovery_first",
+    "max_attempts": 3,
+    "gradient_accumulation_steps": 8,
+    "failure_mode": "once",
+    "failure_stage": 1,
+    "failure_seq": 200,
+    "failure_attempt": 0,
+    "failure_point": "before_execute",
+    "belief_transport_mode": "terminal",
+    "dtype": "float32",
+    "train_chunks": "all",
+    "trainable_mode": "lora",
+    "progress_interval": 128
+  },
+  "cases": [
+    {
+      "name": "wait_for_rejoin",
+      "overrides": {
+        "recovery_policy": "wait_for_rejoin",
+        "worker_rejoin_delay_ms": 2000
+      }
+    },
+    {
+      "name": "handoff_every_step",
+      "overrides": {
+        "recovery_policy": "migrate_from_boundary",
+        "checkpoint_interval": 1
+      }
+    },
+    {
+      "name": "handoff_journal_k8",
+      "overrides": {
+        "recovery_policy": "migrate_from_boundary",
+        "checkpoint_interval": 8
+      }
+    }
+  ]
+}

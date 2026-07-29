@@ -1,0 +1,16 @@
+# Minimal export environment for tools/export/*.py and tools/data/*.py
+#
+# This file is intentionally much smaller than requirement.txt.
+# Use this first for server-side shard export.
+# Keep torch on the ExecuTorch 1.2-compatible line. ExecuTorch 1.2.0
+# declares torch>=2.11.0, and older torch 2.9.x conflicts with torchao.
+
+torch==2.11.*
+executorch==1.2.0
+transformers==5.0.0rc1
+datasets==3.6.0
+sentencepiece==0.2.1
+safetensors==0.7.0
+numpy==2.4.2
+pyyaml==6.0.3
+tqdm==4.67.3

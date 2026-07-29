@@ -1,0 +1,57 @@
+{
+  "name": "scheduler_full_train512_eval256_3seeds",
+  "description": "Full real-GPU stage-local update scheduling comparison for train512/eval256.",
+  "output_root": "debug_runs/scheduler_reports/full_train512_eval256_3seeds",
+  "target_stage": 2,
+  "seeds": [20260531, 20260532, 20260533],
+  "defaults": {
+    "model_name": "tinyllama",
+    "manifest": "data/sft_requests/tinyllama_agnews128_label_train512_seed20260531/requests.jsonl",
+    "eval_manifest": "data/sft_requests/tinyllama_agnews128_label_eval256_seed20260531/requests.jsonl",
+    "num_chunks": 3,
+    "stage_devices": ["cuda:0", "cuda:1", "cuda:2"],
+    "topology": "phone_fixed",
+    "target_stage": 2,
+    "train_limit": 512,
+    "eval_limit": 256,
+    "max_inflight": 8,
+    "scheduler_policy": "fifo",
+    "recovery_policy": "replay_after_update",
+    "belief_transport_mode": "terminal",
+    "dtype": "bfloat16",
+    "train_chunks": "all",
+    "progress_interval": 128
+  },
+  "cases": [
+    {
+      "name": "all_updates"
+    }
+  ],
+  "sweeps": [
+    {
+      "name": "stride_sweep",
+      "name_template": "stride{stride}",
+      "axes": {
+        "stride": [2, 3]
+      },
+      "overrides": {
+        "stage_train_strides": {
+          "{target_stage}": "{stride}"
+        }
+      }
+    },
+    {
+      "name": "queue_threshold_sweep",
+      "name_template": "queue{threshold}",
+      "axes": {
+        "threshold": [0, 1, 2]
+      },
+      "overrides": {
+        "stage_update_policy": "queue_gated",
+        "stage_update_queue_thresholds": {
+          "{target_stage}": "{threshold}"
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,942 @@
+diff --git a/extension/android/CMakeLists.txt b/extension/android/CMakeLists.txt
+index c94b952..af59fc4 100644
+--- a/extension/android/CMakeLists.txt
++++ b/extension/android/CMakeLists.txt
+@@ -162,7 +162,10 @@ if(EXECUTORCH_JNI_CUSTOM_LIBRARY)
+ endif()
+
+ if(EXECUTORCH_BUILD_EXTENSION_TRAINING)
+-  target_sources(executorch_jni PRIVATE jni/jni_layer_training.cpp)
++  target_sources(
++    executorch_jni
++    PRIVATE jni/jni_layer_training.cpp jni/jni_layer_bpfree_training.cpp
++  )
+   list(APPEND link_libraries extension_training)
+   target_compile_definitions(
+     executorch_jni PUBLIC EXECUTORCH_BUILD_EXTENSION_TRAINING=1
+diff --git a/extension/android/jni/jni_layer_training.cpp b/extension/android/jni/jni_layer_training.cpp
+index 9065800..2df2735 100644
+--- a/extension/android/jni/jni_layer_training.cpp
++++ b/extension/android/jni/jni_layer_training.cpp
+@@ -26,6 +26,8 @@ using namespace executorch::extension;
+ using namespace executorch::extension::training;
+ using namespace torch::executor;
+
++extern void register_natives_for_bpfree_training();
++
+ namespace executorch::extension {
+
+ // Forward declarations from jni_layer.cpp
+@@ -351,4 +353,5 @@ class SGDHybrid : public facebook::jni::HybridClass<SGDHybrid> {
+ void register_natives_for_training() {
+   executorch::extension::ExecuTorchTrainingJni::registerNatives();
+   executorch::extension::SGDHybrid::registerNatives();
++  register_natives_for_bpfree_training();
+ };
+diff --git a/extension/training/CMakeLists.txt b/extension/training/CMakeLists.txt
+index 11948c2..ed14c38 100644
+--- a/extension/training/CMakeLists.txt
++++ b/extension/training/CMakeLists.txt
+@@ -16,6 +16,12 @@ if(NOT EXECUTORCH_ROOT)
+   set(EXECUTORCH_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/../..)
+ endif()
+
++list(
++  APPEND
++  _extension_training__srcs
++  extension/training/module/bpfree_pipeline_boundary.cpp
++  extension/training/module/bpfree_training_module.cpp
++)
+ list(TRANSFORM _extension_training__srcs PREPEND "${EXECUTORCH_ROOT}/")
+
+ add_library(extension_training ${_extension_training__srcs})
+diff --git a/extension/training/module/bpfree_pipeline_boundary.h b/extension/training/module/bpfree_pipeline_boundary.h
+new file mode 100644
+index 0000000..3b6c07d
+--- /dev/null
++++ b/extension/training/module/bpfree_pipeline_boundary.h
+@@ -0,0 +1,39 @@
++/*
++ * Copyright (c) Meta Platforms, Inc. and affiliates.
++ * All rights reserved.
++ *
++ * This source code is licensed under the BSD-style license found in the
++ * LICENSE file in the root directory of this source tree.
++ */
++
++#pragma once
++
++#include <cstdint>
++#include <vector>
++
++#include <executorch/extension/tensor/tensor.h>
++#include <executorch/runtime/core/error.h>
++
++namespace executorch::extension::training::bpfree {
++
++struct TensorCapture {
++  std::vector<uint8_t> bytes;
++  std::vector<executorch::aten::SizesType> sizes;
++  executorch::aten::ScalarType scalar_type{
++      executorch::aten::ScalarType::Undefined};
++
++  TensorPtr into_tensor_ptr();
++};
++
++struct BoundaryCapture {
++  bool reached{false};
++  TensorCapture loss;
++  TensorCapture hidden;
++  TensorCapture belief;
++};
++
++void set_active_boundary_capture(BoundaryCapture* capture);
++
++runtime::Error register_pipeline_boundary_operator();
++
++} // namespace executorch::extension::training::bpfree
+diff --git a/extension/training/module/bpfree_pipeline_boundary.cpp b/extension/training/module/bpfree_pipeline_boundary.cpp
+new file mode 100644
+index 0000000..bdc747a
+--- /dev/null
++++ b/extension/training/module/bpfree_pipeline_boundary.cpp
+@@ -0,0 +1,86 @@
++/*
++ * Copyright (c) Meta Platforms, Inc. and affiliates.
++ * All rights reserved.
++ *
++ * This source code is licensed under the BSD-style license found in the
++ * LICENSE file in the root directory of this source tree.
++ */
++
++#include <executorch/extension/training/module/bpfree_pipeline_boundary.h>
++
++#include <cstring>
++
++#include <executorch/runtime/kernel/kernel_includes.h>
++#include <executorch/runtime/kernel/operator_registry.h>
++
++namespace executorch::extension::training::bpfree {
++namespace {
++
++constexpr const char* kBoundaryOperator =
++    "sid_bpfree_pipeline::pipeline_boundary.out";
++thread_local BoundaryCapture* active_capture = nullptr;
++
++void capture_tensor(const executorch::aten::Tensor& tensor, TensorCapture& out) {
++  out.bytes.resize(tensor.nbytes());
++  if (!out.bytes.empty()) {
++    std::memcpy(out.bytes.data(), tensor.const_data_ptr(), tensor.nbytes());
++  }
++  out.sizes.assign(tensor.sizes().begin(), tensor.sizes().end());
++  out.scalar_type = tensor.scalar_type();
++}
++
++void pipeline_boundary(
++    runtime::KernelRuntimeContext& context,
++    runtime::Span<runtime::EValue*> stack) {
++  ET_KERNEL_CHECK_MSG(
++      context,
++      stack.size() == 5,
++      InvalidProgram,
++      /* void */,
++      // ExecuTorch's boxed .out convention appends a return slot after the
++      // four schema arguments. This matches its generated wrapper exactly.
++      "Expected five boxed boundary slots, got %zu",
++      stack.size());
++
++  const auto& loss = stack[0]->toTensor();
++  const auto& hidden = stack[1]->toTensor();
++  const auto& belief = stack[2]->toTensor();
++  auto& out = stack[3]->toTensor();
++  ET_KERNEL_CHECK_MSG(
++      context,
++      loss.scalar_type() == executorch::aten::ScalarType::Float &&
++          out.scalar_type() == loss.scalar_type() &&
++          out.nbytes() == loss.nbytes(),
++      InvalidArgument,
++      /* void */,
++      "Boundary loss/output metadata mismatch");
++
++  std::memcpy(out.mutable_data_ptr(), loss.const_data_ptr(), loss.nbytes());
++  if (active_capture != nullptr) {
++    capture_tensor(loss, active_capture->loss);
++    capture_tensor(hidden, active_capture->hidden);
++    capture_tensor(belief, active_capture->belief);
++    active_capture->reached = true;
++  }
++}
++
++} // namespace
++
++TensorPtr TensorCapture::into_tensor_ptr() {
++  return make_tensor_ptr(
++      std::move(sizes), std::move(bytes), scalar_type);
++}
++
++void set_active_boundary_capture(BoundaryCapture* capture) {
++  active_capture = capture;
++}
++
++runtime::Error register_pipeline_boundary_operator() {
++  if (runtime::registry_has_op_function(kBoundaryOperator)) {
++    return runtime::Error::Ok;
++  }
++  static const runtime::Kernel kernel(kBoundaryOperator, pipeline_boundary);
++  return runtime::register_kernel(kernel);
++}
++
++} // namespace executorch::extension::training::bpfree
+diff --git a/extension/training/module/bpfree_training_module.h b/extension/training/module/bpfree_training_module.h
+new file mode 100644
+index 0000000..2ff91f8
+--- /dev/null
++++ b/extension/training/module/bpfree_training_module.h
+@@ -0,0 +1,90 @@
++/*
++ * Copyright (c) Meta Platforms, Inc. and affiliates.
++ * All rights reserved.
++ *
++ * This source code is licensed under the BSD-style license found in the
++ * LICENSE file in the root directory of this source tree.
++ */
++
++#pragma once
++
++#include <map>
++#include <memory>
++#include <string>
++#include <unordered_map>
++#include <vector>
++
++#include <executorch/extension/module/module.h>
++#include <executorch/extension/tensor/tensor.h>
++#include <executorch/runtime/core/evalue.h>
++
++namespace executorch::extension::training {
++
++/**
++ * Executes one joint training Method in two phases around a BP-free boundary.
++ *
++ * Only one Method may be paused at a time. This preserves the normal Module
++ * memory plan and intentionally does not create a pool of training sessions.
++ */
++class ET_EXPERIMENTAL BPFreeTrainingModule final
++    : public executorch::extension::Module {
++ public:
++  explicit BPFreeTrainingModule(
++      std::unique_ptr<runtime::DataLoader> data_loader,
++      std::unique_ptr<runtime::MemoryAllocator> memory_allocator = nullptr,
++      std::unique_ptr<runtime::MemoryAllocator> temp_allocator = nullptr,
++      std::unique_ptr<runtime::EventTracer> event_tracer = nullptr,
++      std::unique_ptr<runtime::DataLoader> data_map_data_loader = nullptr)
++      : executorch::extension::Module(
++            std::move(data_loader),
++            std::move(memory_allocator),
++            std::move(temp_allocator),
++            std::move(event_tracer),
++            std::move(data_map_data_loader)) {}
++
++  runtime::Result<std::vector<runtime::EValue>> forward_to_boundary(
++      const std::string& method_name,
++      const std::vector<runtime::EValue>& input);
++
++  runtime::Result<std::vector<runtime::EValue>> resume_backward(
++      const std::string& method_name);
++
++  runtime::Result<
++      const std::map<std::string_view, executorch::aten::Tensor>>
++  named_parameters(const std::string& method_name);
++
++  runtime::Result<
++      const std::map<std::string_view, executorch::aten::Tensor>>
++  named_gradients(const std::string& method_name);
++
++  bool is_paused() const {
++    return !paused_method_.empty();
++  }
++
++ private:
++  struct OutputLayout {
++    size_t gradient_start;
++    size_t parameter_start;
++  };
++
++  runtime::Result<OutputLayout> output_layout(
++      const std::string& method_name);
++  runtime::Error populate_gradients(
++      const std::string& method_name,
++      const OutputLayout& layout);
++  void discard_method(const std::string& method_name);
++
++  std::string paused_method_;
++  OutputLayout paused_layout_{0, 0};
++  std::vector<TensorPtr> boundary_tensors_;
++  std::unordered_map<
++      std::string,
++      std::map<std::string_view, executorch::aten::Tensor>>
++      method_named_gradients_;
++  std::unordered_map<
++      std::string,
++      std::map<std::string_view, executorch::aten::Tensor>>
++      method_named_parameters_;
++};
++
++} // namespace executorch::extension::training
+diff --git a/extension/training/module/bpfree_training_module.cpp b/extension/training/module/bpfree_training_module.cpp
+new file mode 100644
+index 0000000..5ae0f20
+--- /dev/null
++++ b/extension/training/module/bpfree_training_module.cpp
+@@ -0,0 +1,248 @@
++/*
++ * Copyright (c) Meta Platforms, Inc. and affiliates.
++ * All rights reserved.
++ *
++ * This source code is licensed under the BSD-style license found in the
++ * LICENSE file in the root directory of this source tree.
++ */
++
++#include <executorch/extension/training/module/bpfree_training_module.h>
++
++#include <executorch/extension/training/module/bpfree_pipeline_boundary.h>
++#include <executorch/runtime/platform/log.h>
++
++namespace executorch::extension::training {
++namespace {
++
++std::string parameters_index_method(const std::string& method_name) {
++  return "__et_training_parameters_index_" + method_name;
++}
++
++std::string gradients_index_method(const std::string& method_name) {
++  return "__et_training_gradients_index_" + method_name;
++}
++
++std::string fqn_method(const std::string& method_name) {
++  return "__et_training_fqn_" + method_name;
++}
++
++} // namespace
++
++runtime::Result<BPFreeTrainingModule::OutputLayout>
++BPFreeTrainingModule::output_layout(const std::string& method_name) {
++  auto gradient_result = Module::execute(gradients_index_method(method_name));
++  if (!gradient_result.ok()) {
++    return gradient_result.error();
++  }
++  auto parameter_result = Module::execute(parameters_index_method(method_name));
++  if (!parameter_result.ok()) {
++    return parameter_result.error();
++  }
++  return OutputLayout{
++      static_cast<size_t>(gradient_result->at(0).toInt()),
++      static_cast<size_t>(parameter_result->at(0).toInt())};
++}
++
++runtime::Result<std::vector<runtime::EValue>>
++BPFreeTrainingModule::forward_to_boundary(
++    const std::string& method_name,
++    const std::vector<runtime::EValue>& input) {
++  if (is_paused()) {
++    ET_LOG(Error, "Method %s is already paused", paused_method_.c_str());
++    return runtime::Error::InvalidState;
++  }
++  auto registration = bpfree::register_pipeline_boundary_operator();
++  if (registration != runtime::Error::Ok) {
++    return registration;
++  }
++  auto layout_result = output_layout(method_name);
++  if (!layout_result.ok()) {
++    return layout_result.error();
++  }
++  auto load_error = load_method(method_name);
++  if (load_error != runtime::Error::Ok) {
++    return load_error;
++  }
++
++  auto& method = methods_.at(method_name).method;
++  const executorch::aten::ArrayRef<runtime::EValue> input_ref(
++      input.data(), input.size());
++  auto input_error = method->set_inputs(input_ref);
++  if (input_error != runtime::Error::Ok) {
++    return input_error;
++  }
++
++  bpfree::BoundaryCapture capture;
++  bpfree::set_active_boundary_capture(&capture);
++  while (!capture.reached) {
++    auto step_error = method->step();
++    if (step_error != runtime::Error::Ok) {
++      bpfree::set_active_boundary_capture(nullptr);
++      if (step_error == runtime::Error::EndOfMethod) {
++        const auto reset_error = method->reset_execution();
++        if (reset_error != runtime::Error::Ok) {
++          discard_method(method_name);
++          return reset_error;
++        }
++        return runtime::Error::InvalidProgram;
++      }
++      discard_method(method_name);
++      return step_error;
++    }
++  }
++  bpfree::set_active_boundary_capture(nullptr);
++
++  if (!method->in_progress()) {
++    const auto reset_error = method->reset_execution();
++    if (reset_error != runtime::Error::Ok) {
++      discard_method(method_name);
++      return reset_error;
++    }
++    return runtime::Error::InvalidState;
++  }
++
++  boundary_tensors_.clear();
++  boundary_tensors_.push_back(capture.loss.into_tensor_ptr());
++  boundary_tensors_.push_back(capture.hidden.into_tensor_ptr());
++  boundary_tensors_.push_back(capture.belief.into_tensor_ptr());
++  paused_method_ = method_name;
++  paused_layout_ = layout_result.get();
++
++  std::vector<runtime::EValue> outputs;
++  outputs.reserve(boundary_tensors_.size());
++  for (const auto& tensor : boundary_tensors_) {
++    outputs.emplace_back(*tensor);
++  }
++  return outputs;
++}
++
++runtime::Result<std::vector<runtime::EValue>>
++BPFreeTrainingModule::resume_backward(const std::string& method_name) {
++  if (paused_method_ != method_name) {
++    ET_LOG(
++        Error,
++        "Cannot resume %s while paused method is %s",
++        method_name.c_str(),
++        paused_method_.c_str());
++    return runtime::Error::InvalidState;
++  }
++
++  auto& method = methods_.at(method_name).method;
++  while (true) {
++    auto step_error = method->step();
++    if (step_error == runtime::Error::EndOfMethod) {
++      break;
++    }
++    if (step_error != runtime::Error::Ok) {
++      discard_method(method_name);
++      return step_error;
++    }
++  }
++
++  std::vector<runtime::EValue> user_outputs;
++  user_outputs.reserve(paused_layout_.gradient_start);
++  for (size_t index = 0; index < paused_layout_.gradient_start; ++index) {
++    user_outputs.push_back(method->get_output(index));
++  }
++  auto gradient_error = populate_gradients(method_name, paused_layout_);
++  if (gradient_error != runtime::Error::Ok) {
++    discard_method(method_name);
++    return gradient_error;
++  }
++  auto reset_error = method->reset_execution();
++  if (reset_error != runtime::Error::Ok) {
++    discard_method(method_name);
++    return reset_error;
++  }
++
++  paused_method_.clear();
++  paused_layout_ = {0, 0};
++  return user_outputs;
++}
++
++runtime::Error BPFreeTrainingModule::populate_gradients(
++    const std::string& method_name,
++    const OutputLayout& layout) {
++  if (method_named_gradients_.count(method_name) != 0) {
++    return runtime::Error::Ok;
++  }
++  auto fqn_result = Module::execute(fqn_method(method_name));
++  if (!fqn_result.ok()) {
++    return fqn_result.error();
++  }
++
++  auto& gradients = method_named_gradients_[method_name];
++  auto& method = methods_.at(method_name).method;
++  size_t name_index = 0;
++  for (size_t output_index = layout.gradient_start;
++       output_index < layout.parameter_start;
++       ++output_index, ++name_index) {
++    const std::string_view name = fqn_result->at(name_index).toString();
++    gradients.insert({name, method->get_output(output_index).toTensor()});
++  }
++  return runtime::Error::Ok;
++}
++
++runtime::Result<
++    const std::map<std::string_view, executorch::aten::Tensor>>
++BPFreeTrainingModule::named_parameters(const std::string& method_name) {
++  if (is_paused()) {
++    return runtime::Error::InvalidState;
++  }
++  // Android restores checkpoints before the first forward, which loads the
++  // Method through named_parameters(). Register the custom op first.
++  auto registration = bpfree::register_pipeline_boundary_operator();
++  if (registration != runtime::Error::Ok) {
++    return registration;
++  }
++  if (method_named_parameters_.count(method_name) == 0) {
++    auto fqn_result = Module::execute(fqn_method(method_name));
++    if (!fqn_result.ok()) {
++      return fqn_result.error();
++    }
++    auto layout_result = output_layout(method_name);
++    if (!layout_result.ok()) {
++      return layout_result.error();
++    }
++    auto load_error = load_method(method_name);
++    if (load_error != runtime::Error::Ok) {
++      return load_error;
++    }
++
++    auto& parameters = method_named_parameters_[method_name];
++    auto& method = methods_.at(method_name).method;
++    size_t name_index = 0;
++    for (size_t output_index = layout_result->parameter_start;
++         output_index < method->outputs_size();
++         ++output_index, ++name_index) {
++      const std::string_view name = fqn_result->at(name_index).toString();
++      parameters.insert({name, method->get_output(output_index).toTensor()});
++    }
++  }
++  return method_named_parameters_.at(method_name);
++}
++
++runtime::Result<
++    const std::map<std::string_view, executorch::aten::Tensor>>
++BPFreeTrainingModule::named_gradients(const std::string& method_name) {
++  if (is_paused()) {
++    return runtime::Error::InvalidState;
++  }
++  const auto found = method_named_gradients_.find(method_name);
++  if (found == method_named_gradients_.end()) {
++    return runtime::Error::InvalidArgument;
++  }
++  return found->second;
++}
++
++void BPFreeTrainingModule::discard_method(const std::string& method_name) {
++  bpfree::set_active_boundary_capture(nullptr);
++  methods_.erase(method_name);
++  method_named_gradients_.erase(method_name);
++  method_named_parameters_.erase(method_name);
++  paused_method_.clear();
++  paused_layout_ = {0, 0};
++  boundary_tensors_.clear();
++}
++
++} // namespace executorch::extension::training
+diff --git a/extension/android/jni/jni_layer_bpfree_training.cpp b/extension/android/jni/jni_layer_bpfree_training.cpp
+new file mode 100644
+index 0000000..ee7a945
+--- /dev/null
++++ b/extension/android/jni/jni_layer_bpfree_training.cpp
+@@ -0,0 +1,241 @@
++/*
++ * Copyright (c) Meta Platforms, Inc. and affiliates.
++ * All rights reserved.
++ *
++ * This source code is licensed under the BSD-style license found in the
++ * LICENSE file in the root directory of this source tree.
++ */
++
++#include <executorch/extension/android/jni/jni_layer_constants.h>
++#include <executorch/extension/data_loader/file_data_loader.h>
++#include <executorch/extension/tensor/tensor.h>
++#include <executorch/extension/training/module/bpfree_pipeline_boundary.h>
++#include <executorch/extension/training/module/bpfree_training_module.h>
++#include <executorch/runtime/platform/log.h>
++
++#include <memory>
++#include <string>
++#include <vector>
++
++#include <fbjni/fbjni.h>
++
++namespace executorch::extension {
++
++class TensorHybrid : public facebook::jni::HybridClass<TensorHybrid> {
++ public:
++  constexpr static const char* kJavaDescriptor =
++      "Lorg/pytorch/executorch/Tensor;";
++
++  static facebook::jni::local_ref<TensorHybrid::javaobject>
++  newJTensorFromTensor(const executorch::aten::Tensor& tensor);
++
++  static TensorPtr newTensorFromJTensor(
++      facebook::jni::alias_ref<TensorHybrid::javaobject> jtensor);
++};
++
++class JEValue : public facebook::jni::JavaClass<JEValue> {
++ public:
++  constexpr static const char* kJavaDescriptor =
++      "Lorg/pytorch/executorch/EValue;";
++
++  constexpr static int kTypeCodeTensor = 1;
++  constexpr static int kTypeCodeDouble = 3;
++  constexpr static int kTypeCodeInt = 4;
++  constexpr static int kTypeCodeBool = 5;
++
++  static facebook::jni::local_ref<JEValue> newJEValueFromEValue(
++      runtime::EValue evalue);
++
++  static TensorPtr JEValueToTensorImpl(
++      facebook::jni::alias_ref<JEValue> jevalue);
++};
++
++class BPFreeTrainingJni
++    : public facebook::jni::HybridClass<BPFreeTrainingJni> {
++ public:
++  constexpr static const char* kJavaDescriptor =
++      "Lorg/pytorch/executorch/training/BPFreeTrainingModule;";
++
++  BPFreeTrainingJni(
++      facebook::jni::alias_ref<jstring> model_path,
++      facebook::jni::alias_ref<jstring> data_path) {
++    auto model_result = FileDataLoader::from(model_path->toStdString().c_str());
++    if (!model_result.ok()) {
++      facebook::jni::throwNewJavaException(
++          "java/lang/Exception", "Failed to open BP-free model file");
++    }
++    auto model_loader =
++        std::make_unique<FileDataLoader>(std::move(model_result.get()));
++
++    std::unique_ptr<FileDataLoader> data_loader;
++    const auto data_path_string = data_path->toStdString();
++    if (!data_path_string.empty()) {
++      auto data_result = FileDataLoader::from(data_path_string.c_str());
++      if (!data_result.ok()) {
++        facebook::jni::throwNewJavaException(
++            "java/lang/Exception", "Failed to open BP-free data file");
++      }
++      data_loader =
++          std::make_unique<FileDataLoader>(std::move(data_result.get()));
++    }
++
++    module_ = std::make_unique<training::BPFreeTrainingModule>(
++        std::move(model_loader),
++        nullptr,
++        nullptr,
++        nullptr,
++        std::move(data_loader));
++  }
++
++  static facebook::jni::local_ref<jhybriddata> initHybrid(
++      facebook::jni::alias_ref<jclass>,
++      facebook::jni::alias_ref<jstring> model_path,
++      facebook::jni::alias_ref<jstring> data_path) {
++    return makeCxxInstance(model_path, data_path);
++  }
++
++  facebook::jni::local_ref<facebook::jni::JArrayClass<JEValue>>
++  forwardToBoundary(
++      facebook::jni::alias_ref<jstring> method_name,
++      facebook::jni::alias_ref<
++          facebook::jni::JArrayClass<JEValue::javaobject>::javaobject>
++          inputs) {
++    if (module_->is_paused()) {
++      facebook::jni::throwNewJavaException(
++          "java/lang/IllegalStateException",
++          "BP-free module is already paused at a boundary");
++    }
++    auto evalues = convertInputs(inputs);
++    auto result =
++        module_->forward_to_boundary(method_name->toStdString(), evalues);
++    if (!result.ok()) {
++      input_tensor_keepalives_.clear();
++      throwExecutionError("forward-to-boundary", result.error());
++    }
++    return toJavaArray(result.get());
++  }
++
++  facebook::jni::local_ref<facebook::jni::JArrayClass<JEValue>>
++  resumeBackward(facebook::jni::alias_ref<jstring> method_name) {
++    auto result = module_->resume_backward(method_name->toStdString());
++    input_tensor_keepalives_.clear();
++    if (!result.ok()) {
++      throwExecutionError("backward-resume", result.error());
++    }
++    return toJavaArray(result.get());
++  }
++
++  facebook::jni::local_ref<
++      facebook::jni::JMap<jstring, TensorHybrid::javaobject>>
++  namedParameters(facebook::jni::alias_ref<jstring> method_name) {
++    return namedTensors(
++        module_->named_parameters(method_name->toStdString()), "parameters");
++  }
++
++  facebook::jni::local_ref<
++      facebook::jni::JMap<jstring, TensorHybrid::javaobject>>
++  namedGradients(facebook::jni::alias_ref<jstring> method_name) {
++    return namedTensors(
++        module_->named_gradients(method_name->toStdString()), "gradients");
++  }
++
++  static void registerNatives() {
++    registerHybrid({
++        makeNativeMethod("initHybrid", BPFreeTrainingJni::initHybrid),
++        makeNativeMethod(
++            "forwardToBoundaryNative", BPFreeTrainingJni::forwardToBoundary),
++        makeNativeMethod(
++            "resumeBackwardNative", BPFreeTrainingJni::resumeBackward),
++        makeNativeMethod(
++            "namedParametersNative", BPFreeTrainingJni::namedParameters),
++        makeNativeMethod(
++            "namedGradientsNative", BPFreeTrainingJni::namedGradients),
++    });
++  }
++
++ private:
++  friend HybridBase;
++
++  std::vector<runtime::EValue> convertInputs(
++      facebook::jni::alias_ref<
++          facebook::jni::JArrayClass<JEValue::javaobject>::javaobject>
++          inputs) {
++    input_tensor_keepalives_.clear();
++    std::vector<runtime::EValue> evalues;
++    evalues.reserve(inputs->size());
++    static const auto type_code_field =
++        JEValue::javaClassStatic()->getField<jint>("mTypeCode");
++
++    for (int index = 0; index < inputs->size(); ++index) {
++      auto value = inputs->getElement(index);
++      const auto type_code = value->getFieldValue(type_code_field);
++      if (type_code == JEValue::kTypeCodeTensor) {
++        input_tensor_keepalives_.push_back(
++            JEValue::JEValueToTensorImpl(value));
++        evalues.emplace_back(*input_tensor_keepalives_.back());
++      } else if (type_code == JEValue::kTypeCodeInt) {
++        static const auto method =
++            JEValue::javaClassStatic()->getMethod<jlong()>("toInt");
++        evalues.emplace_back(static_cast<int64_t>(method(value)));
++      } else if (type_code == JEValue::kTypeCodeDouble) {
++        static const auto method =
++            JEValue::javaClassStatic()->getMethod<jdouble()>("toDouble");
++        evalues.emplace_back(static_cast<double>(method(value)));
++      } else if (type_code == JEValue::kTypeCodeBool) {
++        static const auto method =
++            JEValue::javaClassStatic()->getMethod<jboolean()>("toBool");
++        evalues.emplace_back(static_cast<bool>(method(value)));
++      } else {
++        facebook::jni::throwNewJavaException(
++            "java/lang/IllegalArgumentException",
++            "Unsupported BP-free input EValue type");
++      }
++    }
++    return evalues;
++  }
++
++  static facebook::jni::local_ref<facebook::jni::JArrayClass<JEValue>>
++  toJavaArray(const std::vector<runtime::EValue>& values) {
++    auto result = facebook::jni::JArrayClass<JEValue>::newArray(values.size());
++    for (size_t index = 0; index < values.size(); ++index) {
++      result->setElement(
++          index, *JEValue::newJEValueFromEValue(values.at(index)));
++    }
++    return result;
++  }
++
++  static facebook::jni::local_ref<
++      facebook::jni::JMap<jstring, TensorHybrid::javaobject>>
++  namedTensors(
++      const runtime::Result<
++          const std::map<std::string_view, executorch::aten::Tensor>>& result,
++      const char* kind) {
++    if (!result.ok()) {
++      throwExecutionError(kind, result.error());
++    }
++    auto tensors = facebook::jni::
++        JHashMap<jstring, TensorHybrid::javaobject>::create();
++    for (const auto& [name, tensor] : result.get()) {
++      tensors->put(
++          facebook::jni::make_jstring(name.data()),
++          TensorHybrid::newJTensorFromTensor(tensor));
++    }
++    return tensors;
++  }
++
++  static void throwExecutionError(const char* operation, runtime::Error error) {
++    facebook::jni::throwNewJavaException(
++        "java/lang/Exception",
++        "BP-free %s failed with status 0x%" PRIx32,
++        operation,
++        static_cast<runtime::error_code_t>(error));
++  }
++
++  std::unique_ptr<training::BPFreeTrainingModule> module_;
++  // Method inputs may be read during backward, after the first JNI call returns.
++  std::vector<TensorPtr> input_tensor_keepalives_;
++};
++
++} // namespace executorch::extension
++
++void register_natives_for_bpfree_training() {
++  const auto registration = executorch::extension::training::bpfree::
++      register_pipeline_boundary_operator();
++  if (registration != executorch::runtime::Error::Ok) {
++    ET_LOG(
++        Error,
++        "Failed to register the BP-free pipeline boundary operator: 0x%" PRIx32,
++        static_cast<executorch::runtime::error_code_t>(registration));
++  }
++  executorch::extension::BPFreeTrainingJni::registerNatives();
++}
+diff --git a/extension/android/executorch_android/src/main/java/org/pytorch/executorch/training/BPFreeTrainingModule.java b/extension/android/executorch_android/src/main/java/org/pytorch/executorch/training/BPFreeTrainingModule.java
+new file mode 100644
+index 0000000..0763894
+--- /dev/null
++++ b/extension/android/executorch_android/src/main/java/org/pytorch/executorch/training/BPFreeTrainingModule.java
+@@ -0,0 +1,128 @@
++/*
++ * Copyright (c) Meta Platforms, Inc. and affiliates.
++ * All rights reserved.
++ *
++ * This source code is licensed under the BSD-style license found in the
++ * LICENSE file in the root directory of this source tree.
++ */
++
++package org.pytorch.executorch.training;
++
++import android.util.Log;
++import com.facebook.jni.HybridData;
++import com.facebook.jni.annotations.DoNotStrip;
++import com.facebook.soloader.nativeloader.NativeLoader;
++import com.facebook.soloader.nativeloader.SystemDelegate;
++import java.util.HashMap;
++import java.util.Map;
++import org.pytorch.executorch.EValue;
++import org.pytorch.executorch.ExecuTorchRuntime;
++import org.pytorch.executorch.Tensor;
++import org.pytorch.executorch.annotations.Experimental;
++
++/** Runs a BP-free joint training graph in forward-boundary and backward phases. */
++@Experimental
++public final class BPFreeTrainingModule implements AutoCloseable {
++
++  static {
++    if (!NativeLoader.isInitialized()) {
++      NativeLoader.init(new SystemDelegate());
++    }
++    NativeLoader.loadLibrary("executorch");
++  }
++
++  /** Boundary values are copied by native code and remain valid during backward. */
++  public static final class BoundaryResult {
++    public final Tensor loss;
++    public final Tensor hidden;
++    public final Tensor belief;
++
++    private BoundaryResult(EValue[] outputs) {
++      if (outputs.length != 3) {
++        throw new IllegalStateException(
++            "Expected loss, hidden, and belief at the BP-free boundary; got " + outputs.length);
++      }
++      loss = outputs[0].toTensor();
++      hidden = outputs[1].toTensor();
++      belief = outputs[2].toTensor();
++    }
++  }
++
++  private final HybridData mHybridData;
++
++  @DoNotStrip
++  private static native HybridData initHybrid(String moduleAbsolutePath, String dataAbsolutePath);
++
++  private BPFreeTrainingModule(String moduleAbsolutePath, String dataAbsolutePath) {
++    mHybridData = initHybrid(moduleAbsolutePath, dataAbsolutePath);
++  }
++
++  public static BPFreeTrainingModule load(final String modelPath) {
++    ExecuTorchRuntime.validateFilePath(modelPath, "model path");
++    return new BPFreeTrainingModule(modelPath, "");
++  }
++
++  public static BPFreeTrainingModule load(final String modelPath, final String dataPath) {
++    ExecuTorchRuntime.validateFilePath(modelPath, "model path");
++    ExecuTorchRuntime.validateFilePath(dataPath, "data path");
++    return new BPFreeTrainingModule(modelPath, dataPath);
++  }
++
++  /** Executes through the boundary marker and leaves this module paused. */
++  public BoundaryResult forwardToBoundary(String methodName, EValue... inputs) {
++    ensureValid();
++    return new BoundaryResult(forwardToBoundaryNative(methodName, inputs));
++  }
++
++  /** Resumes the paused Method through backward and returns its user outputs. */
++  public EValue[] resumeBackward(String methodName) {
++    ensureValid();
++    return resumeBackwardNative(methodName);
++  }
++
++  public Map<String, Tensor> namedParameters(String methodName) {
++    if (!mHybridData.isValid()) {
++      Log.e("ExecuTorch", "Attempt to use a destroyed BP-free training module");
++      return new HashMap<>();
++    }
++    return namedParametersNative(methodName);
++  }
++
++  public Map<String, Tensor> namedGradients(String methodName) {
++    if (!mHybridData.isValid()) {
++      Log.e("ExecuTorch", "Attempt to use a destroyed BP-free training module");
++      return new HashMap<>();
++    }
++    return namedGradientsNative(methodName);
++  }
++
++  /** Releases the native module and any paused Method state. */
++  public void destroy() {
++    if (mHybridData.isValid()) {
++      mHybridData.resetNative();
++    }
++  }
++
++  @Override
++  public void close() {
++    destroy();
++  }
++
++  private void ensureValid() {
++    if (!mHybridData.isValid()) {
++      throw new IllegalStateException("Attempt to use a destroyed BP-free training module");
++    }
++  }
++
++  @DoNotStrip
++  private native EValue[] forwardToBoundaryNative(String methodName, EValue... inputs);
++
++  @DoNotStrip
++  private native EValue[] resumeBackwardNative(String methodName);
++
++  @DoNotStrip
++  private native Map<String, Tensor> namedParametersNative(String methodName);
++
++  @DoNotStrip
++  private native Map<String, Tensor> namedGradientsNative(String methodName);
++}
+diff --git a/scripts/build_android_library.sh b/scripts/build_android_library.sh
+index 0fb9e909..de9226cf 100755
+--- a/scripts/build_android_library.sh
++++ b/scripts/build_android_library.sh
+@@ -43,6 +43,7 @@ build_android_native_library() {
+     -DEXECUTORCH_BUILD_EXTENSION_LLM_RUNNER="${EXECUTORCH_BUILD_EXTENSION_LLM:-ON}" \
+     -DEXECUTORCH_BUILD_EXTENSION_ASR_RUNNER="${EXECUTORCH_BUILD_EXTENSION_LLM:-ON}" \
+     -DEXECUTORCH_BUILD_EXTENSION_TRAINING=ON \
++    -DEXECUTORCH_BUILD_KERNELS_OPTIMIZED="${EXECUTORCH_BUILD_KERNELS_OPTIMIZED:-OFF}" \
+     -DEXECUTORCH_BUILD_LLAMA_JNI="${EXECUTORCH_BUILD_EXTENSION_LLM:-ON}" \
+     -DEXECUTORCH_BUILD_NEURON="${EXECUTORCH_BUILD_NEURON}" \
+     -DNEURON_BUFFER_ALLOCATOR_LIB="${NEURON_BUFFER_ALLOCATOR_LIB}" \

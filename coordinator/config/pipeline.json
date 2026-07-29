@@ -1,0 +1,49 @@
+{
+  "bindPort": 50051,
+  "adminBindPort": 18080,
+  "heartbeatLeaseSeconds": 45,
+  "cleanupIntervalSeconds": 5,
+  "requestStallTimeoutSeconds": 30,
+  "resolvedRequestRetentionSeconds": 86400,
+  "artifactBaseUrl": "http://192.168.1.10:18080",
+  "pipelineName": "demo-pipeline",
+  "stateDbPath": "coordinator/data/coordinator.db",
+  "scheduler": {
+    "enabled": true,
+    "policy": "fill-first",
+    "allowUnlistedDevices": false,
+    "preferConfiguredDevices": true,
+    "rebalanceOnRegister": false,
+    "minMemoryGb": 0,
+    "minComputeCapacity": 0
+  },
+  "stages": [
+    {
+      "stageId": 0,
+      "deviceId": "android_stage_0",
+      "modelShardId": "example_chunk_0",
+      "modelArtifactPath": "../../model/example_chunk_0.pte",
+      "expectedHost": "192.168.1.101",
+      "expectedPort": 26052,
+      "schedulingWeight": 1
+    },
+    {
+      "stageId": 1,
+      "deviceId": "android_stage_1",
+      "modelShardId": "example_chunk_1",
+      "modelArtifactPath": "../../model/example_chunk_1.pte",
+      "expectedHost": "192.168.1.102",
+      "expectedPort": 26052,
+      "schedulingWeight": 1
+    },
+    {
+      "stageId": 2,
+      "deviceId": "android_stage_2",
+      "modelShardId": "example_chunk_2",
+      "modelArtifactPath": "../../model/example_chunk_2.pte",
+      "expectedHost": "192.168.1.103",
+      "expectedPort": 26052,
+      "schedulingWeight": 1
+    }
+  ]
+}

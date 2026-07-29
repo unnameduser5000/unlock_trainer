@@ -1,0 +1,81 @@
+{
+  "schema_version": 1,
+  "protocol_id": "agnews-e1-quality-v1",
+  "provenance": {
+    "reconstructs_protocol": "agnews-e1e2-v1",
+    "source_git_commit": "8b971a2f1b3b1a21d38a46230d04b23d33a9867a",
+    "paper_scope": "E1 quality table and validation curves"
+  },
+  "manifests": {
+    "train": {
+      "path": "data/sft_requests/tinyllama_agnews128_label_train10000_seed20260531/requests.jsonl",
+      "sha256": "d92b884697eecf356674b92770791a3c315fb30f8ad6efff715465e44d5f578d",
+      "records": 10000
+    },
+    "validation": {
+      "path": "data/sft_requests/tinyllama_agnews128_label_valid1000_nooverlap_seed20260531/requests.jsonl",
+      "sha256": "dff91052715954e9970934f100245c862b369f9001bdaacc97f1c5c6f50c0289",
+      "records": 1000
+    },
+    "test": {
+      "path": "data/sft_requests/tinyllama_agnews128_label_test7600_seed20260531/requests.jsonl",
+      "sha256": "bb32ece889752b2700bb2b5f18dc5941154dff2f6954335acdabc6beb65d6554",
+      "records": 7600
+    }
+  },
+  "seeds": [20260531, 20260532, 20260533],
+  "model": {
+    "name": "tinyllama",
+    "dtype": "bfloat16",
+    "num_stages": 3,
+    "stage_devices": "cuda:0,cuda:1,cuda:2",
+    "trainable_mode": "lora",
+    "lora_targets": "q_proj,v_proj",
+    "lora_rank": 4,
+    "lora_alpha": 16.0,
+    "lora_init_std": 0.01
+  },
+  "optimization": {
+    "epochs": 1,
+    "physical_request_batch": 1,
+    "effective_batch": 8,
+    "optimizer": "adamw",
+    "learning_rate": 0.0001,
+    "grad_clip": 1.0,
+    "label_smoothing": 0.0,
+    "validation_interval_steps": 125,
+    "optimizer_steps": 1250
+  },
+  "methods": [
+    {
+      "id": "full_bp_1gpu",
+      "paper_label": "Full BP, 1 GPU",
+      "runtime": "exactbp",
+      "num_stages": 1,
+      "pipeline_schedule": "1f1b",
+      "microbatches": 1
+    },
+    {
+      "id": "1f1b_3gpu",
+      "paper_label": "Sync. 1F1B, 3 GPU",
+      "runtime": "exactbp",
+      "num_stages": 3,
+      "pipeline_schedule": "1f1b",
+      "microbatches": 8
+    },
+    {
+      "id": "bpfree_ce_3gpu",
+      "paper_label": "BP-free CE, 3 GPU",
+      "runtime": "bpfree_orchestrated",
+      "belief_transport_mode": "none",
+      "alpha": 1.0
+    },
+    {
+      "id": "bpfree_belief_3gpu",
+      "paper_label": "BP-free belief, 3 GPU",
+      "runtime": "bpfree_orchestrated",
+      "belief_transport_mode": "full",
+      "alpha": 0.5
+    }
+  ]
+}

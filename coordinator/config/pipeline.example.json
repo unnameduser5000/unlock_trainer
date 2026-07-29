@@ -1,0 +1,29 @@
+{
+  "bindPort": 50051,
+  "adminBindPort": 18080,
+  "heartbeatLeaseSeconds": 15,
+  "cleanupIntervalSeconds": 5,
+  "requestStallTimeoutSeconds": 30,
+  "resolvedRequestRetentionSeconds": 86400,
+  "artifactBaseUrl": "http://192.168.1.10:18080",
+  "pipelineName": "demo-pipeline",
+  "stateDbPath": "coordinator/data/coordinator.db",
+  "stages": [
+    {
+      "stageId": 0,
+      "deviceId": "android_stage_0",
+      "modelShardId": "chunk_0",
+      "modelArtifactPath": "../../model/example_chunk_0.pte",
+      "expectedHost": "192.168.1.101",
+      "expectedPort": 26052
+    },
+    {
+      "stageId": 1,
+      "deviceId": "android_stage_1",
+      "modelShardId": "chunk_1",
+      "modelArtifactPath": "../../model/example_chunk_1.pte",
+      "expectedHost": "192.168.1.102",
+      "expectedPort": 26052
+    }
+  ]
+}

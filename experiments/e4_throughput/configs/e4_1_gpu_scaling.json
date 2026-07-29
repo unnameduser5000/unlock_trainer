@@ -1,0 +1,43 @@
+{
+  "experiment_id": "e4_1_gpu_scaling",
+  "description": "Matched BP-free vs Exact-BP GPU/stage scaling on physical NVIDIA L40 GPUs; 1024 records and 32 optimizer steps per run",
+  "methods": [
+    "bpfree",
+    "exactbp"
+  ],
+  "gpu_counts": [
+    2,
+    3,
+    4
+  ],
+  "repetitions": 3,
+  "model_name": "tinyllama",
+  "train_manifest": "data/sft_requests/tinyllama_agnews128_label_train10000_formal_v1/requests.jsonl",
+  "eval_manifest": "data/sft_requests/tinyllama_agnews128_label_eval256_seed20260531/requests.jsonl",
+  "train_limit": 1024,
+  "eval_limit": 1,
+  "train_epochs": 1,
+  "physical_request_batch": 1,
+  "microbatches_per_update": 32,
+  "effective_optimizer_batch": 32,
+  "dtype": "bfloat16",
+  "learning_rate": 0.0003,
+  "optimizer": "adamw",
+  "grad_clip": 0.0,
+  "seed": 20260531,
+  "lora_targets": "q_proj,v_proj",
+  "lora_rank": 4,
+  "lora_alpha": 16.0,
+  "lora_init_std": 0.01,
+  "lora_init_seed": 20260531,
+  "belief_transport_mode": "terminal",
+  "recv_inflight_depth": 1,
+  "skip_eval_before": true,
+  "skip_eval_after": true,
+  "track_activation_memory": false,
+  "record_timeline": false,
+  "enable_action_trace": false,
+  "perf_minimal_metrics": true,
+  "gc_interval_batches": 0,
+  "output_root": "results/e4_throughput/raw/e4_1_gpu_scaling"
+}

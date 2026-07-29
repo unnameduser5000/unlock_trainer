@@ -1,0 +1,711 @@
+{
+  "schema_version": 2,
+  "project": "sg-exe-trainer",
+  "allowed_claim_status": [
+    "final_evidence",
+    "scheduler_runtime_evidence",
+    "memory_evidence",
+    "diagnostic",
+    "historical_contaminated"
+  ],
+  "policy": {
+    "human_status_entry": "docs/EXPERIMENT_STATUS_ZH.md",
+    "long_running_report": "docs/INFOCOM_RESULTS_DRAFT_ZH.md",
+    "scheduler_scenario_dir": "experiments/shared/scenarios/legacy_scheduler/",
+    "measurement_rules": "experiments/MEASUREMENT_RULES.md",
+    "rule": "Promote results only after the experiment has a stable id, config authority, raw output root, aggregation script, explicit supported/unsupported claims, claim_status, and applicable measurement contract.",
+    "raw_output_roots": [
+      "results/",
+      "debug_runs/"
+    ],
+    "report_script_locations": [
+      "experiments/<experiment-id>/",
+      "tools/report/"
+    ]
+  },
+  "measurement_contract_templates": {
+    "throughput_clean": {
+      "gc_collect_in_measured_loop": false,
+      "empty_cache_in_measured_loop": false,
+      "activation_tracker": false,
+      "torch_profiler": false,
+      "autograd_profiler": false,
+      "eval_during_train": false,
+      "checkpointing": false,
+      "retry_replay_cache": false,
+      "failure_injection": false,
+      "progress_print": "disabled_or_fixed",
+      "timer_policy": "synchronized_max_wall_time",
+      "required_outputs": [
+        "full_run_throughput_per_s",
+        "steady_state_throughput_per_s",
+        "warmup_or_fill_ms",
+        "drain_ms",
+        "fill_drain_overhead_ms"
+      ]
+    }
+  },
+  "experiments": [
+    {
+      "id": "E1",
+      "name": "AG News quality",
+      "status": "complete",
+      "claim_status": "final_evidence",
+      "paper_role": "mainline_control_quality",
+      "paper_scope_note": "This is the only finalized mainline quality evidence for BP-free versus exact BP in the current paper scope.",
+      "question": "How much final task quality is lost when replacing exact BP with stage-local BP-free training?",
+      "config_authority": "experiments/e1_quality/configs/agnews_quality_v1.json",
+      "launcher": "experiments/e1_quality/run_agnews_quality.py",
+      "output_root": "results/e1_quality/raw/agnews_e1_quality_v1/",
+      "existing_evidence_root": "results/e1_quality/raw/legacy/root_debug_runs/agnews_e1e2_formal_v1/e1_quality/",
+      "aggregation": [
+        "tools/report/aggregate_agnews_formal_protocol.py",
+        "tools/report/plot_agnews_formal_protocol.py"
+      ],
+      "report_status": "eligible_for_long_running_report",
+      "supported_claims": [
+        "Full BP, 1F1B, BP-free CE, and BP-free belief quality/learning curves under the formal AG News protocol"
+      ],
+      "unsupported_claims": [
+        "Multi-GPU P2P throughput"
+      ]
+    },
+    {
+      "id": "E1-IA",
+      "name": "Mobile Actions instruction-format quality",
+      "status": "precursor_runs_complete_formal_pending",
+      "claim_status": "diagnostic",
+      "paper_role": "supporting_upper_bound_only",
+      "paper_scope_note": "Use as a single-GPU instruction-format upper bound for the model family, not as BP-free mainline evidence.",
+      "question": "Can the same TinyLlama LoRA stack show stable base-to-tuned quality gains on a realistic tool-calling instruction-format dataset under a fixed server protocol?",
+      "config_authority": "docs/FORMAL_MOBILE_ACTIONS_E1_PROTOCOL.md",
+      "launcher": "tools/mobile_agent_eval/run_mobile_actions_lora_sft.py",
+      "output_root": "debug_runs/mobile_actions_tinyllama_lora_formal_v1/",
+      "aggregation": [
+        "tools/mobile_agent_eval/compare_runs.py"
+      ],
+      "report_status": "planned_e1_extension_quality_evidence",
+      "server_alignment_date": "2026-06-25",
+      "server_precursor_runs": [
+        {
+          "path": "debug_runs/mobile_actions_tinyllama_lora_smoke_20260619/",
+          "kind": "smoke_single_gpu",
+          "status": "completed",
+          "key_result": "20/5/2 train-eval-gen slice only; script path valid but too small for quality claims"
+        },
+        {
+          "path": "debug_runs/mobile_actions_tinyllama_lora_full_20260619/",
+          "kind": "single_gpu_full_dataset_reference",
+          "status": "completed",
+          "key_result": "train_records=8693, eval_records=961, gen_eval_records=200; base full_exact 0.285 -> tuned 0.86; train wall 1018.87 s"
+        },
+        {
+          "path": "debug_runs/mobile_actions_tinyllama_lora_formal_v1/",
+          "kind": "formal_output_root",
+          "status": "empty_not_started",
+          "key_result": "The fixed 3-seed formal output root exists in the registry but has no run outputs yet"
+        }
+      ],
+      "next_action": "Launch the fixed 3-seed protocol under debug_runs/mobile_actions_tinyllama_lora_formal_v1/ after preserving the current single-GPU full run as precursor evidence.",
+      "measurement_contract": {
+        "contract_type": "single_gpu_instruction_quality",
+        "seeded_training": true,
+        "seeded_lora_initialization": true,
+        "fixed_generation_eval_subset": true,
+        "metrics_split": [
+          "teacher_forced_loss",
+          "json_parse_rate",
+          "tool_exact",
+          "args_exact",
+          "full_exact",
+          "train_wall_s",
+          "cuda_peak_allocated_mib"
+        ]
+      },
+      "confounders": [
+        "This is a single-GPU LoRA-SFT quality extension, not a pipeline experiment.",
+        "Its metrics must not be merged numerically with AG News label-choice accuracy or NLL."
+      ],
+      "pipeline_phase_policy": {
+        "phase_split_required_for_final_throughput": false,
+        "reported_metric": "quality_only",
+        "current_phase_split": "not_applicable"
+      },
+      "supported_claims": [
+        "Base-to-tuned quality improvement on a fixed instruction-format tool-calling dataset",
+        "Single-GPU LoRA-SFT resource/time reference for the instruction-format extension"
+      ],
+      "unsupported_claims": [
+        "Android on-device quality conclusion",
+        "BP-free vs 1F1B comparison",
+        "Direct numeric merge with AG News E1 metrics before separate reporting is preserved"
+      ]
+    },
+    {
+      "id": "E1-IB",
+      "name": "DroidCall harder Android intent/function-calling quality",
+      "status": "diagnostic_runs_complete_formal_pending",
+      "claim_status": "diagnostic",
+      "paper_role": "limitation_diagnostic_only",
+      "paper_scope_note": "Current BP-free local objectives collapse on free-generation json_calls; keep this line as limitation/diagnostic until the objective or benchmark shape changes.",
+      "question": "Can the same TinyLlama LoRA stack show stable base-to-tuned quality gains on a harder Android intent/function-calling benchmark, and which protocol variant should be frozen for later algorithm comparison?",
+      "config_authority": "docs/FORMAL_DROIDCALL_E1_PROTOCOL.md",
+      "launcher": "tools/mobile_agent_eval/run_droidcall_formal_protocol.py",
+      "output_root": "debug_runs/droidcall_tinyllama_formal_v1/",
+      "aggregation": [
+        "tools/mobile_agent_eval/run_droidcall_formal_protocol.py"
+      ],
+      "report_status": "planned_e1_extension_quality_evidence",
+      "server_alignment_date": "2026-06-25",
+      "selected_protocol_candidate": "json_calls",
+      "server_precursor_runs": [
+        {
+          "path": "debug_runs/droidcall_tinyllama_sanity_20260624/",
+          "kind": "single_gpu_sanity",
+          "status": "completed",
+          "key_result": "512/100/100 slice; base full_exact 0.06 -> tuned 0.43; base tool_exact 0.28 -> tuned 0.66"
+        },
+        {
+          "path": "debug_runs/droidcall_protocol_compare_20260624/",
+          "kind": "single_seed_protocol_compare",
+          "status": "completed",
+          "key_result": "Both json_calls and code_short reached tuned full_exact 0.66 on 100-example generation eval; json_calls had much stronger base formatting"
+        },
+        {
+          "path": "debug_runs/droidcall_e1_phase1_sanity_20260625/",
+          "kind": "multi_algo_small_sanity",
+          "status": "completed",
+          "key_result": "full_bp, 1f1b, and bpfree_ce all finished a 32/16/16 sanity slice; used to validate the cross-algorithm launcher and eval path"
+        },
+        {
+          "path": "debug_runs/droidcall_e1_overnight_20260625/",
+          "kind": "failed_mainline_attempt",
+          "status": "failed_or_stale",
+          "key_result": "1F1B failed because train_records=10071 is not divisible by pipeline batch_size=8; run_status rows marked running are stale because no training process is alive"
+        },
+        {
+          "path": "debug_runs/droidcall_e1_overnight_20260625_mainline10064/",
+          "kind": "single_seed_mainline_multialgo",
+          "status": "completed",
+          "key_result": "json_calls with train_limit=10064 and eval_limit=200 finished for full_bp, 1f1b, bpfree_ce, and bpfree_belief; 1f1b eval full_exact 0.605, bpfree_ce 0.01, bpfree_belief 0.015"
+        },
+        {
+          "path": "debug_runs/droidcall_tinyllama_formal_v1/",
+          "kind": "formal_output_root",
+          "status": "not_created",
+          "key_result": "The registry target root is still empty; current evidence lives in precursor directories"
+        }
+      ],
+      "next_action": "Freeze json_calls as the formal protocol, keep 1F1B train limits divisible by the fixed physical batch size, and rerun clean 3-seed outputs under debug_runs/droidcall_tinyllama_formal_v1/.",
+      "measurement_contract": {
+        "contract_type": "single_gpu_instruction_quality",
+        "seeded_training": true,
+        "seeded_lora_initialization": true,
+        "fixed_generation_eval_subset": true,
+        "protocol_variants": [
+          "json_calls",
+          "code_short"
+        ],
+        "metrics_split": [
+          "teacher_forced_loss",
+          "parse_rate",
+          "tool_exact",
+          "args_exact",
+          "full_exact",
+          "train_wall_s",
+          "cuda_peak_allocated_mib"
+        ]
+      },
+      "confounders": [
+        "DroidCall is less templated than Mobile Actions and is expected to surface larger formatting sensitivity.",
+        "Protocol choice must be frozen before promoting comparisons across different training algorithms.",
+        "This is still a quality extension and must not be merged numerically with AG News metrics."
+      ],
+      "pipeline_phase_policy": {
+        "phase_split_required_for_final_throughput": false,
+        "reported_metric": "quality_only",
+        "current_phase_split": "not_applicable"
+      },
+      "supported_claims": [
+        "Base-to-tuned quality movement on a harder Android intent/function-calling dataset",
+        "Protocol-selection evidence between json_calls and code_short under the same model family",
+        "Reusable data/protocol entry for later BP-free and 1F1B quality extensions"
+      ],
+      "unsupported_claims": [
+        "Android on-device deployment quality conclusion",
+        "Throughput, recovery, or pipeline semantics",
+        "Final cross-algorithm claim before one DroidCall protocol variant is frozen"
+      ]
+    },
+    {
+      "id": "E1-IC",
+      "name": "Constrained first-tool-choice benchmark",
+      "status": "scaffold_ready_not_run",
+      "claim_status": "diagnostic",
+      "paper_role": "candidate_agent_extension_aligned_with_scope",
+      "paper_scope_note": "This is the intended next agent-side benchmark because it keeps real tool-calling data but removes free-generation JSON formatting as the dominant failure mode.",
+      "question": "Can Full BP, 1F1B, and BP-free be compared on a constrained on-device tool-selection task derived from real tool-calling corpora?",
+      "config_authority": "docs/FORMAL_AGENT_TOOL_CHOICE_PROTOCOL.md",
+      "launcher": "tools/mobile_agent_eval/prepare_tool_choice_requests.py + src/sg_exe_trainer/tasks/label_experiment.py",
+      "output_root": "debug_runs/agent_tool_choice_formal_v1/",
+      "aggregation": [],
+      "report_status": "scaffold_ready_waiting_for_first_server_run",
+      "seed_dataset_builder": "tools/mobile_agent_eval/prepare_tool_choice_requests.py",
+      "initial_target_dataset": "mobile_actions",
+      "measurement_contract": {
+        "contract_type": "constrained_agent_label_choice",
+        "task_semantics": "predict only the first gold tool among the candidate tools attached to each example",
+        "primary_metric": "first_tool_choice_accuracy",
+        "secondary_metrics": [
+          "avg_loss",
+          "per_tool_accuracy",
+          "wall_time",
+          "throughput"
+        ]
+      },
+      "confounders": [
+        "This benchmark measures first-step routing only, not full-plan or argument correctness.",
+        "It should not be merged numerically with free-generation parse/tool/args/full exact metrics.",
+        "Multi-action rows are reduced to their first gold tool."
+      ],
+      "pipeline_phase_policy": {
+        "phase_split_required_for_final_throughput": false,
+        "reported_metric": "quality_first",
+        "current_phase_split": "not_applicable"
+      },
+      "supported_claims": [
+        "Whether BP-free retains useful quality on a constrained agent-flavored tool-routing task",
+        "A cleaner agent-side comparison entry than free-generation DroidCall"
+      ],
+      "unsupported_claims": [
+        "Full JSON tool-calling quality",
+        "Argument exactness",
+        "Multi-step execution correctness"
+      ]
+    },
+    {
+      "id": "E2",
+      "name": "GPU Memory Exchange",
+      "status": "historical_formal_complete_clean_launcher_ready",
+      "claim_status": "memory_evidence",
+      "paper_role": "mainline_system_memory",
+      "question": "How does per-stage GPU memory change across batch geometries for BP-free, Sync 1F1B, GPipe, and PipeDream at fixed effective batch B=32?",
+      "config_authority": "experiments/e2_memory/configs/gpu_memory_v1.json",
+      "launcher": "experiments/e2_memory/run_gpu_memory.py",
+      "output_root": "results/e2_memory/raw/gpu_memory_v1/",
+      "existing_evidence_root": "results/e2_memory_v2/raw/formal_v2/",
+      "aggregation": [
+        "experiments/e2_memory/build_report.py"
+      ],
+      "report_status": "eligible_for_paper_memory_report",
+      "measurement_contract": {
+        "contract_type": "gpu_memory_exchange",
+        "fresh_process_per_run": true,
+        "effective_batch": 32,
+        "activation_tracker": true,
+        "cuda_allocator_peak": true,
+        "terminal_output_log_probabilities": false,
+        "eval_during_train": false,
+        "checkpointing": false,
+        "component_peak_semantics": "independent_non_additive_peaks"
+      },
+      "supported_claims": [
+        "Per-stage and maximum-stage CUDA peak allocated memory across the four fixed batch geometries",
+        "Saved non-leaf activation and explicit memory-ledger measurements",
+        "BP-free, Sync 1F1B, GPipe, and PipeDream memory comparison under the frozen E2 protocol"
+      ],
+      "unsupported_claims": [
+        "Primary throughput or steady-state throughput",
+        "Additive reconstruction of CUDA peak from independently measured component peaks"
+      ]
+    },
+    {
+      "id": "E4.1",
+      "name": "Pipeline stage scaling",
+      "status": "complete",
+      "claim_status": "scheduler_runtime_evidence",
+      "paper_role": "mainline_system_throughput",
+      "question": "How does training throughput scale from two to four stages under one resource-matched transport contract?",
+      "config_authority": "experiments/e4_throughput/configs/e4_1_scaling.json",
+      "launcher": "experiments/e4_throughput/run_e4_1_cpu_transport_scaling.py",
+      "output_root": "results/e4_throughput/raw/e4_1_pipedream_scaling_omp4_v2/",
+      "aggregation": [
+        "experiments/e4_throughput/build_e4_formal_figures.py"
+      ],
+      "report_status": "eligible_for_paper_throughput_report",
+      "measurement_contract": {
+        "contract_type": "resource_matched_pipeline_throughput",
+        "timer_policy": "synchronized_max_wall_time",
+        "reported_metric": "full_run_throughput_per_s"
+      },
+      "confounders": [
+        "Changing the stage count also changes partition boundaries and per-stage work balance.",
+        "The measurements use one server with CPU/Gloo transport, not cross-machine or mobile links."
+      ],
+      "pipeline_phase_policy": {
+        "phase_split_required_for_final_throughput": true,
+        "steady_state_primary": false,
+        "current_phase_split": "full_run_only; fill, steady-state, and drain are not separated"
+      },
+      "supported_claims": [
+        "Two-, three-, and four-stage throughput for BP-free, GPipe, synchronous 1F1B, and PipeDream under the fixed OMP and transport budgets"
+      ],
+      "unsupported_claims": [
+        "Cross-machine scaling",
+        "On-device mobile throughput"
+      ]
+    },
+    {
+      "id": "E4.1-G",
+      "name": "Direct GPU/NCCL stage scaling",
+      "status": "smoke_validated_formal_matrix_pending",
+      "claim_status": "diagnostic",
+      "paper_role": "supplementary_gpu_scaling_candidate",
+      "question": "Can BP-free and exact-BP execute the same effective-batch contract as the direct GPU/NCCL stage count changes?",
+      "config_authority": "experiments/e4_throughput/configs/e4_1_gpu_scaling.json",
+      "launcher": "experiments/e4_throughput/run_e4_1_gpu_scaling.py",
+      "output_root": "results/e4_throughput/raw/e4_1_gpu_scaling/",
+      "aggregation": [],
+      "report_status": "launcher_smoke_only_formal_matrix_not_run",
+      "measurement_contract": {
+        "contract_type": "direct_gpu_nccl_stage_scaling",
+        "timer_policy": "synchronized_max_wall_time",
+        "reported_metric": "full_run_throughput_per_s",
+        "effective_optimizer_batch": 32,
+        "action_trace": false
+      },
+      "confounders": [
+        "Changing GPU count also changes model partition boundaries and per-stage work balance.",
+        "The checked-in formal 2/3/4-GPU by three-repetition matrix has not been completed.",
+        "The old three-GPU contract reproduction under the output root is historical and is excluded from the new matrix."
+      ],
+      "pipeline_phase_policy": {
+        "phase_split_required_for_final_throughput": true,
+        "steady_state_primary": false,
+        "current_phase_split": "smoke uses full-run timing only; formal fill, steady-state, and drain are pending"
+      },
+      "supported_claims": [
+        "The direct GPU/NCCL BP-free and exact-BP launch paths pass a real resource-limited smoke contract"
+      ],
+      "unsupported_claims": [
+        "Two-to-four-GPU scaling trend",
+        "Formal throughput comparison",
+        "Replacement for the resource-matched CPU/Gloo E4.1 matrix"
+      ]
+    },
+    {
+      "id": "E4.2a",
+      "name": "Fixed-batch geometry",
+      "status": "complete",
+      "claim_status": "scheduler_runtime_evidence",
+      "paper_role": "mainline_system_throughput",
+      "question": "How does physical-batch and microbatch geometry affect throughput at effective batch B=32?",
+      "config_authority": "experiments/e4_throughput/configs/e4_2a_batch_geometry.json",
+      "launcher": "experiments/e4_throughput/run_e4_2_cpu_transport.py",
+      "output_root": "results/e4_throughput/raw/e4_2a_pipedream_formal_omp4_v2/",
+      "aggregation": [
+        "experiments/e4_throughput/build_e4_formal_figures.py"
+      ],
+      "report_status": "eligible_for_paper_throughput_report",
+      "measurement_contract": {
+        "contract_type": "resource_matched_pipeline_throughput",
+        "timer_policy": "synchronized_max_wall_time",
+        "reported_metric": "full_run_throughput_per_s"
+      },
+      "confounders": [
+        "Physical batch changes GPU kernel geometry and transport-message granularity.",
+        "All cases hold the effective optimizer batch at 32."
+      ],
+      "pipeline_phase_policy": {
+        "phase_split_required_for_final_throughput": true,
+        "steady_state_primary": false,
+        "current_phase_split": "full_run_only; fill, steady-state, and drain are not separated"
+      },
+      "supported_claims": [
+        "Four-method throughput across the fixed B=32 geometry matrix"
+      ],
+      "unsupported_claims": [
+        "Memory peaks, which are owned by E2",
+        "Quality ranking"
+      ]
+    },
+    {
+      "id": "E4.2b",
+      "name": "Low-batch microbatch sweep",
+      "status": "complete",
+      "claim_status": "scheduler_runtime_evidence",
+      "paper_role": "mainline_system_throughput",
+      "question": "How do the pipeline schedules behave as microbatch count grows from one at physical batch one?",
+      "config_authority": "experiments/e4_throughput/configs/e4_2b_low_batch.json",
+      "launcher": "experiments/e4_throughput/run_e4_2_cpu_transport.py",
+      "output_root": "results/e4_throughput/raw/e4_2b_pipedream_formal_omp4_v2/",
+      "aggregation": [
+        "experiments/e4_throughput/build_e4_formal_figures.py"
+      ],
+      "report_status": "eligible_for_paper_throughput_report",
+      "measurement_contract": {
+        "contract_type": "resource_matched_pipeline_throughput",
+        "timer_policy": "synchronized_max_wall_time",
+        "reported_metric": "full_run_throughput_per_s"
+      },
+      "confounders": [
+        "Microbatch count changes the effective optimizer batch because physical batch is fixed at one.",
+        "Illegal synchronous 1F1B geometries are excluded rather than relabeled."
+      ],
+      "pipeline_phase_policy": {
+        "phase_split_required_for_final_throughput": true,
+        "steady_state_primary": false,
+        "current_phase_split": "full_run_only; fill, steady-state, and drain are not separated"
+      },
+      "supported_claims": [
+        "Schedule-specific low-batch throughput with illegal 1F1B geometries excluded by contract"
+      ],
+      "unsupported_claims": [
+        "Automatic switching between GPipe and 1F1B",
+        "Reuse of legacy results under a different schedule name"
+      ]
+    },
+    {
+      "id": "E4.3",
+      "name": "Synthetic mobile-link sensitivity",
+      "status": "complete",
+      "claim_status": "scheduler_runtime_evidence",
+      "paper_role": "system_sensitivity",
+      "question": "How sensitive are the four schedules to controlled sender-side latency and bandwidth pacing?",
+      "config_authority": "experiments/e4_throughput/configs/e4_3_network_sensitivity.json",
+      "launcher": "experiments/e4_throughput/run_e4_3_mobile_network_sensitivity.py",
+      "output_root": "results/e4_throughput/raw/e4_3_pipedream_formal_omp4_v2/",
+      "aggregation": [
+        "experiments/e4_throughput/build_e4_formal_figures.py"
+      ],
+      "report_status": "eligible_for_paper_sensitivity_report",
+      "measurement_contract": {
+        "contract_type": "sender_side_pacing_sensitivity",
+        "timer_policy": "synchronized_max_wall_time",
+        "reported_metric": "full_run_throughput_per_s",
+        "link_model": "deterministic per-send latency, bandwidth, and seeded jitter"
+      },
+      "confounders": [
+        "Sender-side pacing does not model packet loss, congestion control, receiver contention, or radio state.",
+        "Per-send serialization makes results sensitive to runtime message boundaries."
+      ],
+      "pipeline_phase_policy": {
+        "phase_split_required_for_final_throughput": true,
+        "steady_state_primary": false,
+        "current_phase_split": "full_run_only; fill, steady-state, and drain are not separated"
+      },
+      "supported_claims": [
+        "Sensitivity to the explicit deterministic sender-side pacing profiles"
+      ],
+      "unsupported_claims": [
+        "Packet-level network behavior",
+        "A measured cellular-network trace"
+      ]
+    },
+    {
+      "id": "E4.4",
+      "name": "Synchronized overhead decomposition",
+      "status": "complete",
+      "claim_status": "diagnostic",
+      "paper_role": "mechanism_explanation",
+      "question": "Which compute, transfer, pacing, and wait categories explain the observed schedule behavior?",
+      "config_authority": "experiments/e4_throughput/configs/e4_4_overhead_decomposition.json",
+      "launcher": "experiments/e4_throughput/run_e4_4_overhead_decomposition.py",
+      "output_root": "results/e4_throughput/raw/e4_4_pipedream_trace_omp4_v2/",
+      "aggregation": [
+        "experiments/e4_throughput/analyze_e4_4_traces.py",
+        "experiments/e4_throughput/build_e4_formal_figures.py"
+      ],
+      "report_status": "diagnostic_mechanism_evidence",
+      "measurement_contract": {
+        "contract_type": "synchronized_action_trace",
+        "timer_policy": "cuda_synchronized_action_boundaries",
+        "action_trace": true,
+        "reported_metric": "per_stage_action_category_duration"
+      },
+      "confounders": [
+        "CUDA synchronization perturbs overlap and absolute wall time.",
+        "Action categories are accounting intervals, not direct GPU-utilization samples."
+      ],
+      "pipeline_phase_policy": {
+        "phase_split_required_for_final_throughput": false,
+        "steady_state_primary": false,
+        "current_phase_split": "synchronized full-run mechanism trace"
+      },
+      "supported_claims": [
+        "Per-stage action-category decomposition under synchronized tracing"
+      ],
+      "unsupported_claims": [
+        "Absolute unsynchronized throughput",
+        "Pure GPU idle time inferred from untraced intervals"
+      ]
+    },
+    {
+      "id": "E4.4-S",
+      "name": "Late-window steady trace",
+      "status": "complete",
+      "claim_status": "diagnostic",
+      "paper_role": "steady_state_mechanism_validation",
+      "question": "Has the late-window pipeline reached a stable lag and period before the schedule timeline is reported?",
+      "config_authority": "experiments/e4_throughput/configs/e4_4_steady_trace.json",
+      "launcher": "experiments/e4_throughput/run_e4_4_steady_trace.py",
+      "output_root": "results/e4_throughput/raw/e4_4_steady_trace_v3/",
+      "aggregation": [
+        "experiments/e4_throughput/analyze_e4_4_steady_trace.py",
+        "experiments/e4_throughput/build_e4_4_paper_artifacts.py",
+        "experiments/e4_throughput/build_e4_4_report.py"
+      ],
+      "report_status": "diagnostic_steady_trace_evidence",
+      "measurement_contract": {
+        "contract_type": "synchronized_late_window_trace",
+        "timer_policy": "cuda_synchronized_action_boundaries",
+        "action_trace": true,
+        "reported_metric": "late_window_lag_period_and_timeline"
+      },
+      "confounders": [
+        "The selected late window validates stability only for the configured workload and buffer limits.",
+        "CUDA synchronization perturbs overlap and absolute wall time."
+      ],
+      "pipeline_phase_policy": {
+        "phase_split_required_for_final_throughput": false,
+        "steady_state_primary": false,
+        "current_phase_split": "late windows 64-95 after untraced warmup"
+      },
+      "supported_claims": [
+        "Late-window lag stability and synchronized schedule visualization"
+      ],
+      "unsupported_claims": [
+        "Replacement for E4.1-E4.3 throughput measurements"
+      ]
+    },
+    {
+      "id": "E4.4-N",
+      "name": "Nsight CUDA activity timeline",
+      "status": "historical_complete_launcher_smoke_validated_provenance_gap",
+      "claim_status": "diagnostic",
+      "paper_role": "gpu_activity_mechanism_diagnostic",
+      "question": "What CUDA compute, copy, and idle intervals are visible without enabling synchronized runtime action tracing?",
+      "config_authority": "experiments/e4_throughput/configs/e4_2a_batch_geometry.json",
+      "launcher": "experiments/e4_throughput/gpu_timeline/run_nsys_timeline.py",
+      "output_root": "results/e4_throughput/raw/e4_gpu_timeline_nsys_v1/",
+      "aggregation": [
+        "experiments/e4_throughput/gpu_timeline/export_nsys_intervals.py",
+        "tools/report/plot_e4_gpu_timeline.py"
+      ],
+      "report_status": "diagnostic_trace_with_historical_source_snapshot_gap",
+      "measurement_contract": {
+        "contract_type": "nsight_cuda_activity_trace",
+        "timer_policy": "external_cuda_activity_timestamps",
+        "action_trace": false,
+        "nsys_profile": true,
+        "reported_metric": "per_stage_compute_copy_and_idle_intervals",
+        "selection_rule": "centered fixed 1 s window within the common compute-active span of stages 0-2"
+      },
+      "confounders": [
+        "Nsight instrumentation perturbs the profiled wall time, so the captured throughput is not used for method comparison.",
+        "The centered common-active interval is a visualization selection rule, not a runtime steady-state boundary.",
+        "The completed 512-record traces predate per-run repository source-snapshot provenance; the maintained launcher now records it."
+      ],
+      "pipeline_phase_policy": {
+        "phase_split_required_for_final_throughput": false,
+        "steady_state_primary": false,
+        "current_phase_split": "centered 1 s diagnostic window within the common three-stage compute-active span"
+      },
+      "supported_claims": [
+        "Measured CUDA kernel and device-copy activity intervals for each of the four schedules",
+        "Per-stage active and idle ratios inside the explicitly selected diagnostic window"
+      ],
+      "unsupported_claims": [
+        "Profiled throughput as a replacement for E4.1-E4.3",
+        "Causal attribution of every idle interval to a runtime action",
+        "Bit-for-bit reconstruction of historical traces from a recorded Git source snapshot"
+      ]
+    },
+    {
+      "id": "E3-R",
+      "name": "Stage-1 failover recovery",
+      "status": "complete",
+      "claim_status": "final_evidence",
+      "question": "How much faster is migration from a retained boundary than waiting for the failed worker to rejoin?",
+      "config_authority": "experiments/shared/scenarios/legacy_scheduler/scheduler_failover_recovery_train512_eval256_3seeds.json",
+      "launcher": "experiments/e5_recovery/scheduler_lab/run_scheduler_scenarios.py",
+      "output_root": "debug_runs/failover_recovery_train512_eval256_3seeds/",
+      "aggregation": [
+        "tools/report/plot_failover_recovery_report.py"
+      ],
+      "report_status": "resilience_evidence",
+      "supported_claims": [
+        "Migration recovery latency, checkpoint transfer, steady-state cost"
+      ],
+      "unsupported_claims": [
+        "P2P throughput"
+      ]
+    },
+    {
+      "id": "E3-J",
+      "name": "Checkpoint cadence and journal trade-off",
+      "status": "complete",
+      "claim_status": "final_evidence",
+      "question": "How does checkpoint cadence affect recovery time, steady throughput, and state-transfer payload?",
+      "config_authority": "experiments/shared/scenarios/legacy_scheduler/scheduler_failover_journal_cadence_train512_eval256_3seeds.json",
+      "launcher": "experiments/e5_recovery/scheduler_lab/run_scheduler_scenarios.py",
+      "output_root": "debug_runs/failover_journal_cadence_train512_eval256_3seeds/",
+      "aggregation": [
+        "tools/report/plot_failover_recovery_report.py"
+      ],
+      "report_status": "resilience_evidence",
+      "supported_claims": [
+        "Checkpoint/journal bandwidth and recovery trade-off"
+      ],
+      "unsupported_claims": [
+        "P2P throughput"
+      ]
+    },
+    {
+      "id": "E3-G",
+      "name": "Graceful degradation and retained local progress",
+      "status": "complete",
+      "claim_status": "diagnostic",
+      "question": "What local progress can BP-free retain during an offline window where strict 1F1B cannot commit incomplete global batches?",
+      "config_authority": null,
+      "config_gap": "No dedicated scenario JSON is currently checked in for graceful_degradation_train512_eval256_3seeds; recover it from run logs or add a stable scenario before promoting new claims.",
+      "launcher": "experiments/e5_recovery/scheduler_lab/run_scheduler_scenarios.py",
+      "output_root": "debug_runs/graceful_degradation_train512_eval256_3seeds/",
+      "aggregation": [
+        "tools/report/aggregate_graceful_degradation_report.py",
+        "tools/report/plot_graceful_degradation_report.py"
+      ],
+      "report_status": "resilience_evidence_with_config_gap",
+      "supported_claims": [
+        "Local-update retention and training progress after end-to-end failure"
+      ],
+      "unsupported_claims": [
+        "E1 quality ranking",
+        "Paper-facing final claim before a dedicated scenario JSON is restored"
+      ]
+    },
+    {
+      "id": "E3-B",
+      "name": "Exact-BP batch-boundary recovery control",
+      "status": "in_progress",
+      "claim_status": "diagnostic",
+      "question": "How much committed progress can an exact-BP 1F1B baseline recover if it is limited to batch-boundary checkpoint/restart rather than stage-local retention?",
+      "config_authority": "src/sg_exe_trainer/runtime/exactbp/distributed_runtime.py with recovery_policy in {strict_skip, wait_for_rejoin_batch_boundary, restart_from_last_commit}",
+      "launcher": "experiments/e5_recovery/baselines/run_exactbp_batch_recovery.py",
+      "output_root": "debug_runs/graceful_degradation_train512_eval256_3seeds/",
+      "aggregation": [
+        "tools/report/aggregate_graceful_degradation_report.py",
+        "tools/report/plot_graceful_degradation_report.py"
+      ],
+      "report_status": "resilience_baseline_under_construction",
+      "supported_claims": [
+        "Stronger exact-BP control than historical strict skip",
+        "Batch-boundary checkpoint/restart exact-BP semantics distinct from BP-free stage-local retention"
+      ],
+      "unsupported_claims": [
+        "Equivalence to a production-grade PipeDream/Varuna/Oobleck recovery system",
+        "Microbatch in-flight exact-BP recovery"
+      ]
+    }
+  ]
+}

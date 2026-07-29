@@ -1,0 +1,243 @@
+syntax = "proto3";
+
+package sid;
+
+service CoordinatingService {
+  rpc RegisterNode(NodeInfo) returns (RegistrationResponse);
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+  rpc ReportRequestEvent(RequestEvent) returns (RequestEventAck);
+  rpc SubmitRequest(ForwardChunkRequest) returns (ForwardChunkResponse);
+  rpc SubmitStageRequest(StageForwardChunkRequest) returns (ForwardChunkResponse);
+}
+
+service ParticipantService {
+  rpc ForwardChunk(ForwardChunkRequest) returns (ForwardChunkResponse);
+}
+
+message NodeInfo {
+  string device_id = 1;
+  string node_type = 2;
+  float compute_capacity = 3;
+  float memory_gb = 4;
+  string ip_address = 5;
+  int32 grpc_port = 6;
+}
+
+message NextHop {
+  int32 node_id = 1;
+  string ip_address = 2;
+  int32 grpc_port = 3;
+}
+
+message RegistrationResponse {
+  bool success = 1;
+  string message = 2;
+  int32 node_id = 3;
+  int32 stage_id = 4;
+  bool terminal = 5;
+  NextHop next_hop = 6;
+  string model_shard_id = 7;
+  int64 routing_epoch = 8;
+  bool route_ready = 9;
+  string model_download_url = 10;
+  string model_sha256 = 11;
+  int64 model_bytes = 12;
+}
+
+message HeartbeatRequest {
+  string device_id = 1;
+  int32 node_id = 2;
+  float battery_level = 3;
+  bool is_active = 4;
+  bool is_charging = 5;
+  string power_source = 6;
+  int32 battery_status = 7;
+  float battery_temp_c = 8;
+  int32 battery_voltage_mv = 9;
+  int64 battery_current_ua = 10;
+  string thermal_status = 11;
+  int64 app_pss_kb = 12;
+  int64 app_private_dirty_kb = 13;
+  int64 runtime_used_memory_kb = 14;
+  string worker_state = 15;
+}
+
+message HeartbeatResponse {
+  bool ack = 1;
+  string command = 2;
+  NextHop next_hop = 3;
+  bool terminal = 4;
+  string model_shard_id = 5;
+  int64 routing_epoch = 6;
+  bool route_ready = 7;
+  int32 stage_id = 8;
+  string model_download_url = 9;
+  string model_sha256 = 10;
+  int64 model_bytes = 11;
+}
+
+enum RequestEventType {
+  REQUEST_EVENT_TYPE_UNSPECIFIED = 0;
+  REQUEST_RECEIVED = 1;
+  LOCAL_COMPLETED = 2;
+  FORWARDING = 3;
+  COMPLETED = 4;
+  FAILED = 5;
+  BOUNDARY_BUFFERED = 6;
+  BOUNDARY_FORWARD_RETRY = 7;
+  BOUNDARY_ACKNOWLEDGED = 8;
+  BOUNDARY_DROPPED = 9;
+  REPLAY_ACKNOWLEDGED = 10;
+}
+
+enum RequestFailureKind {
+  REQUEST_FAILURE_KIND_UNSPECIFIED = 0;
+  REQUEST_FAILURE_KIND_INVALID_REQUEST = 1;
+  REQUEST_FAILURE_KIND_WORKER_UNAVAILABLE = 2;
+  REQUEST_FAILURE_KIND_LOCAL_EXECUTION = 3;
+  REQUEST_FAILURE_KIND_DOWNSTREAM_UNAVAILABLE = 4;
+  REQUEST_FAILURE_KIND_DURABLE_STATE = 5;
+}
+
+message RequestEvent {
+  string request_id = 1;
+  int32 batch_id = 2;
+  int32 chunk_idx = 3;
+  int32 node_id = 4;
+  int32 stage_id = 5;
+  RequestEventType event_type = 6;
+  bool success = 7;
+  string message = 8;
+  int64 event_epoch_ms = 9;
+  bool terminal = 10;
+}
+
+message RequestEventAck {
+  bool ack = 1;
+  string message = 2;
+}
+
+message TensorData {
+  bytes data = 1;
+  repeated int32 shape = 2;
+  string data_type = 3;
+}
+
+message ForwardChunkRequest {
+  int32 batch_id = 1;
+  int32 chunk_idx = 2;
+  TensorData hidden_states = 3;
+  TensorData attention_mask = 4;
+  TensorData position_ids = 5;
+  TensorData labels = 6;
+  TensorData shift_log_p_prev = 7;
+  string request_id = 8;
+  bool eval_only = 9;
+  float learning_rate = 10;
+  bool stop_after_local_stage = 11;
+  string belief_transport_mode = 12;
+  // auto keeps the legacy behavior; explicit values are atomic or split.
+  string runtime_execution_mode = 13;
+  // 0 uses the app default, a positive value is the sampling period, and -1 disables periodic sampling.
+  int64 memory_sample_interval_ms = 14;
+  // Durable mode acknowledges each stage after its local commit and transfers
+  // the detached boundary through a bounded phone-local outbox.
+  bool durable_pipeline = 15;
+  int32 replay_buffer_capacity = 16;
+  int64 pipeline_window_seq = 17;
+  // Quality-tolerant mode: keep committed prefix-stage updates and do not
+  // replay a boundary when an unavailable downstream stage cannot receive it.
+  bool drop_on_forward_failure = 18;
+}
+
+message StageForwardChunkRequest {
+  int32 stage_id = 1;
+  ForwardChunkRequest request = 2;
+}
+
+message ForwardChunkResponse {
+  bool success = 1;
+  string message = 2;
+  float local_loss = 3;
+  TensorData output_hidden_states = 4;
+  TensorData output_shift_log_p = 5;
+  int32 processed_chunk_idx = 6;
+  int32 processed_stage_id = 7;
+  bool terminal = 8;
+  repeated StageExecutionMetrics stage_metrics = 9;
+  // A successful non-terminal response with forward_dropped=true is a valid
+  // prefix commit. Stages from first_unprocessed_stage_id onward did not run.
+  bool forward_dropped = 10;
+  int32 first_unprocessed_stage_id = 11;
+  RequestFailureKind failure_kind = 12;
+}
+
+message StageExecutionMetrics {
+  int32 stage_id = 1;
+  int32 chunk_idx = 2;
+  int32 node_id = 3;
+  bool terminal = 4;
+  bool eval_only = 5;
+  bool optimizer_step_applied = 6;
+  bool checkpoint_saved = 7;
+  int64 checkpoint_interval_steps = 8;
+  string runtime_name = 9;
+  string method_name = 10;
+  int32 input_count = 11;
+  double learning_rate = 12;
+  float local_loss = 13;
+  int64 local_queue_wait_ms = 14;
+  int64 local_elapsed_ms = 15;
+  int64 runtime_acquire_ms = 16;
+  int64 checkpoint_restore_ms = 17;
+  int64 input_build_ms = 18;
+  int64 execute_ms = 19;
+  int64 gradients_ms = 20;
+  int64 optimizer_create_ms = 21;
+  int64 optimizer_step_ms = 22;
+  int64 output_convert_ms = 23;
+  int64 output_hidden_bytes = 24;
+  int64 output_shift_log_p_bytes = 25;
+  int64 belief_encode_ms = 26;
+  int64 belief_dense_bytes = 27;
+  int64 belief_transport_bytes = 28;
+  string belief_transport_dtype = 29;
+  int64 forward_ms = 30;
+  int64 stage_total_ms = 31;
+  int64 request_received_epoch_ms = 32;
+  int64 memory_sample_interval_ms = 33;
+  int64 memory_sample_count = 34;
+  int64 pss_before_kb = 35;
+  int64 pss_after_kb = 36;
+  int64 pss_peak_kb = 37;
+  int64 private_dirty_before_kb = 38;
+  int64 private_dirty_after_kb = 39;
+  int64 private_dirty_peak_kb = 40;
+  int64 java_heap_before_kb = 41;
+  int64 java_heap_after_kb = 42;
+  int64 java_heap_peak_kb = 43;
+  string device_id = 44;
+  int64 forward_boundary_ms = 45;
+  int64 backward_ms = 46;
+  string runtime_execution_mode = 47;
+  int64 optimizer_step_count = 48;
+  int64 checkpoint_save_ms = 49;
+  int64 checkpoint_bytes = 50;
+  int64 checkpoint_step = 51;
+  int64 rpc_request_serialize_ms = 52;
+  int64 rpc_request_write_ms = 53;
+  int64 rpc_response_wait_ms = 54;
+  int64 rpc_response_read_ms = 55;
+  int64 rpc_response_parse_ms = 56;
+  int64 rpc_request_bytes = 57;
+  int64 rpc_response_bytes = 58;
+  int64 rpc_client_send_epoch_ms = 59;
+  int64 rpc_server_request_received_epoch_ms = 60;
+  int64 rpc_server_request_read_ms = 61;
+  int64 rpc_server_request_parse_ms = 62;
+  int64 rpc_server_response_serialize_ms = 63;
+  int64 rpc_server_handler_ms = 64;
+  int64 rpc_server_response_ready_epoch_ms = 65;
+  int64 rpc_client_response_received_epoch_ms = 66;
+  bool optimizer_step_committed = 67;
+}

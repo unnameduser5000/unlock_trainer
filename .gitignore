@@ -1,0 +1,78 @@
+# IDE
+.idea/
+*.iml
+.DS_Store
+Thumbs.db
+
+# Local machine config
+local.properties
+
+# Gradle and build outputs
+.gradle/
+.gradle-user/
+build/
+app/build/
+coordinator/build/
+
+# Android native/build intermediates
+captures/
+.externalNativeBuild/
+.cxx/
+app/.cxx/
+
+# Android packaging outputs
+*.apk
+*.aab
+
+# Coordinator runtime state
+coordinator/data/
+*.db
+*.db-shm
+*.db-wal
+
+# Model artifacts and generated exports
+model/*.pte
+exported_pte/
+/executorch/
+data/sft_requests/
+
+# Python caches and virtual environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+env/
+*.egg-info/
+
+# Logs and memory dumps
+*.log
+*.hprof
+debug_runs/
+# Local repository artifacts for public releases
+model/
+data/
+docs/deliverables/
+docs/figures/
+docs/papers/
+docs/presentation/
+docs/*.pdf
+docs/*.zip
+org/
+.local-broken-links*/
+data
+debug_runs
+# Secrets and signing material
+.env
+.env.*
+*.jks
+*.keystore
+*.p12
+*.pem
+docs/*DRAFT*.md
+docs/*PPT_OUTLINE*.md
+docs/*.tex
+/results/
+/output/
+/model_seq128/

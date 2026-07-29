@@ -1,0 +1,48 @@
+{
+  "name": "scheduler_dolly64_train1352_eval360_3seeds",
+  "description": "Dolly seq64 sample-budget comparison for BP-free scheduler policies and the 1F1B baseline.",
+  "output_root": "debug_runs/scheduler_reports/dolly64_train1352_eval360_3seeds",
+  "target_stage": 2,
+  "seeds": [20260531, 20260532, 20260533],
+  "defaults": {
+    "model_name": "tinyllama",
+    "manifest": "data/sft_requests/tinyllama_dolly64_train512/requests.jsonl",
+    "eval_manifest": "data/sft_requests/tinyllama_dolly64_eval128/requests.jsonl",
+    "num_chunks": 3,
+    "stage_devices": ["cuda:0", "cuda:1", "cuda:2"],
+    "topology": "phone_fixed",
+    "target_stage": 2,
+    "train_limit": 1352,
+    "eval_limit": 360,
+    "max_inflight": 8,
+    "scheduler_policy": "fifo",
+    "recovery_policy": "replay_after_update",
+    "belief_transport_mode": "terminal",
+    "dtype": "bfloat16",
+    "train_chunks": "all",
+    "progress_interval": 256
+  },
+  "cases": [
+    {
+      "name": "all_updates"
+    },
+    {
+      "name": "queue0",
+      "overrides": {
+        "stage_update_policy": "queue_gated",
+        "stage_update_queue_thresholds": {
+          "{target_stage}": 0
+        }
+      }
+    },
+    {
+      "name": "queue2",
+      "overrides": {
+        "stage_update_policy": "queue_gated",
+        "stage_update_queue_thresholds": {
+          "{target_stage}": 2
+        }
+      }
+    }
+  ]
+}

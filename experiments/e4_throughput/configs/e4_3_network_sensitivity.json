@@ -1,0 +1,86 @@
+{
+  "experiment_id": "e4_3_pipedream_formal_omp4_v2",
+  "description": "Four-schedule mobile-link sensitivity with OMP_NUM_THREADS=4 fixed for every method",
+  "repetitions": 4,
+  "cooldown_seconds": 2.0,
+  "model_name": "tinyllama",
+  "train_manifest": "data/sft_requests/tinyllama_agnews128_label_train10000_formal_v1/requests.jsonl",
+  "eval_manifest": "data/sft_requests/tinyllama_agnews128_label_eval256_seed20260531/requests.jsonl",
+  "eval_limit": 1,
+  "train_epochs": 1,
+  "gpu_count": 3,
+  "stage_devices": "cuda:0,cuda:1,cuda:2",
+  "profiles": [
+    {
+      "name": "local",
+      "description": "No injected network delay or bandwidth cap",
+      "link_latency_ms": 0.0,
+      "link_bandwidth_mbps": 0.0,
+      "link_jitter_ms": 0.0
+    },
+    {
+      "name": "wifi",
+      "description": "Low-latency high-bandwidth synthetic wireless link",
+      "link_latency_ms": 2.0,
+      "link_bandwidth_mbps": 1000.0,
+      "link_jitter_ms": 0.0
+    },
+    {
+      "name": "mobile",
+      "description": "Moderate synthetic mobile link",
+      "link_latency_ms": 10.0,
+      "link_bandwidth_mbps": 200.0,
+      "link_jitter_ms": 0.0
+    },
+    {
+      "name": "constrained",
+      "description": "Constrained synthetic mobile link",
+      "link_latency_ms": 30.0,
+      "link_bandwidth_mbps": 50.0,
+      "link_jitter_ms": 0.0
+    }
+  ],
+  "regimes": [
+    {
+      "name": "online_b1_m1",
+      "description": "Continuous single-request online updates",
+      "physical_request_batch": 1,
+      "microbatches_per_update": 1,
+      "train_limit": 480,
+      "methods": ["bpfree", "exactbp_gpipe"]
+    },
+    {
+      "name": "throughput_b8_m4",
+      "description": "Long-stream effective-batch-32 throughput",
+      "physical_request_batch": 8,
+      "microbatches_per_update": 4,
+      "train_limit": 9984,
+      "methods": [
+        "bpfree",
+        "exactbp_gpipe",
+        "exactbp_1f1b",
+        "pipedream"
+      ]
+    }
+  ],
+  "dtype": "bfloat16",
+  "learning_rate": 0.0003,
+  "optimizer": "adamw",
+  "grad_clip": 0.0,
+  "label_smoothing": 0.0,
+  "trainable_mode": "lora",
+  "lora_targets": "q_proj,v_proj",
+  "lora_rank": 4,
+  "lora_alpha": 16.0,
+  "lora_init_std": 0.01,
+  "lora_init_seed": 20260531,
+  "seed": 20260531,
+  "link_emulation_seed": 20260531,
+  "belief_transport_mode": "none",
+  "master_port_base": 30340,
+  "output_root": "results/e4_throughput/raw/e4_3_pipedream_formal_omp4_v2",
+  "omp_num_threads": 4,
+  "recv_prepost_depth": 4,
+  "max_pending_send_bytes": 67108864,
+  "max_posted_recv_bytes": 67108864
+}
